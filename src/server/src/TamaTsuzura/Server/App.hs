@@ -11,13 +11,13 @@ module TamaTsuzura.Server.App
     , application
     ) where
 
-import qualified Data.Aeson                  as Aeson
-import           Data.Text                   (Text)
-import qualified Data.Text                   as Txt
-import qualified Network.HTTP.Types          as Http
-import qualified Network.Wai                 as Wai
-import           TamaTsuzura.Common.Document (healthOk)
-import           Text.Read                   (readMaybe)
+import qualified Data.Aeson             as Aeson
+import           Data.Text              (Text)
+import qualified Data.Text              as Txt
+import qualified Network.HTTP.Types     as Http
+import qualified Network.Wai            as Wai
+import           TamaTsuzura.Common.Api (ApiError(..), ApiErrorCode(..), healthOk)
+import           Text.Read              (readMaybe)
 
 -- | HTTP サーバの待受ポート番号 (1〜65535)。
 -- 不正なポート番号の構築を型レベルで防ぐためコンストラクタは非公開とし、'mkServerPort' を経由する。
@@ -62,4 +62,11 @@ application req respond = case (Wai.requestMethod req, Wai.pathInfo req) of
         respond $ Wai.responseLBS
             Http.status404
             [(Http.hContentType, "application/json; charset=utf-8")]
-            "{\"error\":\"not_found\"}"
+            (Aeson.encode notFoundError)
+  where
+    notFoundError :: ApiError
+    notFoundError = ApiError
+        { code    = ErrNotFound
+        , message = "Endpoint not found"
+        , field   = Nothing
+        }

@@ -1,20 +1,569 @@
 openapi: 3.0.3
 info:
   title: TamaTsuzura API
-  description: Text Editor Web API with Revision Management
-  version: 0.1.0
+  description: |
+    TamaTsuzura Web API specification (M1 Document CRUD, Trash / Restore, Tags & Folders).
+    Designed to run identically on both shared-hosting CGI (wai-extra) and standalone Warp servers.
+  version: 0.2.0
+tags:
+  - name: health
+    description: Server health check
+  - name: documents
+    description: Document CRUD, search/filtering, and soft-delete (trash) lifecycle
+  - name: metadata
+    description: Organization metadata listing (tags and folders)
+
 paths:
   /api/health:
     get:
+      tags:
+        - health
       summary: Health check endpoint
+      operationId: getHealth
       responses:
         '200':
           description: Server is healthy
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    example: ok
+                $ref: '#/components/schemas/HealthStatus'
+
+  /api/documents:
+    get:
+      tags:
+        - documents
+      summary: List documents (metadata summaries)
+      description: |
+        Returns lightweight document summaries (excluding body) sorted by `updated_at` descending.
+        By default returns active (non-trashed) documents only.
+      operationId: listDocuments
+      parameters:
+        - name: status
+          in: query
+          description: Lifecycle filter (`active`, `trashed`, or `all`). Defaults to `active`.
+          required: false
+          schema:
+            $ref: '#/components/schemas/DocumentStatusFilter'
+        - name: tag
+          in: query
+          description: Filter documents that contain the specified tag.
+          required: false
+          schema:
+            $ref: '#/components/schemas/Tag'
+        - name: folder
+          in: query
+          description: Filter documents in the specified normalized folder path.
+          required: false
+          schema:
+            $ref: '#/components/schemas/FolderPath'
+        - name: include_subfolders
+          in: query
+          description: When `folder` is specified, include documents in descendant subfolders as well.
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: q
+          in: query
+          description: |
+            Case-insensitive substring search across title and body (max 200 chars, no control chars).
+            Leading/trailing whitespace is trimmed; whitespace-only values are treated as no search filter.
+          required: false
+          schema:
+            type: string
+            maxLength: 200
+        - name: limit
+          in: query
+          description: Maximum number of items to return (1..200).
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: offset
+          in: query
+          description: Zero-based pagination offset.
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Matching document summaries and total count
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+    post:
+      tags:
+        - documents
+      summary: Create a new document
+      description: |
+        Creates a new document and returns the persisted entity.
+        All request fields are optional so mobile clients can create a blank Markdown note immediately with `{}`.
+      operationId: createDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDocumentRequest'
+      responses:
+        '201':
+          description: Document created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /api/documents/{id}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
+
+    get:
+      tags:
+        - documents
+      summary: Get a document by ID
+      description: |
+        Returns the full document including body.
+        Trashed documents are also retrievable so users can preview them before restoring or permanently deleting.
+      operationId: getDocument
+      responses:
+        '200':
+          description: Full document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags:
+        - documents
+      summary: Replace/update an active document
+      description: |
+        Replaces title, body, format, folder, and tags of an active document.
+        Returns `409 Conflict` if the document is currently in the trash (restore it before editing).
+      operationId: updateDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDocumentRequest'
+      responses:
+        '200':
+          description: Updated document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+    delete:
+      tags:
+        - documents
+      summary: Soft-delete a document (move to trash)
+      description: |
+        Sets `deleted_at` to the current UTC timestamp and returns the trashed document.
+        Idempotent: if the document is already in the trash, preserves the existing `deleted_at` and returns `200 OK`.
+      operationId: softDeleteDocument
+      responses:
+        '200':
+          description: Document moved to trash
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/documents/{id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
+
+    post:
+      tags:
+        - documents
+      summary: Restore a document from trash
+      description: |
+        Clears `deleted_at` (`null`) and returns the active document.
+        Idempotent: if the document is already active, returns `200 OK`.
+      operationId: restoreDocument
+      responses:
+        '200':
+          description: Document restored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/documents/{id}/permanent:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
+
+    delete:
+      tags:
+        - documents
+      summary: Permanently delete a trashed document
+      description: |
+        Permanently removes a document from storage.
+        To prevent accidental data loss, the document must already be in the trash (`deleted_at != null`);
+        attempting to permanently delete an active document returns `409 Conflict`.
+      operationId: permanentDeleteDocument
+      responses:
+        '204':
+          description: Document permanently deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/tags:
+    get:
+      tags:
+        - metadata
+      summary: List distinct tags across active documents
+      operationId: listTags
+      responses:
+        '200':
+          description: Sorted list of distinct tags used by active documents
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TagListResponse'
+
+  /api/folders:
+    get:
+      tags:
+        - metadata
+      summary: List distinct folders across active documents
+      operationId: listFolders
+      responses:
+        '200':
+          description: Sorted list of distinct folder paths used by active documents
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FolderListResponse'
+
+components:
+  parameters:
+    DocumentIdPath:
+      name: id
+      in: path
+      required: true
+      description: URL-safe document identifier (1..64 ASCII alphanumeric, hyphen, or underscore characters)
+      schema:
+        $ref: '#/components/schemas/DocumentId'
+
+  responses:
+    BadRequest:
+      description: Validation or malformed request error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    NotFound:
+      description: Requested document or endpoint not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    Conflict:
+      description: Resource state conflict (e.g. updating a trashed document or permanently deleting an active document)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    PayloadTooLarge:
+      description: Document body exceeds the maximum allowed UTF-8 size (5 MiB)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+  schemas:
+    HealthStatus:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: ok
+
+    DocumentId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[A-Za-z0-9_-]+$'
+      example: 550e8400-e29b-41d4-a716-446655440000
+
+    DocumentTitle:
+      type: string
+      minLength: 0
+      maxLength: 255
+      description: Single-line document title (empty string allowed; control characters rejected; leading/trailing spaces trimmed)
+      example: 執筆メモ
+
+    DocumentBody:
+      type: string
+      description: UTF-8 document text body (max 5,242,880 UTF-8 bytes / 5 MiB)
+      example: "# 見出し\n本文テキスト"
+
+    DocumentFormat:
+      type: string
+      enum:
+        - markdown
+        - plain_text
+      default: markdown
+
+    DocumentStatusFilter:
+      type: string
+      enum:
+        - active
+        - trashed
+        - all
+      default: active
+
+    Tag:
+      type: string
+      minLength: 1
+      maxLength: 64
+      description: Trimmed non-empty tag label without control characters
+      example: 仕事
+
+    FolderPath:
+      type: string
+      minLength: 1
+      maxLength: 255
+      description: |
+        Normalized logical relative folder path (e.g. `work/notes`).
+        No control characters, backslashes, empty segments, `.` or `..`, or edge whitespace per segment; max depth 10.
+        Leading/trailing slashes are stripped during normalization.
+      example: work/notes
+
+    NullableFolderPath:
+      type: string
+      nullable: true
+      minLength: 1
+      maxLength: 255
+      description: Normalized folder path, or `null` when the document is at root
+      example: work/notes
+
+    DocumentSummary:
+      type: object
+      required:
+        - id
+        - title
+        - format
+        - folder
+        - tags
+        - created_at
+        - updated_at
+        - deleted_at
+      properties:
+        id:
+          $ref: '#/components/schemas/DocumentId'
+        title:
+          $ref: '#/components/schemas/DocumentTitle'
+        format:
+          $ref: '#/components/schemas/DocumentFormat'
+        folder:
+          $ref: '#/components/schemas/NullableFolderPath'
+        tags:
+          type: array
+          maxItems: 50
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Tag'
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-11-20T05:00:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-11-20T06:00:00Z'
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+
+    Document:
+      type: object
+      required:
+        - id
+        - title
+        - body
+        - format
+        - folder
+        - tags
+        - created_at
+        - updated_at
+        - deleted_at
+      properties:
+        id:
+          $ref: '#/components/schemas/DocumentId'
+        title:
+          $ref: '#/components/schemas/DocumentTitle'
+        body:
+          $ref: '#/components/schemas/DocumentBody'
+        format:
+          $ref: '#/components/schemas/DocumentFormat'
+        folder:
+          $ref: '#/components/schemas/NullableFolderPath'
+        tags:
+          type: array
+          maxItems: 50
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Tag'
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-11-20T05:00:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-11-20T06:00:00Z'
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+
+    CreateDocumentRequest:
+      type: object
+      properties:
+        title:
+          $ref: '#/components/schemas/DocumentTitle'
+        body:
+          $ref: '#/components/schemas/DocumentBody'
+        format:
+          $ref: '#/components/schemas/DocumentFormat'
+        folder:
+          $ref: '#/components/schemas/NullableFolderPath'
+        tags:
+          type: array
+          maxItems: 50
+          description: Up to 50 tag labels. Duplicate entries are deduplicated and normalized in ascending order.
+          items:
+            $ref: '#/components/schemas/Tag'
+
+    UpdateDocumentRequest:
+      type: object
+      required:
+        - title
+        - body
+        - format
+        - tags
+      properties:
+        title:
+          $ref: '#/components/schemas/DocumentTitle'
+        body:
+          $ref: '#/components/schemas/DocumentBody'
+        format:
+          $ref: '#/components/schemas/DocumentFormat'
+        folder:
+          $ref: '#/components/schemas/NullableFolderPath'
+        tags:
+          type: array
+          maxItems: 50
+          description: Up to 50 tag labels. Duplicate entries are deduplicated and normalized in ascending order.
+          items:
+            $ref: '#/components/schemas/Tag'
+
+    DocumentListResponse:
+      type: object
+      required:
+        - documents
+        - total
+      properties:
+        documents:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentSummary'
+        total:
+          type: integer
+          minimum: 0
+          description: Total matching document count before limit/offset pagination
+          example: 12
+
+    TagListResponse:
+      type: object
+      required:
+        - tags
+      properties:
+        tags:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Tag'
+
+    FolderListResponse:
+      type: object
+      required:
+        - folders
+      properties:
+        folders:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/FolderPath'
+
+    ApiErrorCode:
+      type: string
+      enum:
+        - validation_error
+        - not_found
+        - conflict
+        - payload_too_large
+        - method_not_allowed
+        - internal_error
+
+    ApiError:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          $ref: '#/components/schemas/ApiErrorCode'
+        message:
+          type: string
+          example: Document title must not contain control characters
+        field:
+          type: string
+          nullable: true
+          description: Target field or query parameter name when applicable
+          example: title

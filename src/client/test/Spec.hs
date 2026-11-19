@@ -7,7 +7,7 @@ module Main
 
 import           TamaTsuzura.Client.App                (ClientState(..), applyExtensionById, initialClientState)
 import           TamaTsuzura.Client.ExtensionRegistry  (bundledExtensions)
-import           TamaTsuzura.Common.Document           (DocumentBody(..), DocumentTitle(..))
+import           TamaTsuzura.Common.Document           (DocumentBody(..), emptyDocumentBody, emptyDocumentTitle)
 import           TamaTsuzura.ExtensionApi              (ExtensionId(..))
 import           Test.Hspec                            (Spec, describe, hspec, it, shouldBe)
 
@@ -20,8 +20,8 @@ spec =
         it "initializes empty document state with injected bundled extensions" $ do
             let state :: ClientState
                 state = initialClientState bundledExtensions
-            state.title `shouldBe` DocumentTitle ""
-            state.body `shouldBe` DocumentBody ""
+            state.title `shouldBe` emptyDocumentTitle
+            state.body `shouldBe` emptyDocumentBody
             length state.extensions `shouldBe` 1
 
         it "applies a bundled extension by id" $ do

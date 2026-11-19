@@ -1,7 +1,6 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NoFieldSelectors      #-}
 {-# LANGUAGE OverloadedRecordDot   #-}
-{-# LANGUAGE OverloadedStrings     #-}
 
 module TamaTsuzura.Client.App
     ( ClientState(..)
@@ -10,7 +9,7 @@ module TamaTsuzura.Client.App
     ) where
 
 import           Data.List                   (find)
-import           TamaTsuzura.Common.Document (DocumentBody(..), DocumentTitle(..))
+import           TamaTsuzura.Common.Document (DocumentBody(..), DocumentTitle, emptyDocumentBody, emptyDocumentTitle)
 import           TamaTsuzura.ExtensionApi    (Extension(..), ExtensionId, ExtensionMetadata(..))
 
 -- | クライアントコアの状態モデル (M0 最小骨格)。
@@ -28,8 +27,8 @@ data ClientState = ClientState
 -- | 拡張一覧を注入して初期クライアント状態を構築する。
 initialClientState :: [Extension] -> ClientState
 initialClientState exts = ClientState
-    { title      = DocumentTitle ""
-    , body       = DocumentBody ""
+    { title      = emptyDocumentTitle
+    , body       = emptyDocumentBody
     , extensions = exts
     }
 
