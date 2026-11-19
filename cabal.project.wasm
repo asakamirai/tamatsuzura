@@ -1,0 +1,23 @@
+-- GHC WebAssembly backend project configuration (wasm32-wasi-cabal)
+-- Usage: wasm32-wasi-cabal --project-file=cabal.project.wasm build all
+
+packages:
+  src/common
+  src/extension-api
+  src/extensions
+  src/client
+
+package *
+  shared: True
+
+package tamatsuzura-common
+  ghc-options: -Wall -Werror
+
+package tamatsuzura-extension-api
+  ghc-options: -Wall -Werror
+
+package tamatsuzura-extensions
+  ghc-options: -Wall -Werror
+
+package tamatsuzura-client
+  ghc-options: -Wall -Werror

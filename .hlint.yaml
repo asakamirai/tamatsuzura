@@ -1,0 +1,13 @@
+# HLint configuration for TamaTsuzura
+# Aligned with docs/coding_rules_haskell.md
+
+# Enforce partial function and space-leak bans
+- functions:
+  - { name: head,      within: [], message: "Avoid partial function head; use pattern matching or Data.Maybe.listToMaybe" }
+  - { name: tail,      within: [], message: "Avoid partial function tail; use pattern matching or safe alternatives" }
+  - { name: init,      within: [], message: "Avoid partial function init; use safe alternatives" }
+  - { name: last,      within: [], message: "Avoid partial function last; use safe alternatives" }
+  - { name: fromJust,  within: [], message: "Avoid partial function fromJust; handle Maybe explicitly" }
+  - { name: foldl,     within: [], message: "Avoid lazy foldl (space leak); use Data.List.foldl'" }
+  - { name: error,     within: [], message: "Avoid error; represent failures with Either or domain Result types" }
+  - { name: undefined, within: [], message: "Avoid undefined in committed code" }

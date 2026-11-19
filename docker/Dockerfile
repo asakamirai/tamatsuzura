@@ -6,21 +6,27 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-# Install base dependencies
+# Install base dependencies (including prerequisites for Stack and Haskell builds)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ca-certificates \
     curl \
     git \
+    gnupg \
+    libffi-dev \
     libgmp-dev \
     libncurses-dev \
     libsqlite3-dev \
+    netbase \
     pkg-config \
+    xz-utils \
     zlib1g-dev \
-    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Haskell Stack
-RUN curl -fsSL https://get.haskellstack.org/ | sh
+# Install Haskell Stack (refresh apt index so the installer's apt-get checks succeed)
+RUN apt-get update \
+    && curl -fsSL https://get.haskellstack.org/ | sh \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install HLint:
 # - On x86_64, keep the extracted directory (including data/hlint.yaml) under /opt/hlint

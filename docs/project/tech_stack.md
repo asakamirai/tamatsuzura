@@ -9,7 +9,7 @@
 | レイヤー | 技術 / ツール | 選定理由・目的 |
 | --- | --- | --- |
 | **主要言語** | Haskell (GHC 9.x 系列) | 強力な静的型付け、純粋関数型モデルによる不変性、サーバ・クライアント・拡張間の型共有 |
-| **ビルドツール（サーバ / 共通）** | Stack / Cabal | 再現性の高いパッケージ管理と依存関係の固定（M0 Phase 1 で詳細構成を確定） |
+| **ビルドツール（サーバ / 共通）** | Stack (LTS 24.67 / GHC 9.10.3) + Cabal (`cabal.project`) | 再現性の高いパッケージ管理と `.cabal` 単一ソースによる Wasm 構成との共有 |
 | **ビルドツール（クライアント Wasm）** | GHC Wasm バックエンド (`wasm32-wasi-ghc` / `wasm32-wasi-cabal` / `ghc-wasm-meta`) + `wasm-opt` | Miso および共通 Haskell コードの WebAssembly コンパイルとバイナリ最適化 |
 | **バックエンド** | WAI (`wai-extra` の `Network.Wai.Handler.CGI` + `warp`) / Servant | **CGI 最優先**かつ Warp スタンドアロン両対応の型安全な Web API 定義 |
 | **データベース** | SQLite (`direct-sqlite` 等、WAL + `busy_timeout`) | レンタルサーバ・CGI 環境で単一ファイル運用でき、ACID トランザクションと並行読み書きに強い |

@@ -1,0 +1,39 @@
+cabal-version: 3.0
+name:          tamatsuzura-extension-api
+version:       0.1.0.0
+synopsis:      Public extension interface types for TamaTsuzura
+license:       NONE
+build-type:    Simple
+
+common shared-options
+  default-language: GHC2021
+  ghc-options:
+    -Wall
+    -Werror
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wmissing-export-lists
+    -Wpartial-fields
+    -Wredundant-constraints
+
+library
+  import:          shared-options
+  hs-source-dirs:  src
+  exposed-modules:
+    TamaTsuzura.ExtensionApi
+  build-depends:
+      base               >= 4.18 && < 5
+    , tamatsuzura-common
+    , text               >= 2.0 && < 2.2
+
+test-suite tamatsuzura-extension-api-test
+  import:         shared-options
+  type:           exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is:        Spec.hs
+  build-depends:
+      base                      >= 4.18 && < 5
+    , hspec                     >= 2.11 && < 2.12
+    , tamatsuzura-common
+    , tamatsuzura-extension-api

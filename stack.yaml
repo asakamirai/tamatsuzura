@@ -1,0 +1,11 @@
+resolver: lts-24.67
+
+packages:
+  - src/common
+  - src/extension-api
+  - src/extensions
+  - src/server
+  - src/client
+
+ghc-options:
+  "$locals": -Wall -Werror

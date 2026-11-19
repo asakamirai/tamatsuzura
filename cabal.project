@@ -1,0 +1,21 @@
+packages:
+  src/common
+  src/extension-api
+  src/extensions
+  src/server
+  src/client
+
+package tamatsuzura-common
+  ghc-options: -Wall -Werror
+
+package tamatsuzura-extension-api
+  ghc-options: -Wall -Werror
+
+package tamatsuzura-extensions
+  ghc-options: -Wall -Werror
+
+package tamatsuzura-server
+  ghc-options: -Wall -Werror
+
+package tamatsuzura-client
+  ghc-options: -Wall -Werror
