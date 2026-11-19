@@ -1,0 +1,36 @@
+# Verification logs
+.check.log
+
+# Haskell (Stack / Cabal / GHC)
+.stack-work/
+dist-newstyle/
+cabal.project.local*
+.ghc.environment.*
+*.hi
+*.o
+*.dyn_hi
+*.dyn_o
+
+# Node.js / Frontend / Wasm
+node_modules/
+dist/
+.pnpm-store/
+
+# Local databases / runtime artifacts
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+.vscode/
+.idea/
