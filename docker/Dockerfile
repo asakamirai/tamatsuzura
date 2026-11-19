@@ -1,26 +1,35 @@
 FROM ubuntu:22.04
 
 ARG HLINT_VERSION=3.8
+ARG GHC_WASM_FLAVOUR=9.10
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-# Install base dependencies (including prerequisites for Stack and Haskell builds)
+# Install base dependencies (including prerequisites for Stack, Haskell builds, and ghc-wasm-meta)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    autoconf \
+    automake \
     build-essential \
+    bzip2 \
     ca-certificates \
     curl \
     git \
     gnupg \
+    jq \
     libffi-dev \
     libgmp-dev \
     libncurses-dev \
     libsqlite3-dev \
     netbase \
+    patch \
     pkg-config \
+    python3 \
+    unzip \
     xz-utils \
     zlib1g-dev \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Haskell Stack (refresh apt index so the installer's apt-get checks succeed)
@@ -46,6 +55,15 @@ RUN ARCH="$(uname -m)" \
        fi \
     && hlint --version \
     && printf 'module Main where\nmain :: IO ()\nmain = putStrLn "ok"\n' | hlint -
+
+# Install GHC WebAssembly backend (ghc-wasm-meta) and expose a non-interactive exec helper
+RUN export FLAVOUR="${GHC_WASM_FLAVOUR}" \
+    && curl --proto '=https' --tlsv1.2 -fsSL https://gitlab.haskell.org/haskell-wasm/ghc-wasm-meta/-/raw/master/bootstrap.sh | sh \
+    && printf '#!/bin/sh\nset -eu\n. /root/.ghc-wasm/env\nexec "$@"\n' > /usr/local/bin/ghc-wasm-exec \
+    && chmod +x /usr/local/bin/ghc-wasm-exec \
+    && ghc-wasm-exec wasm32-wasi-ghc --version \
+    && ghc-wasm-exec wasm32-wasi-cabal --version \
+    && ghc-wasm-exec wasm32-wasi-cabal update
 
 # Install Node.js (LTS) for client/wasm/tooling
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \

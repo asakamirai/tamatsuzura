@@ -8,8 +8,8 @@
 
 以下のいずれかの実行環境を用意してください。
 
-- **ホスト環境 (推奨: Antigravity 標準サンドボックス対応)**: `stack`（またはホスト単独利用時の `cabal`）および `hlint` がインストールされていること。
-- **Docker 環境 (再現性重視・ホスト非汚染)**: **Docker** および **Docker Compose** がインストールされていること（コンテナ内は `stack` + `hlint` 標準構成）。
+- **ホスト環境 (推奨: Antigravity 標準サンドボックス対応)**: `stack`（またはホスト単独利用時の `cabal`）、`hlint`、および Wasm ビルド用 `wasm32-wasi-cabal`（`~/.ghc-wasm/env` 自動読込対応）がインストールされていること。
+- **Docker 環境 (再現性重視・ホスト非汚染)**: **Docker** および **Docker Compose** がインストールされていること（コンテナ内は `stack` + `hlint` + GHC 9.10 Wasm `ghc-wasm-meta` 標準構成。成果物は `.stack-work-docker/` / `dist-newstyle-docker/` へ分離されるためホスト環境と競合しない）。
   - `scripts/*.sh` はホストに Haskell ツールがあればホスト側を優先し、未導入環境または `USE_DOCKER=1` 指定時に自動で Docker Compose (`docker/docker-compose.yml`) を使用します。
   - Antigravity で Docker 経由実行を行う場合は、`/var/run/docker.sock` アクセスのため標準サンドボックス外 (`BypassSandbox: true`) での実行が必要になります。
 
@@ -35,8 +35,9 @@
 
 | コマンド | 説明 |
 | --- | --- |
-| `scripts/check.sh` | build → test → lint を一括実行 |
-| `scripts/build.sh` | ビルドの実行 |
+| `scripts/check.sh` | build（ネイティブ + Wasm）→ test → lint を一括実行 |
+| `scripts/build.sh` | プロジェクト全体のビルド（ネイティブ + Wasm。`SKIP_WASM=1` でネイティブのみ可） |
+| `scripts/build-wasm.sh` | GHC Wasm クライアント（`cabal.project.wasm`）単体ビルド |
 | `scripts/test.sh` | テストスイートの実行 |
 | `scripts/lint.sh` | 静的解析 (Lint) の実行 |
 | `scripts/run-server.sh` | ローカル開発用サーバの起動 (ポート 8080) |

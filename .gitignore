@@ -3,8 +3,10 @@
 
 # Haskell (Stack / Cabal / GHC)
 .stack-work/
+.stack-work-docker/
 dist-newstyle/
-cabal.project.local*
+dist-newstyle-docker/
+cabal.project*.local*
 .ghc.environment.*
 *.hi
 *.o

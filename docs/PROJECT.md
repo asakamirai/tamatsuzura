@@ -10,7 +10,7 @@
 
 ## 現在地
 
-**M0 Phase 1（リポジトリ構成とビルドツールの初期設定）完了。次は M0 Phase 2（Docker 開発環境および Wasm 最小ビルドの疎通確認）へ着手予定。**
+**M0 Phase 2（Docker 開発環境および Wasm 最小ビルドの疎通確認）完了。次は M0 Phase 3（自動検証・CI スクリプト `scripts/check.sh` の稼働確認）へ着手予定。**
 
 | マイルストーン | 内容 | 状態 | 完了記録 |
 | --- | --- | --- | --- |
@@ -33,7 +33,7 @@
 
 - [x] Phase 0: 要件定義の確定 ([REQUIREMENTS.md](./REQUIREMENTS.md) および関連設計書の同期)
 - [x] Phase 1: リポジトリ構成とビルドツールの初期設定 (サーバ向け Haskell + Wasm クライアント向け `wasm32-wasi-cabal` 設定)
-- [ ] Phase 2: Docker 開発環境および Wasm 最小ビルドの疎通確認 (`scripts/build.sh`, `scripts/test.sh`, `scripts/lint.sh`)
+- [x] Phase 2: Docker 開発環境および Wasm 最小ビルドの疎通確認 (`scripts/build.sh`, `scripts/test.sh`, `scripts/lint.sh`)
 - [ ] Phase 3: 自動検証・CI スクリプト (`scripts/check.sh`) の稼働確認
 
 ※ マイルストーンの新規追加や調整は Antigravity スキル `add-milestone` を利用してください。

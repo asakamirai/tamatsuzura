@@ -21,11 +21,11 @@ run_in_docker() {
 
 if [ -f "stack.yaml" ]; then
   if [ "${USE_DOCKER}" = "1" ]; then
-    run_in_docker stack run tamatsuzura-server -- --port "${PORT}"
+    run_in_docker stack --allow-different-user run tamatsuzura-server -- --port "${PORT}"
   elif command -v stack >/dev/null 2>&1; then
     stack run tamatsuzura-server -- --port "${PORT}"
   elif command -v docker >/dev/null 2>&1 && [ -f "docker/docker-compose.yml" ]; then
-    run_in_docker stack run tamatsuzura-server -- --port "${PORT}"
+    run_in_docker stack --allow-different-user run tamatsuzura-server -- --port "${PORT}"
   else
     echo "Error: Neither stack nor docker is available." >&2
     exit 1

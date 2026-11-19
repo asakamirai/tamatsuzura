@@ -39,13 +39,14 @@ TamaTsuzura リポジトリで作業する Antigravity AI エージェントお�
 | コマンド | 用途 |
 | --- | --- |
 | `scripts/check.sh` | build → test → lint を一括実行。全ログは `.check.log` に出力し、失敗時は末尾 30 行を表示する（詳細は `.check.log` を確認） |
-| `scripts/build.sh` | プロジェクト全体のビルド |
+| `scripts/build.sh` | プロジェクト全体のビルド（ネイティブ Haskell + Wasm クライアント。`SKIP_WASM=1` で Wasm 省略可） |
+| `scripts/build-wasm.sh` | Wasm クライアント（`cabal.project.wasm`）単体ビルド |
 | `scripts/test.sh` | テストスイートの実行 |
 | `scripts/lint.sh` | 静的解析 (`hlint`) の実行 |
 | `scripts/run-server.sh` | 開発用サーバの起動 |
 
 ### サンドボックス / Docker 実行方針
-- 各スクリプトはホストに `stack` / `hlint` がある場合はホスト側ツールを優先し、未導入環境または `USE_DOCKER=1` 指定時に Docker Compose (`docker/docker-compose.yml`) へフォールバックします。
+- 各スクリプトはホストに `stack` / `hlint` / `wasm32-wasi-cabal` がある場合はホスト側ツールを優先し、未導入環境または `USE_DOCKER=1` 指定時に Docker Compose (`docker/docker-compose.yml`) へフォールバックします。
 - まず標準サンドボックス (`BypassSandbox: false`) で実行し、Docker ソケット (`/var/run/docker.sock`) へのアクセスや依存取得でブロックされた場合のみ最小範囲で `BypassSandbox: true` を使用します。
 
 ---

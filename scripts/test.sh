@@ -24,11 +24,11 @@ has_hs_files() {
 
 if [ -f "stack.yaml" ]; then
   if [ "${USE_DOCKER}" = "1" ]; then
-    run_in_docker stack test --fast
+    run_in_docker stack --allow-different-user test --fast
   elif command -v stack >/dev/null 2>&1; then
     stack test --fast
   elif command -v docker >/dev/null 2>&1 && [ -f "docker/docker-compose.yml" ]; then
-    run_in_docker stack test --fast
+    run_in_docker stack --allow-different-user test --fast
   else
     echo "Error: Neither stack nor docker is available." >&2
     exit 1
