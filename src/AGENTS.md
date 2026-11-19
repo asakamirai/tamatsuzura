@@ -7,9 +7,9 @@
 
 - `src/common/`: **外部フレームワーク (Warp, Miso, SQLite 等) および `IO` 副作用を一切禁止**。完全な純粋関数として実装し、`hspec` + `QuickCheck` でテストする。
 - `src/server/`: 内部パッケージは `src/common/` のみに依存。`src/client/` への依存禁止。
-- `src/client/`: 内部パッケージは `src/common/`（拡張連携時は `src/extension-api/`）に依存。`src/server/` 内部実装への直接依存禁止（Web API 経由）。
+- `src/client/`: コア UI・ロジックの内部依存は `src/common/` と `src/extension-api/` のみ。同梱拡張を登録するエントリポイント／レジストリ結線層に限定して `src/extensions/` への片方向依存を許可する。`src/server/` 内部実装への直接依存禁止（Web API 経由）。
 - `src/extension-api/`: 内部パッケージは `src/common/` のみに依存。後方互換性を厳格に維持する。
-- `src/extensions/`: `src/extension-api/` 経由でのみ本体機能と連携する。
+- `src/extensions/`: `src/extension-api/`（および必要に応じ `src/common/`）のみに依存し、`src/client/`・`src/server/` への依存を禁止する。
 
 ## Haskell 必須チェックポイント
 

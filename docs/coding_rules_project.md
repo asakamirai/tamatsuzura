@@ -8,7 +8,7 @@
 
 ## 1. アーキテクチャと責務境界
 
-本プロジェクトは、クライアント・サーバ・拡張機能から構成されるWeb/デスクトップ向け文書編集・差分管理システムです。
+本プロジェクトは、クライアント・サーバ・拡張機能から構成されるモバイル/PC ブラウザ向け文書編集・差分管理システムです。
 ドメイン境界を厳格に保ち、疎結合でテスト容易性の高い設計を維持します。
 
 ### 1-1. パッケージ・ディレクトリ構成と依存関係
@@ -19,24 +19,27 @@
 flowchart TD
     Common["src/common/<br>(純粋ドメイン・差分計算・共通型)"]
     ExtAPI["src/extension-api/<br>(拡張向け公開インターフェース)"]
-    Server["src/server/<br>(HTTP API / SQLite / 認証)"]
-    Client["src/client/<br>(UI / Wasm / オフライン同期)"]
-    Exts["src/extensions/<br>(拡張機能実装)"]
+    Server["src/server/<br>(WAI CGI/Warp / SQLite / 認証)"]
+    ClientCore["src/client/ コア<br>(Miso UI / Wasm / 同期)"]
+    ClientEntry["src/client/ 結線層<br>(同梱拡張レジストリ)"]
+    Exts["src/extensions/<br>(同梱・サンプル拡張機能実装)"]
 
     Server --> Common
-    Client --> Common
+    ClientCore --> Common
+    ClientCore --> ExtAPI
+    ClientEntry --> ClientCore
+    ClientEntry -. 同梱登録のみ .-> Exts
     ExtAPI --> Common
     Exts --> ExtAPI
-    Client -.-> ExtAPI
 ```
 
 | ディレクトリ | 役割と責務 | 依存ルール・制約 |
 | --- | --- | --- |
 | **`src/common/`** | クライアント・サーバ共通の純粋データ型、差分計算ロジック、バリデーション | **外部フレームワーク (Warp, Miso, SQLite 等) や IO 副作用に一切依存してはならない**。完全な純粋関数としてテスト可能にする |
-| **`src/server/`** | バックエンド HTTP サーバ (Warp/Servant)、SQLite 永続化、認証・セッション管理 | `src/common/` に依存する。クライアント実装には依存しない |
-| **`src/client/`** | フロントエンド UI 実装 (Miso/Wasm)、エディタコア、オフライン同期、ローカルストレージ | `src/common/` に依存する。サーバ内部実装には直接依存しない (Web API 経由) |
-| **`src/extension-api/`** | 拡張機能開発者向けの公開インターフェース型定義 | `src/common/` に依存する。後方互換性を厳格に維持する |
-| **`src/extensions/`** | 各種サンプル・プラグイン実装 | `src/extension-api/` 経由でのみ本体機能と通信する |
+| **`src/server/`** | バックエンド HTTP サーバ (WAI: CGI/Warp + Servant)、SQLite 永続化、認証・セッション管理 | 内部パッケージは `src/common/` のみに依存する。クライアント実装には依存しない |
+| **`src/client/`** | フロントエンド UI 実装 (Miso/GHC Wasm)、CodeMirror 6 等の薄い JSFFI、オフライン同期、IndexedDB | コア UI・ロジックは `src/common/` と `src/extension-api/` のみに依存する。同梱拡張の登録を行う**エントリポイント／レジストリ結線層に限定**して `src/extensions/` への片方向依存を許可し、`src/extension-api/` の抽象型として本体へ注入する。サーバ内部実装には直接依存しない (Web API 経由) |
+| **`src/extension-api/`** | 拡張機能開発者向けの公開インターフェース型定義 | 内部パッケージは `src/common/` のみに依存する。後方互換性を厳格に維持する |
+| **`src/extensions/`** | 同梱・サンプル拡張機能の実装 | `src/extension-api/`（および必要に応じ `src/common/`）のみに依存し、`src/client/`・`src/server/` への依存を禁止する |
 
 ### 1-2. 言語選択と純粋性の原則
 
