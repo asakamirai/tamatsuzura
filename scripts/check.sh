@@ -9,11 +9,13 @@ cd "${ROOT_DIR}"
 
 echo "=== Running check (build -> test -> lint) ==="
 rm -f "${LOG_FILE}"
+: > "${LOG_FILE}"
 
 step() {
   local name="$1"
   local cmd="$2"
-  echo -n "[check] Running ${name}... "
+  printf '[check] Running %s... ' "${name}"
+  printf '\n===== [check] %s =====\n' "${name}" >> "${LOG_FILE}"
   if "${cmd}" >> "${LOG_FILE}" 2>&1; then
     echo "OK"
   else

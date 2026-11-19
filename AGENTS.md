@@ -51,19 +51,22 @@ TamaTsuzura リポジトリで作業する Antigravity AI エージェントお�
 
 ---
 
-## 4. ディレクトリ構造 (構成方針)
+## 4. ディレクトリ構造
 
-M0 完了時に実態に合わせて更新してください（詳細は [docs/project/architecture.md](docs/project/architecture.md)）。
+M0 にて確定した構成です（パッケージ間依存の詳細は [docs/project/architecture.md](docs/project/architecture.md) および [docs/coding_rules_project.md](docs/coding_rules_project.md) を参照）。
 
-- `src/common/`: クライアント・サーバ共通の純粋データ型、差分計算、バリデーション
-- `src/server/`: バックエンド HTTP サーバ、SQLite 永続化、認証
-- `src/client/`: フロントエンド UI、エディタコア統合、オフライン同期 (Wasm/Miso)
-- `src/extension-api/`: 拡張機能開発者向けの公開インターフェース型定義
-- `src/extensions/`: サンプル拡張機能の実装
+- `stack.yaml` / `stack.yaml.lock` / `cabal.project`: ネイティブ Haskell（Stack LTS 24.67 / GHC 9.10.3 + Cabal）設定
+- `cabal.project.wasm`: GHC Wasm クライアント（`wasm32-wasi-cabal`）設定
+- `.hlint.yaml`: プロジェクト共通 HLint ルール
+- `src/common/`: クライアント・サーバ共通の純粋データ型、差分計算、バリデーション (`tamatsuzura-common`)
+- `src/server/`: バックエンド HTTP サーバ（WAI: CGI `tamatsuzura-cgi` / Warp `tamatsuzura-server`）、SQLite 永続化、認証 (`tamatsuzura-server`)
+- `src/client/`: フロントエンド UI（`src-core/` 内部サブライブラリ＋`src/` 同梱拡張結線層＋`app/` Wasm リアクタ、`tamatsuzura-client`）
+- `src/extension-api/`: 拡張機能開発者向けの公開インターフェース型定義 (`tamatsuzura-extension-api`)
+- `src/extensions/`: 同梱・サンプル拡張機能の実装 (`tamatsuzura-extensions`)
 - `src/AGENTS.md`: `src/` 配下編集時に自動適用される実装ガードレール
-- `docs/`: 要件・計画・コーディング規約・API 仕様・手動検証手順
-- `scripts/`: ビルド・テスト・Lint 等の共通ラッパースクリプト
-- `docker/`: 開発用 Dockerfile および `docker-compose.yml`
+- `docs/`: 要件・計画・コーディング規約・API 仕様・手動検証手順・マイルストーン完了記録 (`docs/project/history/`)
+- `scripts/`: ビルド・テスト・Lint・Wasm ビルド・開発サーバ起動の共通ラッパースクリプト
+- `docker/`: 開発用 `Dockerfile`（Stack + HLint + GHC 9.10 Wasm + Node.js/pnpm）および `docker-compose.yml`
 - `.agents/`: Antigravity カスタマイズ（`skills/`, `hooks.json`, `hooks/`）
 
 ---
