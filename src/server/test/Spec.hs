@@ -7,6 +7,7 @@ module Main
 import qualified Network.HTTP.Types     as Http
 import qualified Network.Wai            as Wai
 import qualified Network.Wai.Test       as WaiTest
+import           StorageSpec            (storageSpec)
 import           TamaTsuzura.Server.App (application, defaultServerPort, mkServerPort, parsePortArgs, serverPortValue)
 import           Test.Hspec             (Spec, describe, hspec, it, shouldBe)
 
@@ -15,6 +16,7 @@ main = hspec spec
 
 spec :: Spec
 spec = do
+    storageSpec
     describe "parsePortArgs" $ do
         it "returns defaultServerPort when no arguments are given" $
             parsePortArgs [] `shouldBe` Right defaultServerPort

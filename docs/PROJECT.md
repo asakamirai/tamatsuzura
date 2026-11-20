@@ -10,7 +10,7 @@
 
 ## 現在地
 
-**M1（MVP サーバ: 文書 CRUD + CGI / Warp 両対応）進行中。Phase 1 完了、次は Phase 2（SQLite 永続化層）へ着手予定。**
+**M1（MVP サーバ: 文書 CRUD + CGI / Warp 両対応）進行中。Phase 2 完了、次は Phase 3（WAI / Servant REST API 実装および Warp / CGI 統合・疎通テスト）へ着手予定。**
 
 | マイルストーン | 内容 | 状態 | 完了記録 |
 | --- | --- | --- | --- |
@@ -32,7 +32,7 @@
 **M1: MVP サーバ (文書 CRUD + CGI / Warp 両対応)**
 
 - [x] Phase 1: 共通ドメイン型（文書・タグ/整理メタデータ・論理削除・CRUD DTO）の実装と [docs/api/openapi.yaml](./api/openapi.yaml) の詳細定義
-- [ ] Phase 2: SQLite 永続化層（スキーマ初期化・WAL + `busy_timeout`・CRUD・ゴミ箱/復元/完全削除）の実装と単体テスト
+- [x] Phase 2: SQLite 永続化層（スキーマ初期化・WAL + `busy_timeout`・CRUD・ゴミ箱/復元/完全削除）の実装と単体テスト
 - [ ] Phase 3: WAI / Servant 文書 CRUD REST API 実装および Warp / CGI 両エントリポイントの統合・疎通テスト
 
 ※ マイルストーンの新規追加や調整は Antigravity スキル `add-milestone` を利用してください。
