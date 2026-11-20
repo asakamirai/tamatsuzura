@@ -41,3 +41,15 @@
 | `scripts/test.sh` | テストスイートの実行 |
 | `scripts/lint.sh` | 静的解析 (Lint) の実行 |
 | `scripts/run-server.sh` | ローカル開発用サーバの起動 (ポート 8080) |
+
+---
+
+## 4. サーバ起動オプションと環境変数
+
+Warp サーバ (`tamatsuzura-server`) および CGI バイナリ (`tamatsuzura-cgi`) は以下の環境変数・CLI オプションをサポートします。同一項目が両方指定された場合は CLI 引数が優先されます。
+
+| 項目 | 環境変数 | Warp CLI 引数 | 既定値 |
+| --- | --- | --- | --- |
+| 待受ポート | `PORT` | `--port PORT` | `8080` |
+| SQLite DB パス | `TAMATSUZURA_DB_PATH` | `--db-path PATH` | `data/tamatsuzura.sqlite3` |
+| SQLite `busy_timeout` (ms) | `TAMATSUZURA_DB_BUSY_TIMEOUT_MS` | `--busy-timeout-ms MS` | `5000` (範囲: `0..300000`) |

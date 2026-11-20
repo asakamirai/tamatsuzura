@@ -12,7 +12,14 @@ echo "Starting TamaTsuzura development server on port ${PORT}..."
 
 run_in_docker() {
   if command -v docker >/dev/null 2>&1 && [ -f "docker/docker-compose.yml" ]; then
-    PORT="${PORT}" docker compose -f docker/docker-compose.yml run --rm --service-ports dev "$@"
+    local docker_env_args=()
+    if [ -n "${TAMATSUZURA_DB_PATH+x}" ]; then
+      docker_env_args+=(-e "TAMATSUZURA_DB_PATH=${TAMATSUZURA_DB_PATH}")
+    fi
+    if [ -n "${TAMATSUZURA_DB_BUSY_TIMEOUT_MS+x}" ]; then
+      docker_env_args+=(-e "TAMATSUZURA_DB_BUSY_TIMEOUT_MS=${TAMATSUZURA_DB_BUSY_TIMEOUT_MS}")
+    fi
+    PORT="${PORT}" docker compose -f docker/docker-compose.yml run --rm --service-ports "${docker_env_args[@]}" dev "$@"
   else
     echo "Error: Docker or docker/docker-compose.yml is not available." >&2
     exit 1

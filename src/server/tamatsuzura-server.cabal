@@ -21,17 +21,21 @@ library
   import:          shared-options
   hs-source-dirs:  src
   exposed-modules:
+    TamaTsuzura.Server.Api
     TamaTsuzura.Server.App
+    TamaTsuzura.Server.Config
     TamaTsuzura.Server.Storage
     TamaTsuzura.Server.Storage.Schema
     TamaTsuzura.Server.Storage.Types
   build-depends:
       aeson              >= 2.1     && < 2.3
     , base               >= 4.18    && < 5
+    , bytestring         >= 0.11    && < 0.13
     , containers         >= 0.6     && < 0.8
     , directory          >= 1.3.8   && < 1.4
     , filepath           >= 1.4.100 && < 1.6
     , http-types         >= 0.12    && < 0.13
+    , servant-server     >= 0.20    && < 0.21
     , sqlite-simple      >= 0.4     && < 0.5
     , tamatsuzura-common
     , text               >= 2.0     && < 2.2
@@ -47,8 +51,8 @@ executable tamatsuzura-server
   build-depends:
       base               >= 4.18 && < 5
     , tamatsuzura-server
-    , text               >= 2.0 && < 2.2
-    , warp               >= 3.3 && < 3.5
+    , text               >= 2.0  && < 2.2
+    , warp               >= 3.3  && < 3.5
 
 executable tamatsuzura-cgi
   import:         shared-options
@@ -57,7 +61,8 @@ executable tamatsuzura-cgi
   build-depends:
       base               >= 4.18 && < 5
     , tamatsuzura-server
-    , wai-extra          >= 3.1 && < 3.2
+    , text               >= 2.0  && < 2.2
+    , wai-extra          >= 3.1  && < 3.2
 
 test-suite tamatsuzura-server-test
   import:         shared-options
@@ -65,13 +70,18 @@ test-suite tamatsuzura-server-test
   hs-source-dirs: test
   main-is:        Spec.hs
   other-modules:
+    ApiSpec
+    IntegrationSpec
     StorageSpec
   ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      base               >= 4.18    && < 5
+      aeson              >= 2.1     && < 2.3
+    , base               >= 4.18    && < 5
+    , bytestring         >= 0.11    && < 0.13
     , directory          >= 1.3.8   && < 1.4
     , filepath           >= 1.4.100 && < 1.6
     , hspec              >= 2.11    && < 2.12
+    , http-client        >= 0.7     && < 0.8
     , http-types         >= 0.12    && < 0.13
     , sqlite-simple      >= 0.4     && < 0.5
     , tamatsuzura-common
@@ -81,3 +91,4 @@ test-suite tamatsuzura-server-test
     , uuid               >= 1.3     && < 1.4
     , wai                >= 3.2     && < 3.3
     , wai-extra          >= 3.1     && < 3.2
+    , warp               >= 3.3     && < 3.5

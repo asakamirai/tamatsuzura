@@ -43,7 +43,7 @@
 
 ---
 
-## 基本検証項目 (テンプレート)
+## 検証項目一覧
 
 ### MT-1: サインインと文書の基本保存
 
@@ -67,6 +67,54 @@
    - 確認項目: 直前に保存した文書と内容が正しく復元されること。
 
 **再実施が必要になる変更**: 認証機能、文書 CRUD API、DB ストレージ接続、エディタ基本 UI の変更時。
+
+---
+
+### MT-2: Warp / CGI 実バイナリでの REST API 疎通と SQLite 永続化検証
+
+**確認したいこと**: ビルド済み実バイナリ (`tamatsuzura-server` および `tamatsuzura-cgi`) をそれぞれ独立プロセスとして起動し、同一 SQLite ファイルに対して文書 CRUD・ゴミ箱移動・復元・完全削除が一貫して動作すること。
+
+**手順**:
+1. リポジトリルートで `scripts/build.sh` を実行し、ワークスペース直下に一時 DB パスを指定する（ホスト実行・Docker 実行の両方から同一ファイルを参照でき、かつ `.gitignore` 対象となる相対パスを使用する）:
+   ```bash
+   export TAMATSUZURA_DB_PATH=./tmp-mt2.sqlite3
+   ```
+   - 確認項目: ビルドがエラーなく完了すること。
+2. Warp サーバを起動する（Docker 経由で実行する場合は `USE_DOCKER=1` を付与）:
+   ```bash
+   PORT=18080 scripts/run-server.sh
+   ```
+   別ターミナルからヘルスチェックと文書作成を実行する:
+   ```bash
+   curl -i http://127.0.0.1:18080/api/health
+   curl -i -X POST http://127.0.0.1:18080/api/documents \
+     -H 'Content-Type: application/json' \
+     -d '{"title":"MT-2確認","body":"Warp作成本文","folder":"manual/test","tags":["mt2"]}'
+   ```
+   - 確認項目: `/api/health` が `HTTP/1.1 200 OK` と `{"status":"ok"}` を返すこと。
+   - 確認項目: `POST /api/documents` が `HTTP/1.1 201 Created` と生成された `id` を含む JSON を返すこと（返却された `id` を `<DOC_ID>` として控える）。
+3. Warp サーバを `Ctrl+C` で停止し、同じ DB ファイルに対して CGI バイナリ (`tamatsuzura-cgi`) を CGI/1.1 環境変数で直接呼び出す:
+   - ホストに `stack` がある場合:
+     ```bash
+     GATEWAY_INTERFACE=CGI/1.1 REQUEST_METHOD=GET SCRIPT_NAME=/cgi-bin/tamatsuzura.cgi \
+       PATH_INFO="/api/documents/<DOC_ID>" SERVER_PROTOCOL=HTTP/1.1 SERVER_NAME=localhost \
+       SERVER_PORT=80 REMOTE_ADDR=127.0.0.1 TAMATSUZURA_DB_PATH=./tmp-mt2.sqlite3 \
+       stack exec tamatsuzura-cgi
+     ```
+   - Docker 環境 (`USE_DOCKER=1` / ホスト `stack` 未導入) の場合:
+     ```bash
+     docker compose -f docker/docker-compose.yml run --rm -T \
+       -e GATEWAY_INTERFACE=CGI/1.1 -e REQUEST_METHOD=GET -e SCRIPT_NAME=/cgi-bin/tamatsuzura.cgi \
+       -e "PATH_INFO=/api/documents/<DOC_ID>" -e SERVER_PROTOCOL=HTTP/1.1 -e SERVER_NAME=localhost \
+       -e SERVER_PORT=80 -e REMOTE_ADDR=127.0.0.1 -e TAMATSUZURA_DB_PATH=./tmp-mt2.sqlite3 \
+       dev stack --allow-different-user exec tamatsuzura-cgi
+     ```
+   - 確認項目: `Status: 200 OK`、`Content-Type: application/json;charset=utf-8`、および手順 2 で作成した文書の JSON が標準出力に返ること。
+4. 同様に CGI バイナリ経由で論理削除 (`REQUEST_METHOD=DELETE`, `PATH_INFO="/api/documents/<DOC_ID>"`)、復元 (`REQUEST_METHOD=POST`, `PATH_INFO="/api/documents/<DOC_ID>/restore"`)、再度の論理削除、完全削除 (`REQUEST_METHOD=DELETE`, `PATH_INFO="/api/documents/<DOC_ID>/permanent"`) を順に実行する。
+   - 確認項目: 論理削除で `Status: 200 OK` かつ `deleted_at` が非 null、復元で `Status: 200 OK` かつ `deleted_at` が `null`、完全削除で `Status: 204 No Content` かつボディ空であること。
+5. 検証終了後、一時 DB ファイル (`./tmp-mt2.sqlite3`, `./tmp-mt2.sqlite3-wal`, `./tmp-mt2.sqlite3-shm`) を削除する。
+
+**再実施が必要になる変更**: `src/server/app/{WarpMain,CgiMain}.hs`、`TamaTsuzura.Server.{Config,Api,App,Storage}`、`scripts/run-server.sh`、または本番 CGI / Web サーバ設定の変更時。
 
 ---
 

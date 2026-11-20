@@ -1,21 +1,23 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 module Main
     ( main
     ) where
 
-import qualified Data.Text.IO             as Txt
-import qualified Network.Wai.Handler.Warp as Warp
-import qualified System.Environment       as Env
-import qualified System.Exit              as Exit
-import qualified System.IO                as Sys
-import           TamaTsuzura.Server.App   (application, parsePortArgs, serverPortValue)
+import qualified Data.Text.IO              as TxtIO
+import qualified Network.Wai.Handler.Warp  as Warp
+import qualified System.Exit               as Exit
+import qualified System.IO                 as Sys
+import           TamaTsuzura.Server.App    (mkApplication)
+import           TamaTsuzura.Server.Config (WarpConfig(..), loadWarpConfig, serverPortValue)
 
 -- | ローカル開発およびスタンドアロン運用向けの Warp HTTP サーバエントリポイント。
 main :: IO ()
 main = do
-    args <- Env.getArgs
-    case parsePortArgs args of
+    eCfg <- loadWarpConfig
+    case eCfg of
         Left errMsg -> do
-            Txt.hPutStrLn Sys.stderr errMsg
+            TxtIO.hPutStrLn Sys.stderr errMsg
             Exit.exitFailure
-        Right port  ->
-            Warp.run (serverPortValue port) application
+        Right cfg   ->
+            Warp.run (serverPortValue cfg.port) (mkApplication cfg.storage)
