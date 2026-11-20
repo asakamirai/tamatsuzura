@@ -9,14 +9,16 @@ module TamaTsuzura.Client.I18n
     , formatDocumentFormat
     , formatApiClientError
     , formatValidationError
+    , formatFileImportError
     ) where
 
-import           Data.Text                     (Text)
-import qualified Data.Text                     as Txt
-import           TamaTsuzura.Client.Api        (ApiClientError(..))
-import           TamaTsuzura.Common.Api        (ApiError(..), ApiErrorCode(..))
-import           TamaTsuzura.Common.Document   (DocumentFormat(..))
-import           TamaTsuzura.Common.Validation (ValidationError(..))
+import           Data.Text                       (Text)
+import qualified Data.Text                       as Txt
+import           TamaTsuzura.Client.Api          (ApiClientError(..))
+import           TamaTsuzura.Client.FileTransfer (FileImportError(..))
+import           TamaTsuzura.Common.Api          (ApiError(..), ApiErrorCode(..))
+import           TamaTsuzura.Common.Document     (DocumentFormat(..))
+import           TamaTsuzura.Common.Validation   (ValidationError(..))
 
 -- | クライアント UI の全表示文言を集約するメッセージカタログ。
 -- 将来の多言語化 (英語リソース追加や UI 言語切替) に備え、
@@ -70,6 +72,34 @@ data UiMessages = UiMessages
       -- ^ 未保存変更を破棄して続行するボタンラベル
     , actionConfirmPermanentDel  :: !Text
       -- ^ 完全削除を確定するボタンラベル
+    , actionImport               :: !Text
+      -- ^ ファイルインポートボタンラベル
+    , actionImporting            :: !Text
+      -- ^ ファイルインポート中ボタンラベル
+    , actionExport               :: !Text
+      -- ^ ファイルエクスポートボタンラベル
+    , actionDiscardDraft         :: !Text
+      -- ^ ローカル未保存ドラフト破棄ボタンラベル
+    , actionApplyDraft           :: !Text
+      -- ^ 更新前ローカルドラフト適用ボタンラベル
+    , actionRecoverOrphanDraft   :: !Text
+      -- ^ 孤立ドラフトを新規文書として復元するボタンラベル
+    , badgeHasDraft              :: !Text
+      -- ^ 文書一覧に表示する未保存ドラフト保有バッジ文言
+    , draftStatePending          :: !Text
+      -- ^ ローカルドラフト退避中インジケータ
+    , draftStateSaved            :: !Text
+      -- ^ ローカルドラフト退避済みインジケータ
+    , draftStateFailed           :: !Text
+      -- ^ ローカルドラフト退避失敗インジケータ
+    , draftRestoredBanner        :: !Text
+      -- ^ ローカル未保存ドラフト復元完了バナー文言
+    , draftStaleBanner           :: !Text
+      -- ^ サーバ側更新済み文書に対する未保存ドラフト存在警告バナー文言
+    , draftTrashedBanner         :: !Text
+      -- ^ ゴミ箱内文書に対する残存ドラフト案内バナー文言
+    , draftOrphanedBanner        :: !Text
+      -- ^ サーバ削除済み文書に対する孤立ドラフト救出バナー文言
     , tabActiveDocuments         :: !Text
       -- ^ 稼働中文書タブ文言
     , tabTrashDocuments          :: !Text
@@ -180,6 +210,14 @@ data UiMessages = UiMessages
       -- ^ 完全削除完了通知
     , noticeExtensionApplied     :: !Text
       -- ^ 拡張適用完了通知
+    , noticeDraftRestored        :: !Text
+      -- ^ 未保存ドラフト復元完了通知
+    , noticeDraftDiscarded       :: !Text
+      -- ^ 未保存ドラフト破棄完了通知
+    , noticeExportedPrefix       :: !Text
+      -- ^ エクスポート完了通知の接頭辞
+    , noticeImportedPrefix       :: !Text
+      -- ^ インポート完了通知の接頭辞
     , confirmUnsavedTitle        :: !Text
       -- ^ 未保存変更破棄確認モーダル見出し
     , confirmUnsavedBody         :: !Text
@@ -202,6 +240,14 @@ data UiMessages = UiMessages
       -- ^ サーバ・HTTP エラーの日本語説明接頭辞
     , errDecodeMessage           :: !Text
       -- ^ レスポンス解析失敗時の日本語説明
+    , errDraftStoragePrefix      :: !Text
+      -- ^ IndexedDB ドラフト操作失敗時の接頭辞
+    , errExportFailedPrefix      :: !Text
+      -- ^ ファイルエクスポート失敗時の接頭辞
+    , errImportInvalidUtf8       :: !Text
+      -- ^ UTF-8 以外のファイルインポート拒否時の説明
+    , errImportFailedPrefix      :: !Text
+      -- ^ ファイルインポート失敗時の接頭辞
     , valTitleTooLong            :: !Text
       -- ^ タイトル文字数上限超過の説明
     , valTitleControlChar        :: !Text
@@ -255,6 +301,20 @@ jaMessages = UiMessages
     , actionSearchRun           = "検索"
     , actionDiscardAndContinue  = "変更を破棄して移動"
     , actionConfirmPermanentDel = "完全に削除する"
+    , actionImport              = "インポート"
+    , actionImporting           = "インポート中..."
+    , actionExport              = "エクスポート"
+    , actionDiscardDraft        = "ドラフトを破棄"
+    , actionApplyDraft          = "ドラフトを適用"
+    , actionRecoverOrphanDraft  = "新規文書として復元"
+    , badgeHasDraft             = "ドラフトあり"
+    , draftStatePending         = "ドラフト退避中..."
+    , draftStateSaved           = "ドラフト退避済み"
+    , draftStateFailed          = "ドラフト退避失敗"
+    , draftRestoredBanner       = "ローカルに退避されていた未保存ドラフトを復元しました。"
+    , draftStaleBanner          = "この文書はサーバ側で更新されていますが、更新前のローカル未保存ドラフトが残っています。"
+    , draftTrashedBanner        = "この文書にはゴミ箱移動前のローカル未保存ドラフトが残っています。"
+    , draftOrphanedBanner       = "元の文書がサーバ上に見つかりませんでした。ローカルの未保存ドラフトを新規文書として復元するか、破棄できます。"
     , tabActiveDocuments        = "文書"
     , tabTrashDocuments         = "ゴミ箱"
     , modeEditLabel             = "編集"
@@ -310,6 +370,10 @@ jaMessages = UiMessages
     , noticeRestored            = "文書をゴミ箱から復元しました。"
     , noticePermanentlyDeleted  = "文書を完全に削除しました。"
     , noticeExtensionApplied    = "拡張機能を適用しました。"
+    , noticeDraftRestored       = "未保存ドラフトを復元しました。"
+    , noticeDraftDiscarded      = "ローカルの未保存ドラフトを破棄しました。"
+    , noticeExportedPrefix      = "ファイルをエクスポートしました: "
+    , noticeImportedPrefix      = "ファイルをインポートしました: "
     , confirmUnsavedTitle       = "未保存の変更があります"
     , confirmUnsavedBody        = "現在の文書に未保存の変更があります。保存せずに移動すると変更は失われます。"
     , confirmPermanentDelTitle  = "文書を完全に削除しますか？"
@@ -321,6 +385,10 @@ jaMessages = UiMessages
     , errPayloadTooLarge        = "文書サイズが上限 (5 MiB) を超えています。"
     , errServerPrefix           = "サーバエラーが発生しました"
     , errDecodeMessage          = "サーバ応答の読み取りに失敗しました。"
+    , errDraftStoragePrefix     = "ローカルドラフトの保存に失敗しました"
+    , errExportFailedPrefix     = "ファイルのエクスポートに失敗しました"
+    , errImportInvalidUtf8      = "UTF-8 テキストとして読み込めないファイルのためインポートできません。"
+    , errImportFailedPrefix     = "ファイルのインポートに失敗しました"
     , valTitleTooLong           = "タイトルが文字数上限を超えています"
     , valTitleControlChar       = "タイトルに改行や制御文字は使用できません"
     , valEmptyTag               = "空のタグは指定できません"
@@ -397,3 +465,15 @@ formatApiClientError msgs (ClientHttpError status detail)
     | otherwise       = msgs.errServerPrefix <> " (HTTP " <> Txt.pack (show status) <> ": " <> detail <> ")"
 formatApiClientError msgs ClientDecodeError{} =
     msgs.errDecodeMessage
+
+-- | 'FileImportError' をユーザー向けの表示文言へ整形する。
+formatFileImportError :: UiMessages -> FileImportError -> Text
+formatFileImportError msgs err = case err of
+    ImportFileTooLarge{} ->
+        msgs.errPayloadTooLarge
+    ImportInvalidUtf8{} ->
+        msgs.errImportInvalidUtf8
+    ImportValidationFailed vErr ->
+        formatValidationError msgs vErr
+    ImportReadFailed detail ->
+        msgs.errImportFailedPrefix <> " (" <> detail <> ")"

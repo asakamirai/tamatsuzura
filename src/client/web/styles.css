@@ -147,9 +147,10 @@ body {
 
 .tt-banner {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 0.75rem;
+  gap: 0.5rem 0.75rem;
   padding: 0.55rem 0.9rem;
   font-size: 0.88rem;
 }
@@ -170,6 +171,20 @@ body {
   background: var(--tt-warn-bg);
   color: var(--tt-warn-text);
   border-bottom: 1px solid #f2d48a;
+}
+
+.tt-banner-info {
+  background: var(--tt-primary-soft);
+  color: var(--tt-primary-hover);
+  border-bottom: 1px solid #bfd7f2;
+}
+
+.tt-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  flex-shrink: 0;
 }
 
 .tt-banner-text {
@@ -458,6 +473,14 @@ body {
   color: #334155;
   padding: 0.05rem 0.4rem;
   border-radius: 4px;
+}
+
+.tt-doc-draft-badge {
+  background: var(--tt-warn-bg);
+  color: var(--tt-warn-text);
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  font-weight: 600;
 }
 
 .tt-tag-chips {
@@ -808,6 +831,28 @@ body {
 
 .tt-ext-label {
   font-weight: 600;
+}
+
+.tt-draft-status {
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.tt-draft-status-pending {
+  background: var(--tt-warn-bg);
+  color: var(--tt-warn-text);
+}
+
+.tt-draft-status-saved {
+  background: var(--tt-ok-bg);
+  color: var(--tt-ok-text);
+}
+
+.tt-draft-status-failed {
+  background: var(--tt-err-bg);
+  color: var(--tt-err-text);
 }
 
 /* Modals */

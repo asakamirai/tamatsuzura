@@ -12,6 +12,7 @@ import qualified Data.Aeson                           as Aeson
 import           Data.ByteString                      (ByteString)
 import qualified Data.ByteString.Lazy                 as LazyBS
 import           Data.IORef                           (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import qualified Data.Map.Strict                      as Map
 import           Data.Maybe                           (isNothing)
 import           Data.Text                            (Text)
 import qualified Data.Text                            as Txt
@@ -61,6 +62,7 @@ import           TamaTsuzura.Client.App
     , ClientEnv(..)
     , ClientState(..)
     , ConnectionStatus(..)
+    , DraftReconcileResult(..)
     , EditorDraft(..)
     , EditorViewMode(..)
     , FilterState(..)
@@ -74,6 +76,8 @@ import           TamaTsuzura.Client.App
     , applyDocumentSaved
     , applyDocumentSoftDeleted
     , applyDocumentsResult
+    , applyDraftStorageEvent
+    , applyDraftsLoaded
     , applyEditorEvent
     , applyExtensionById
     , applyFoldersResult
@@ -81,10 +85,12 @@ import           TamaTsuzura.Client.App
     , applyTagsResult
     , buildEditorSyncPayload
     , buildListQueryFromFilter
+    , buildRecoveryRequestFromStoredDraft
     , defaultFilterState
     , dismissError
     , dismissNotice
     , draftFromDocument
+    , editorDraftFromStored
     , emptyEditorDraft
     , emptySearchPanelState
     , formatTagsInput
@@ -95,8 +101,20 @@ import           TamaTsuzura.Client.App
     , mergeDraftAfterSave
     , parseFolderInput
     , parseTagsInput
+    , reconcileDocumentWithDraft
+    , toStoredDraft
     , updateClient
     , validateEditorDraft
+    )
+import           TamaTsuzura.Client.DraftStorage
+    ( DraftStorage(..)
+    , DraftStorageEvent(..)
+    , DraftSyncState(..)
+    , StoredDraft(..)
+    , decodeDraftStorageEventJson
+    , decodeStoredDraftListJson
+    , encodeStoredDraftJson
+    , latestStoredDraft
     )
 import           TamaTsuzura.Client.EditorBridge
     ( EditorCommand(..)
@@ -115,10 +133,28 @@ import           TamaTsuzura.Client.Ffi
     , decodeFetchResultJson
     , encodeFetchOptionsJson
     )
+import           TamaTsuzura.Client.FileTransfer
+    ( ExportSpec(..)
+    , FileImportError(..)
+    , FilePickResult(..)
+    , FileTransferClient(..)
+    , ImportedFile(..)
+    , buildExportFileName
+    , buildExportSpec
+    , decodeExportResultJson
+    , decodeFilePickResultJson
+    , deriveTitleFromFileName
+    , exportMimeType
+    , inferDocumentFormatFromFileName
+    , prepareImportedDocumentRequest
+    , sanitizeExportBaseName
+    , stripUtf8Bom
+    )
 import           TamaTsuzura.Client.I18n
     ( UiMessages(..)
     , formatApiClientError
     , formatDocumentFormat
+    , formatFileImportError
     , formatValidationError
     , jaMessages
     )
@@ -159,13 +195,17 @@ import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentBody(..)
     , DocumentFormat(..)
+    , DocumentId
     , DocumentSummary(..)
+    , Tag
+    , TagSet
     , emptyDocumentTitle
     , emptyTagSet
     , mkDocumentId
     , mkDocumentTitle
     , mkFolderPath
     , mkTag
+    , mkTagSet
     , toDocumentSummary
     )
 import           TamaTsuzura.Common.Text              (ToText(..))
@@ -524,7 +564,7 @@ spec = do
             formatTagsInput req.tags `shouldBe` "メモ, 設計"
 
             let invalidTitleDraft :: EditorDraft
-                invalidTitleDraft = validDraft { titleInput = "bad\ntitle" }
+                invalidTitleDraft = withDraftTitle "bad\ntitle" validDraft
             validateEditorDraft invalidTitleDraft `shouldBe` Left TitleContainsControlChar
 
             let oversizedDraft :: EditorDraft
@@ -537,12 +577,12 @@ spec = do
             let cleanDraft :: EditorDraft
                 cleanDraft = draftFromDocument doc
             isDraftDirty doc cleanDraft `shouldBe` False
-            isDraftDirty doc (cleanDraft { titleInput = "  元のタイトル  " }) `shouldBe` False
+            isDraftDirty doc (withDraftTitle "  元のタイトル  " cleanDraft) `shouldBe` False
             isDraftDirty doc (withDraftBody (DocumentBody "変更後") cleanDraft) `shouldBe` True
             isDraftDirty doc (withDraftFormat FormatPlainText cleanDraft) `shouldBe` True
-            isDraftDirty doc (cleanDraft { folderInput = "work/sub" }) `shouldBe` True
-            isDraftDirty doc (cleanDraft { folderInput = "../invalid" }) `shouldBe` True
-            isDraftDirty doc (cleanDraft { tagsInput = "新規タグ" }) `shouldBe` True
+            isDraftDirty doc (withDraftFolder "work/sub" cleanDraft) `shouldBe` True
+            isDraftDirty doc (withDraftFolder "../invalid" cleanDraft) `shouldBe` True
+            isDraftDirty doc (withDraftTags "新規タグ" cleanDraft) `shouldBe` True
             let trashedDoc :: Document
                 trashedDoc = withDocDeletedAt (Just sampleUtcTime) doc
             isDraftDirty trashedDoc (withDraftBody (DocumentBody "ignored") cleanDraft) `shouldBe` False
@@ -635,7 +675,7 @@ spec = do
         it "preserves concurrent edits typed during in-flight save and prevents stale/trash list corruption" $ do
             doc <- mkSampleDocument "doc-race" "初期"
             let sentDraft :: EditorDraft
-                sentDraft = (draftFromDocument doc) { titleInput = "  送信タイトル  " }
+                sentDraft = withDraftTitle "  送信タイトル  " (draftFromDocument doc)
 
                 typedDuringSave :: EditorDraft
                 typedDuringSave = withDraftBody (DocumentBody "保存中に追記した本文") sentDraft
@@ -880,7 +920,7 @@ spec = do
             let badDraftState :: ClientState
                 badDraftState = (initialClientState bundledExtensions)
                     { selectedDocument = Just doc
-                    , draft            = (draftFromDocument doc) { titleInput = "bad\ntitle" }
+                    , draft            = withDraftTitle "bad\ntitle" (draftFromDocument doc)
                     }
             (sValErr, actsErr) <- runUpdateStep env SaveCurrentDocument badDraftState
             actsErr `shouldBe` []
@@ -906,7 +946,8 @@ spec = do
             writeIORef reqRef []
             (sCreating, createActs) <- runUpdateStep env RequestCreateDocument trashState
             sCreating.pendingListReloadAfterCreate `shouldBe` True
-            sCreating.filterState.status `shouldBe` StatusActive
+            -- Filter stays on StatusTrashed until POST succeeds so failure does not desync tab and list
+            sCreating.filterState.status `shouldBe` StatusTrashed
             reqsBeforeCreated <- readIORef reqRef
             map (.method) reqsBeforeCreated `shouldBe` [MethodPost]
 
@@ -916,6 +957,7 @@ spec = do
                 (act : _) -> runUpdateStep env act sCreating
                 []        -> expectationFailure "Expected DocumentCreated action" >> pure (sCreating, [])
             sCreated.pendingListReloadAfterCreate `shouldBe` False
+            sCreated.filterState.status `shouldBe` StatusActive
             reqsAfterCreated <- readIORef reqRef
             any (\ r -> r.method == MethodGet && r.url == "/api/documents") reqsAfterCreated `shouldBe` True
             cmdsAfterCreated <- readIORef cmdRef
@@ -1214,6 +1256,575 @@ spec = do
             plainHtml `shouldSatisfy` Txt.isInfixOf "#保留"
             plainHtml `shouldSatisfy` Txt.isInfixOf "value=\"plain_text\" selected"
 
+        it "renders draft badges, recovery/stale/orphaned banners, sync status, and export/import buttons" $ do
+            doc <- mkSampleDocument "doc-view-draft" "ドラフト表示テスト"
+            otherId <- expectRight (mkDocumentId "doc-orphan")
+            let sd :: StoredDraft
+                sd = toStoredDraft doc (withDraftBody (DocumentBody "ローカル変更") (draftFromDocument doc)) sampleLaterUtcTime
+
+                orphanSd :: StoredDraft
+                orphanSd = StoredDraft
+                    { docId         = otherId
+                    , titleInput    = "消えた文書"
+                    , body          = DocumentBody "救出本文"
+                    , format        = FormatMarkdown
+                    , folderInput   = ""
+                    , tagsInput     = ""
+                    , baseUpdatedAt = sampleUtcTime
+                    , savedAt       = sampleLaterUtcTime
+                    }
+
+                restoredState :: ClientState
+                restoredState = (initialClientState bundledExtensions)
+                    { documentSummaries  = [toDocumentSummary doc]
+                    , totalDocuments     = 1
+                    , selectedDocument   = Just doc
+                    , draft              = editorDraftFromStored sd
+                    , storedDrafts       = Map.singleton doc.id sd
+                    , draftSyncState     = DraftSyncSaved sampleLaterUtcTime
+                    , restoredDraftDocId = Just doc.id
+                    , orphanedDraft      = Just orphanSd
+                    }
+
+                restoredHtml :: Text
+                restoredHtml = TxtEnc.decodeUtf8Lenient
+                    (LazyBS.toStrict (toHtmlWith () () restoredState (viewClient jaMessages restoredState)))
+
+                staleState :: ClientState
+                staleState = restoredState
+                    { restoredDraftDocId = Nothing
+                    , staleDraftPrompt   = Just sd
+                    }
+
+                staleHtml :: Text
+                staleHtml = TxtEnc.decodeUtf8Lenient
+                    (LazyBS.toStrict (toHtmlWith () () staleState (viewClient jaMessages staleState)))
+            restoredHtml `shouldSatisfy` Txt.isInfixOf jaMessages.actionImport
+            restoredHtml `shouldSatisfy` Txt.isInfixOf jaMessages.actionExport
+            restoredHtml `shouldSatisfy` Txt.isInfixOf jaMessages.badgeHasDraft
+            restoredHtml `shouldSatisfy` Txt.isInfixOf jaMessages.draftStateSaved
+            restoredHtml `shouldSatisfy` Txt.isInfixOf jaMessages.draftRestoredBanner
+            restoredHtml `shouldSatisfy` Txt.isInfixOf jaMessages.draftOrphanedBanner
+            restoredHtml `shouldSatisfy` Txt.isInfixOf jaMessages.actionRecoverOrphanDraft
+            staleHtml `shouldSatisfy` Txt.isInfixOf jaMessages.draftStaleBanner
+            staleHtml `shouldSatisfy` Txt.isInfixOf jaMessages.actionApplyDraft
+
+    describe "TamaTsuzura.Client.DraftStorage pure serialization and selection" $ do
+        it "round-trips StoredDraft through JSON list payloads and selects latest draft deterministically" $ do
+            doc1 <- mkSampleDocument "doc-d1" "一番目"
+            doc2 <- mkSampleDocument "doc-d2" "二番目"
+            let sd1 :: StoredDraft
+                sd1 = toStoredDraft doc1 (withDraftBody (DocumentBody "draft1") (draftFromDocument doc1)) sampleUtcTime
+
+                sd2 :: StoredDraft
+                sd2 = toStoredDraft doc2 (withDraftBody (DocumentBody "draft2") (draftFromDocument doc2)) sampleLaterUtcTime
+
+                listJson :: Text
+                listJson = "{\"ok\":true,\"drafts\":[" <> encodeStoredDraftJson sd1 <> "," <> encodeStoredDraftJson sd2 <> "]}"
+            decodeStoredDraftListJson listJson `shouldBe` Right [sd1, sd2]
+            decodeStoredDraftListJson "{\"ok\":false,\"error\":\"QuotaExceededError\"}"
+                `shouldBe` Left "QuotaExceededError"
+            decodeStoredDraftListJson "{broken" `shouldSatisfy` isLeftEither
+            latestStoredDraft [] `shouldBe` Nothing
+            latestStoredDraft [sd1, sd2] `shouldBe` Just sd2
+            let sd1SameTime :: StoredDraft
+                sd1SameTime = sd1 { savedAt = sampleLaterUtcTime }
+            latestStoredDraft [sd1SameTime, sd2] `shouldBe` Just sd2
+            latestStoredDraft [sd2, sd1SameTime] `shouldBe` Just sd2
+
+        it "decodes draft storage events including empty or missing docId on failure" $ do
+            docId <- expectRight (mkDocumentId "doc-evt-1")
+            decodeDraftStorageEventJson
+                "{\"type\":\"draftSaved\",\"docId\":\"doc-evt-1\",\"savedAt\":\"2026-11-20T09:30:00Z\"}"
+                `shouldBe` Right (DraftEvtSaved docId sampleUtcTime)
+            decodeDraftStorageEventJson
+                "{\"type\":\"draftSaveFailed\",\"docId\":\"doc-evt-1\",\"error\":\"quota\"}"
+                `shouldBe` Right (DraftEvtSaveFailed (Just docId) "quota")
+            decodeDraftStorageEventJson
+                "{\"type\":\"draftSaveFailed\",\"docId\":\"\",\"error\":\"parse\"}"
+                `shouldBe` Right (DraftEvtSaveFailed Nothing "parse")
+            decodeDraftStorageEventJson "{\"type\":\"unknown\"}" `shouldSatisfy` isLeftEither
+
+    describe "TamaTsuzura.Client.FileTransfer pure export/import logic" $ do
+        it "sanitizes export file names, avoids duplicate extensions, and sets UTF-8 MIME types" $ do
+            sanitizeExportBaseName "  議事録 2026/11:20?  " `shouldBe` "議事録 2026_11_20"
+            sanitizeExportBaseName "   ...   " `shouldBe` "untitled"
+            sanitizeExportBaseName "a\nb\tc" `shouldBe` "a_b_c"
+            buildExportFileName "議事録" FormatMarkdown `shouldBe` "議事録.md"
+            buildExportFileName "README.md" FormatMarkdown `shouldBe` "README.md"
+            buildExportFileName "notes.MARKDOWN" FormatMarkdown `shouldBe` "notes.MARKDOWN"
+            buildExportFileName "メモ" FormatPlainText `shouldBe` "メモ.txt"
+            buildExportFileName "memo.txt" FormatPlainText `shouldBe` "memo.txt"
+            exportMimeType FormatMarkdown `shouldBe` "text/markdown;charset=utf-8"
+            exportMimeType FormatPlainText `shouldBe` "text/plain;charset=utf-8"
+            let exportSpec :: ExportSpec
+                exportSpec = buildExportSpec "" (DocumentBody "hello") FormatMarkdown
+            exportSpec `shouldBe` ExportSpec "untitled.md" "text/markdown;charset=utf-8" "hello"
+
+        it "never emits forbidden OS filename characters or control chars from sanitizeExportBaseName (QuickCheck)" $
+            property $ \ (rawStr :: String) ->
+                let sanitized :: Text
+                    sanitized = sanitizeExportBaseName (Txt.pack rawStr)
+                in  not (Txt.null sanitized)
+                        && not (Txt.any (`elem` ['/', '\\', ':', '*', '?', '"', '<', '>', '|']) sanitized)
+                        && not (Txt.any (\ ch -> ch < ' ' || ch == '\DEL') sanitized)
+
+        it "infers format, derives title, strips UTF-8 BOM, and validates imported documents" $ do
+            inferDocumentFormatFromFileName "README.md" `shouldBe` FormatMarkdown
+            inferDocumentFormatFromFileName "notes.MARKDOWN" `shouldBe` FormatMarkdown
+            inferDocumentFormatFromFileName "memo.txt" `shouldBe` FormatPlainText
+            inferDocumentFormatFromFileName "plain-no-ext" `shouldBe` FormatPlainText
+
+            deriveTitleFromFileName "dir/sub/設計メモ.md" `shouldBe` "設計メモ"
+            deriveTitleFromFileName "C:\\notes\\todo.TXT" `shouldBe` "todo"
+            deriveTitleFromFileName "  trailing.md  " `shouldBe` "trailing"
+            deriveTitleFromFileName "bad\ntitle.md" `shouldBe` "bad title"
+            Txt.length (deriveTitleFromFileName (Txt.replicate 300 "あ" <> ".md")) `shouldBe` 255
+            stripUtf8Bom "\xFEFF# 見出し" `shouldBe` "# 見出し"
+            stripUtf8Bom "# 見出し" `shouldBe` "# 見出し"
+
+            folderVal <- expectRight (mkFolderPath "work/imports")
+            tagVal <- expectRight (mkTag "取込")
+            let imported :: ImportedFile
+                imported = ImportedFile
+                    { fileName = "週次メモ.md"
+                    , content  = "\xFEFF# 週次\n本文"
+                    }
+            req <- expectRight (prepareImportedDocumentRequest imported (Just folderVal) (expectPureTagSet tagVal))
+            toText req.title `shouldBe` "週次メモ"
+            req.format `shouldBe` FormatMarkdown
+            req.body `shouldBe` DocumentBody "# 週次\n本文"
+            req.folder `shouldBe` Just folderVal
+
+            let hugeImported :: ImportedFile
+                hugeImported = ImportedFile
+                    { fileName = "huge.txt"
+                    , content  = Txt.replicate (maxDocumentBodyBytes + 1) "x"
+                    }
+            case prepareImportedDocumentRequest hugeImported Nothing emptyTagSet of
+                Left (ImportValidationFailed BodyTooLarge{}) -> pure ()
+                other -> expectationFailure ("Expected BodyTooLarge, got: " <> show other)
+
+        it "decodes export and file-pick JSFFI JSON results and formats Japanese import errors" $ do
+            decodeExportResultJson "{\"ok\":true}" `shouldBe` Right ()
+            decodeExportResultJson "{\"ok\":false,\"error\":\"blocked\"}" `shouldBe` Left "blocked"
+            decodeFilePickResultJson "{\"status\":\"cancelled\"}" `shouldBe` FilePickCancelled
+            decodeFilePickResultJson "{\"status\":\"selected\",\"fileName\":\"a.md\",\"content\":\"hi\"}"
+                `shouldBe` FilePickSelected (ImportedFile "a.md" "hi")
+            decodeFilePickResultJson "{\"status\":\"error\",\"code\":\"too_large\",\"actualBytes\":6000000,\"maxBytes\":5242880}"
+                `shouldBe` FilePickError (ImportFileTooLarge 6000000 5242880)
+            decodeFilePickResultJson "{\"status\":\"error\",\"code\":\"invalid_utf8\",\"message\":\"bad\"}"
+                `shouldBe` FilePickError (ImportInvalidUtf8 "bad")
+            formatFileImportError jaMessages (ImportInvalidUtf8 "bad") `shouldBe` jaMessages.errImportInvalidUtf8
+            formatFileImportError jaMessages (ImportFileTooLarge 10 5) `shouldBe` jaMessages.errPayloadTooLarge
+
+    describe "TamaTsuzura.Client.App Phase 3 draft autosave, recovery, and file transfer MVU" $ do
+        it "reconciles server documents against local drafts and builds safe recovery requests" $ do
+            doc <- mkSampleDocument "doc-rec" "照合対象"
+            let cleanSd :: StoredDraft
+                cleanSd = toStoredDraft doc (draftFromDocument doc) sampleLaterUtcTime
+
+                dirtySd :: StoredDraft
+                dirtySd = toStoredDraft doc (withDraftBody (DocumentBody "未保存追記") (draftFromDocument doc)) sampleLaterUtcTime
+
+                staleDoc :: Document
+                staleDoc = withDocUpdatedAt sampleLaterUtcTime doc
+
+                staleSd :: StoredDraft
+                staleSd = dirtySd { baseUpdatedAt = sampleUtcTime }
+
+                trashedDoc :: Document
+                trashedDoc = withDocDeletedAt (Just sampleLaterUtcTime) doc
+            reconcileDocumentWithDraft doc Nothing `shouldBe` NoLocalDraft
+            reconcileDocumentWithDraft doc (Just cleanSd) `shouldBe` RedundantLocalDraft
+            reconcileDocumentWithDraft doc (Just dirtySd) `shouldBe` RestoreLocalDraft dirtySd
+            reconcileDocumentWithDraft staleDoc (Just staleSd) `shouldBe` PromptStaleLocalDraft staleSd
+            reconcileDocumentWithDraft trashedDoc (Just dirtySd) `shouldBe` PromptStaleLocalDraft dirtySd
+
+            let brokenMetaSd :: StoredDraft
+                brokenMetaSd = StoredDraft
+                    { docId         = dirtySd.docId
+                    , titleInput    = "bad\ntitle"
+                    , body          = dirtySd.body
+                    , format        = dirtySd.format
+                    , folderInput   = "../bad"
+                    , tagsInput     = "bad\ntag"
+                    , baseUpdatedAt = dirtySd.baseUpdatedAt
+                    , savedAt       = dirtySd.savedAt
+                    }
+            recReq <- expectRight (buildRecoveryRequestFromStoredDraft brokenMetaSd)
+            recReq.body `shouldBe` DocumentBody "未保存追記"
+            recReq.title `shouldBe` emptyDocumentTitle
+            recReq.folder `shouldBe` Nothing
+            recReq.tags `shouldBe` emptyTagSet
+
+        it "autosaves dirty edits to IndexedDB, clears on clean revert/save/discard/trash, and resaves concurrent edits" $ do
+            doc <- mkSampleDocument "doc-auto" "自動退避"
+            let savedDoc :: Document
+                savedDoc = withDocUpdatedAt sampleLaterUtcTime (withDocBody (DocumentBody "編集中1") doc)
+            (env, _reqRef, _cmdRef, savedDraftsRef, deletedIdsRef, _exportsRef) <-
+                mkFullMockClientEnv
+                    (\ _ -> pure (Right (HttpResponse 200 (encodeStrict savedDoc))))
+                    (pure (Right []))
+                    (pure FilePickCancelled)
+
+            let base :: ClientState
+                base = (initialClientState bundledExtensions)
+                    { selectedDocument = Just doc
+                    , draft            = draftFromDocument doc
+                    }
+
+            -- Editing body queues local draft and marks pending
+            (sEdited, _) <- runUpdateStep env (EditorEventReceived (EvtBodyChanged "編集中1" (EditorStats 1 4 1 5))) base
+            sEdited.draftSyncState `shouldBe` DraftSyncPending
+            Map.member doc.id sEdited.storedDrafts `shouldBe` True
+            saved1 <- readIORef savedDraftsRef
+            length saved1 `shouldBe` 1
+
+            -- Receiving storage confirmation transitions to DraftSyncSaved
+            let sConfirmed :: ClientState
+                sConfirmed = applyDraftStorageEvent (DraftEvtSaved doc.id sampleLaterUtcTime) sEdited
+            sConfirmed.draftSyncState `shouldBe` DraftSyncSaved sampleLaterUtcTime
+
+            -- Reverting body back to server version deletes local draft
+            (sReverted, _) <- runUpdateStep env (EditorEventReceived (EvtBodyChanged (toText doc.body) (EditorStats 2 8 1 1))) sConfirmed
+            sReverted.draftSyncState `shouldBe` DraftSyncIdle
+            Map.member doc.id sReverted.storedDrafts `shouldBe` False
+            readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
+
+            -- Explicit save clears draft when clean; concurrent edit during save re-schedules with new baseUpdatedAt
+            writeIORef savedDraftsRef []
+            writeIORef deletedIdsRef []
+            let sentDraft :: EditorDraft
+                sentDraft = withDraftBody (DocumentBody "編集中1") (draftFromDocument doc)
+
+                cleanInFlight :: ClientState
+                cleanInFlight = base
+                    { draft          = sentDraft
+                    , storedDrafts   = Map.singleton doc.id (toStoredDraft doc sentDraft sampleUtcTime)
+                    , savingDocument = Just (doc.id, sentDraft)
+                    }
+            (sSavedClean, _) <- runUpdateStep env (DocumentSaved doc.id (Right savedDoc)) cleanInFlight
+            sSavedClean.draftSyncState `shouldBe` DraftSyncIdle
+            Map.member doc.id sSavedClean.storedDrafts `shouldBe` False
+            readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
+
+            writeIORef savedDraftsRef []
+            writeIORef deletedIdsRef []
+            let concurrentInFlight :: ClientState
+                concurrentInFlight = cleanInFlight
+                    { draft = withDraftBody (DocumentBody "保存中にさらに追記") sentDraft
+                    }
+            (sSavedConcurrent, _) <- runUpdateStep env (DocumentSaved doc.id (Right savedDoc)) concurrentInFlight
+            sSavedConcurrent.draftSyncState `shouldBe` DraftSyncPending
+            resaved <- readIORef savedDraftsRef
+            case resaved of
+                [sd] -> do
+                    sd.baseUpdatedAt `shouldBe` savedDoc.updatedAt
+                    sd.body `shouldBe` DocumentBody "保存中にさらに追記"
+                other -> expectationFailure ("Expected 1 re-saved draft, got: " <> show other)
+
+            -- ConfirmDiscardNavigation, SoftDelete, and PermanentDelete all purge local draft
+            writeIORef deletedIdsRef []
+            let pendingDiscard :: ClientState
+                pendingDiscard = sEdited { pendingNavigation = Just NavReturnToList }
+            (sAfterDiscard, _) <- runUpdateStep env ConfirmDiscardNavigation pendingDiscard
+            Map.member doc.id sAfterDiscard.storedDrafts `shouldBe` False
+            readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
+
+            writeIORef deletedIdsRef []
+            let trashedDoc :: Document
+                trashedDoc = withDocDeletedAt (Just sampleLaterUtcTime) doc
+            (sAfterSoftDel, _) <- runUpdateStep env (DocumentSoftDeleted doc.id (Right trashedDoc)) sEdited
+            Map.member doc.id sAfterSoftDel.storedDrafts `shouldBe` False
+            readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
+
+            writeIORef deletedIdsRef []
+            (sAfterPermDel, _) <- runUpdateStep env (DocumentPermanentlyDeleted doc.id (Right ())) sEdited
+            Map.member doc.id sAfterPermDel.storedDrafts `shouldBe` False
+            readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
+
+            -- Saving docA after switching to docB preserves docB's draft status and recovery banners
+            docB <- mkSampleDocument "doc-other-open" "別文書"
+            let sdB :: StoredDraft
+                sdB = toStoredDraft docB (withDraftBody (DocumentBody "docB未保存") (draftFromDocument docB)) sampleLaterUtcTime
+
+                switchedDuringSave :: ClientState
+                switchedDuringSave = (initialClientState bundledExtensions)
+                    { selectedDocument   = Just docB
+                    , draft              = editorDraftFromStored sdB
+                    , storedDrafts       = Map.fromList [(doc.id, toStoredDraft doc sentDraft sampleUtcTime), (docB.id, sdB)]
+                    , draftSyncState     = DraftSyncSaved sampleLaterUtcTime
+                    , restoredDraftDocId = Just docB.id
+                    , staleDraftPrompt   = Just sdB
+                    , savingDocument     = Just (doc.id, sentDraft)
+                    }
+                afterBgSave :: ClientState
+                afterBgSave = applyDocumentSaved jaMessages doc.id (Right savedDoc) switchedDuringSave
+            afterBgSave.draftSyncState `shouldBe` DraftSyncSaved sampleLaterUtcTime
+            afterBgSave.restoredDraftDocId `shouldBe` Just docB.id
+            afterBgSave.staleDraftPrompt `shouldBe` Just sdB
+            Map.member doc.id afterBgSave.storedDrafts `shouldBe` False
+            Map.member docB.id afterBgSave.storedDrafts `shouldBe` True
+
+            -- DraftsLoaded failure and DraftEvtSaveFailed (matching / non-matching / Nothing)
+            let sLoadFail :: ClientState
+                sLoadFail = applyDraftsLoaded jaMessages (Left "idb-blocked") sEdited
+
+                sOtherFail :: ClientState
+                sOtherFail = applyDraftStorageEvent (DraftEvtSaveFailed (Just docB.id) "other-err") sConfirmed
+
+                sMatchFail :: ClientState
+                sMatchFail = applyDraftStorageEvent (DraftEvtSaveFailed (Just doc.id) "quota") sConfirmed
+
+                sGlobalFail :: ClientState
+                sGlobalFail = applyDraftStorageEvent (DraftEvtSaveFailed Nothing "parse") sConfirmed
+            sLoadFail.draftSyncState `shouldBe` DraftSyncFailed "idb-blocked"
+            sOtherFail.draftSyncState `shouldBe` DraftSyncSaved sampleLaterUtcTime
+            sMatchFail.draftSyncState `shouldBe` DraftSyncFailed "quota"
+            sGlobalFail.draftSyncState `shouldBe` DraftSyncFailed "parse"
+
+        it "auto-opens and restores latest draft on reload, handles late DraftsLoaded, stale conflicts, and 404 orphan recovery" $ do
+            doc <- mkSampleDocument "doc-recover" "復元対象"
+            orphanId <- expectRight (mkDocumentId "doc-deleted-remote")
+            recoveredDoc <- mkSampleDocument "doc-new-recovered" "孤立復元"
+            let storedForDoc :: StoredDraft
+                storedForDoc = toStoredDraft doc (withDraftBody (DocumentBody "リロード前ドラフト") (draftFromDocument doc)) sampleLaterUtcTime
+
+                orphanSd :: StoredDraft
+                orphanSd = StoredDraft
+                    { docId         = orphanId
+                    , titleInput    = "孤立復元"
+                    , body          = storedForDoc.body
+                    , format        = storedForDoc.format
+                    , folderInput   = storedForDoc.folderInput
+                    , tagsInput     = storedForDoc.tagsInput
+                    , baseUpdatedAt = storedForDoc.baseUpdatedAt
+                    , savedAt       = storedForDoc.savedAt
+                    }
+
+            (env, _reqRef, cmdRef, _savedRef, deletedIdsRef, _exportsRef) <-
+                mkFullMockClientEnv
+                    (\ req ->
+                        if req.method == MethodGet && req.url == "/api/documents/doc-recover"
+                            then pure (Right (HttpResponse 200 (encodeStrict doc)))
+                            else if req.method == MethodGet && req.url == "/api/documents/doc-deleted-remote"
+                                then pure (Right (HttpResponse 404 (encodeStrict (ApiError ErrNotFound "not found" Nothing))))
+                                else if req.method == MethodPost && req.url == "/api/documents"
+                                    then pure (Right (HttpResponse 201 (encodeStrict recoveredDoc)))
+                                    else pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [] 0))))
+                    )
+                    (pure (Right [storedForDoc]))
+                    (pure FilePickCancelled)
+
+            -- DraftsLoaded triggers auto-open GET and DocumentLoaded restores draft automatically
+            (sAutoOpen, autoActs) <- runUpdateStep env (DraftsLoaded (Right [storedForDoc])) (initialClientState bundledExtensions)
+            sAutoOpen.autoOpeningDraftId `shouldBe` Just doc.id
+            (sRestored, _) <- case autoActs of
+                (act : _) -> runUpdateStep env act sAutoOpen
+                []        -> expectationFailure "Expected DocumentLoaded action" >> pure (sAutoOpen, [])
+            sRestored.draft.body `shouldBe` DocumentBody "リロード前ドラフト"
+            sRestored.restoredDraftDocId `shouldBe` Just doc.id
+            sRestored.statusNotice `shouldBe` Just jaMessages.noticeDraftRestored
+
+            -- DiscardCurrentDraft is blocked while save is in flight to prevent stale merge resurrection
+            writeIORef deletedIdsRef []
+            let savingRestored :: ClientState
+                savingRestored = sRestored { savingDocument = Just (doc.id, sRestored.draft) }
+            (sBlockedDiscard, _) <- runUpdateStep env DiscardCurrentDraft savingRestored
+            sBlockedDiscard.draft `shouldBe` sRestored.draft
+            readIORef deletedIdsRef >>= (`shouldBe` [])
+
+            -- DiscardCurrentDraft reverts to server version, resets history, and deletes from IndexedDB
+            writeIORef cmdRef []
+            writeIORef deletedIdsRef []
+            (sDiscarded, _) <- runUpdateStep env DiscardCurrentDraft sRestored
+            sDiscarded.draft `shouldBe` draftFromDocument doc
+            sDiscarded.restoredDraftDocId `shouldBe` Nothing
+            readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
+            cmdsDiscard <- readIORef cmdRef
+            case reverse cmdsDiscard of
+                (CmdSyncDocument payload : _) -> payload.resetHistory `shouldBe` True
+                other -> expectationFailure ("Expected resetHistory=True sync, got: " <> show other)
+
+            -- DiscardCurrentDraft on staleDraftPrompt (e.g. trashed read-only doc) clears prompt without overwriting editor
+            writeIORef deletedIdsRef []
+            let trashedDoc :: Document
+                trashedDoc = withDocDeletedAt (Just sampleLaterUtcTime) doc
+
+                trashedWithStale :: ClientState
+                trashedWithStale = (initialClientState bundledExtensions)
+                    { selectedDocument = Just trashedDoc
+                    , draft            = draftFromDocument trashedDoc
+                    , storedDrafts     = Map.singleton doc.id storedForDoc
+                    , staleDraftPrompt = Just storedForDoc
+                    }
+            (sTrashedCleared, _) <- runUpdateStep env DiscardCurrentDraft trashedWithStale
+            sTrashedCleared.staleDraftPrompt `shouldBe` Nothing
+            Map.member doc.id sTrashedCleared.storedDrafts `shouldBe` False
+            readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
+
+            -- Late DraftsLoaded arriving after user already opened clean doc still restores
+            let alreadyOpenClean :: ClientState
+                alreadyOpenClean = (initialClientState bundledExtensions)
+                    { selectedDocument = Just doc
+                    , draft            = draftFromDocument doc
+                    }
+                sLateRestored :: ClientState
+                sLateRestored = applyDraftsLoaded jaMessages (Right [storedForDoc]) alreadyOpenClean
+            sLateRestored.draft.body `shouldBe` DocumentBody "リロード前ドラフト"
+            sLateRestored.restoredDraftDocId `shouldBe` Just doc.id
+
+            -- Stale conflict (server updated newer than draft baseUpdatedAt) prompts without overwriting, then ApplyStaleDraft applies
+            let newerServerDoc :: Document
+                newerServerDoc = withDocUpdatedAt sampleLaterUtcTime doc
+
+                staleStored :: StoredDraft
+                staleStored = storedForDoc { baseUpdatedAt = sampleUtcTime }
+
+                waitingLoad :: ClientState
+                waitingLoad = (initialClientState bundledExtensions)
+                    { openingDocumentId = Just doc.id
+                    , storedDrafts      = Map.singleton doc.id staleStored
+                    }
+                sStale :: ClientState
+                sStale = applyDocumentLoaded jaMessages doc.id (Right newerServerDoc) waitingLoad
+            sStale.draft.body `shouldBe` newerServerDoc.body
+            sStale.staleDraftPrompt `shouldBe` Just staleStored
+            (sAppliedStale, _) <- runUpdateStep env ApplyStaleDraft sStale
+            sAppliedStale.draft.body `shouldBe` DocumentBody "リロード前ドラフト"
+            sAppliedStale.staleDraftPrompt `shouldBe` Nothing
+
+            -- Auto-open 404 surfaces orphanedDraft; RecoverOrphanedDraft guards dirty doc, recovers, and DiscardOrphanedDraft purges
+            writeIORef deletedIdsRef []
+            (sOrphanOpen, orphanActs) <- runUpdateStep env (DraftsLoaded (Right [orphanSd])) (initialClientState bundledExtensions)
+            (sOrphaned, _) <- case orphanActs of
+                (act : _) -> runUpdateStep env act sOrphanOpen
+                []        -> expectationFailure "Expected DocumentLoaded 404 action" >> pure (sOrphanOpen, [])
+            sOrphaned.orphanedDraft `shouldBe` Just orphanSd
+            sOrphaned.mobilePane `shouldBe` PaneList
+
+            -- Dirty current doc triggers NavRecoverOrphanedDraft guard first
+            let dirtyWithOrphan :: ClientState
+                dirtyWithOrphan = sOrphaned
+                    { selectedDocument = Just doc
+                    , draft            = withDraftBody (DocumentBody "他文書編集") (draftFromDocument doc)
+                    }
+            (sOrphanGuard, _) <- runUpdateStep env RecoverOrphanedDraft dirtyWithOrphan
+            sOrphanGuard.pendingNavigation `shouldBe` Just NavRecoverOrphanedDraft
+
+            -- DiscardOrphanedDraft removes orphan banner and IndexedDB key
+            writeIORef deletedIdsRef []
+            (sOrphanDiscarded, _) <- runUpdateStep env DiscardOrphanedDraft sOrphaned
+            sOrphanDiscarded.orphanedDraft `shouldBe` Nothing
+            sOrphanDiscarded.statusNotice `shouldBe` Just jaMessages.noticeDraftDiscarded
+            readIORef deletedIdsRef >>= (`shouldBe` [orphanId])
+
+            writeIORef deletedIdsRef []
+            (sRecovering, recActs) <- runUpdateStep env RecoverOrphanedDraft sOrphaned
+            (sRecovered, _) <- case recActs of
+                (act : _) -> runUpdateStep env act sRecovering
+                []        -> expectationFailure "Expected OrphanDraftRecovered action" >> pure (sRecovering, [])
+            sRecovered.orphanedDraft `shouldBe` Nothing
+            sRecovered.selectedDocument `shouldBe` Just recoveredDoc
+            readIORef deletedIdsRef >>= (`shouldBe` [orphanId])
+
+        it "exports active drafts and imports Markdown/text files with unsaved guard and filter inheritance" $ do
+            doc <- mkSampleDocument "doc-io" "入出力テスト"
+            importedDoc <- mkSampleDocument "doc-imported" "取り込みメモ"
+            folderVal <- expectRight (mkFolderPath "work/import")
+            tagVal <- expectRight (mkTag "取込")
+            let picked :: FilePickResult
+                picked = FilePickSelected ImportedFile
+                    { fileName = "取り込みメモ.md"
+                    , content  = "\xFEFF# 取り込み\n本文"
+                    }
+            (env, reqRef, cmdRef, _savedRef, _delRef, exportsRef) <-
+                mkFullMockClientEnv
+                    (\ req ->
+                        if req.method == MethodPost && req.url == "/api/documents"
+                            then pure (Right (HttpResponse 201 (encodeStrict importedDoc)))
+                            else if req.url == "/api/tags"
+                                then pure (Right (HttpResponse 200 (encodeStrict (TagListResponse []))))
+                                else if req.url == "/api/folders"
+                                    then pure (Right (HttpResponse 200 (encodeStrict (FolderListResponse []))))
+                                    else pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [] 0))))
+                    )
+                    (pure (Right []))
+                    (pure picked)
+
+            let activeState :: ClientState
+                activeState = (initialClientState bundledExtensions)
+                    { selectedDocument = Just doc
+                    , draft            = withDraftBody (DocumentBody "エクスポート本文") (draftFromDocument doc)
+                    , filterState      = defaultFilterState
+                        { selectedFolder = Just folderVal
+                        , selectedTag    = Just tagVal
+                        }
+                    }
+
+            -- Export dispatches ExportSpec with current draft content and shows notice
+            (sExp1, expActs) <- runUpdateStep env ExportCurrentDocument activeState
+            exports <- readIORef exportsRef
+            exports `shouldBe` [ExportSpec "入出力テスト.md" "text/markdown;charset=utf-8" "エクスポート本文"]
+            (sExp2, _) <- case expActs of
+                (act : _) -> runUpdateStep env act sExp1
+                []        -> expectationFailure "Expected ExportFinished action" >> pure (sExp1, [])
+            sExp2.statusNotice `shouldBe` Just (jaMessages.noticeExportedPrefix <> "入出力テスト.md")
+
+            -- RequestImportDocument guards dirty state before launching file picker
+            (sImportGuard, _) <- runUpdateStep env RequestImportDocument activeState
+            sImportGuard.pendingNavigation `shouldBe` Just NavImportDocument
+
+            -- ConfirmDiscardNavigation reverts draft before launching file picker so cancelling never leaves unsaved orphan edits
+            writeIORef reqRef []
+            writeIORef cmdRef []
+            (sAfterConfirm, pickActs) <- runUpdateStep env ConfirmDiscardNavigation sImportGuard
+            isCurrentDocumentDirty sAfterConfirm `shouldBe` False
+            sAfterConfirm.draft `shouldBe` draftFromDocument doc
+            (sImporting, createActs) <- case pickActs of
+                (act : _) -> runUpdateStep env act sAfterConfirm
+                []        -> expectationFailure "Expected ImportFilePicked action" >> pure (sAfterConfirm, [])
+            sImporting.isImportingDocument `shouldBe` True
+            reqs <- readIORef reqRef
+            map (.method) reqs `shouldBe` [MethodPost]
+            (sImported, _) <- case createActs of
+                (act : _) -> runUpdateStep env act sImporting
+                []        -> expectationFailure "Expected DocumentImported action" >> pure (sImporting, [])
+            sImported.isImportingDocument `shouldBe` False
+            sImported.selectedDocument `shouldBe` Just importedDoc
+            sImported.statusNotice `shouldBe` Just (jaMessages.noticeImportedPrefix <> "取り込みメモ.md")
+            cmdsAfterImport <- readIORef cmdRef
+            cmdsAfterImport `shouldSatisfy` elem CmdFocus
+
+            -- Cancelled picker produces no error; export/import failures set localized errors
+            (sCancelPick, _) <- runUpdateStep env (ImportFilePicked FilePickCancelled) sImported
+            sCancelPick.lastError `shouldBe` Nothing
+            (sErrPick, _) <- runUpdateStep env (ImportFilePicked (FilePickError (ImportInvalidUtf8 "bad"))) sImported
+            sErrPick.lastError `shouldBe` Just jaMessages.errImportInvalidUtf8
+            (sExpFail, _) <- runUpdateStep env (ExportFinished "a.md" (Left "blocked")) sImported
+            sExpFail.lastError `shouldSatisfy` maybe False (Txt.isInfixOf jaMessages.errExportFailedPrefix)
+            (sImpFail, _) <- runUpdateStep env (DocumentImported "a.md" (Left (ClientNetworkError "offline"))) sImporting
+            sImpFail.isImportingDocument `shouldBe` False
+            sImpFail.lastError `shouldSatisfy` maybe False (Txt.isInfixOf jaMessages.errNetworkPrefix)
+
+            -- Importing from Trash tab switches back to StatusActive and reloads list only on success
+            writeIORef reqRef []
+            let trashImportState :: ClientState
+                trashImportState = (initialClientState bundledExtensions)
+                    { filterState = withFilterStatus StatusTrashed defaultFilterState
+                    }
+            (sTrashImp1, trashImpActs) <- runUpdateStep env (ImportFilePicked picked) trashImportState
+            sTrashImp1.pendingListReloadAfterImport `shouldBe` True
+            sTrashImp1.filterState.status `shouldBe` StatusTrashed
+            writeIORef reqRef []
+            (sTrashImp2, _) <- case trashImpActs of
+                (act : _) -> runUpdateStep env act sTrashImp1
+                []        -> expectationFailure "Expected DocumentImported from trash" >> pure (sTrashImp1, [])
+            sTrashImp2.filterState.status `shouldBe` StatusActive
+            trashReqs <- readIORef reqRef
+            any (\ r -> r.method == MethodGet && r.url == "/api/documents") trashReqs `shouldBe` True
+
 recordingTransport ::
        IORef (Maybe HttpRequest)
     -> Either Text HttpResponse
@@ -1227,6 +1838,9 @@ encodeStrict = LazyBS.toStrict . Aeson.encode
 
 sampleUtcTime :: UTCTime
 sampleUtcTime = UTCTime (fromGregorian 2026 11 20) (secondsToDiffTime (9 * 3600 + 30 * 60))
+
+sampleLaterUtcTime :: UTCTime
+sampleLaterUtcTime = UTCTime (fromGregorian 2026 11 20) (secondsToDiffTime (9 * 3600 + 35 * 60))
 
 mkSampleDocument :: Text -> Text -> IO Document
 mkSampleDocument rawId rawTitle = do
@@ -1280,6 +1894,33 @@ withDocDeletedAt mDel doc = Document
     , deletedAt = mDel
     }
 
+withDocUpdatedAt :: UTCTime -> Document -> Document
+withDocUpdatedAt ts doc = Document
+    { id        = doc.id
+    , title     = doc.title
+    , body      = doc.body
+    , format    = doc.format
+    , folder    = doc.folder
+    , tags      = doc.tags
+    , createdAt = doc.createdAt
+    , updatedAt = ts
+    , deletedAt = doc.deletedAt
+    }
+
+expectPureTagSet :: Tag -> TagSet
+expectPureTagSet t = case mkTagSet [t] of
+    Right ts -> ts
+    Left _   -> emptyTagSet
+
+withDraftTitle :: Text -> EditorDraft -> EditorDraft
+withDraftTitle nextTitle d = EditorDraft
+    { titleInput  = nextTitle
+    , body        = d.body
+    , format      = d.format
+    , folderInput = d.folderInput
+    , tagsInput   = d.tagsInput
+    }
+
 withDraftBody :: DocumentBody -> EditorDraft -> EditorDraft
 withDraftBody nextBody d = EditorDraft
     { titleInput  = d.titleInput
@@ -1296,6 +1937,24 @@ withDraftFormat nextFmt d = EditorDraft
     , format      = nextFmt
     , folderInput = d.folderInput
     , tagsInput   = d.tagsInput
+    }
+
+withDraftFolder :: Text -> EditorDraft -> EditorDraft
+withDraftFolder nextFolder d = EditorDraft
+    { titleInput  = d.titleInput
+    , body        = d.body
+    , format      = d.format
+    , folderInput = nextFolder
+    , tagsInput   = d.tagsInput
+    }
+
+withDraftTags :: Text -> EditorDraft -> EditorDraft
+withDraftTags nextTags d = EditorDraft
+    { titleInput  = d.titleInput
+    , body        = d.body
+    , format      = d.format
+    , folderInput = d.folderInput
+    , tagsInput   = nextTags
     }
 
 withFilterStatus :: DocumentStatusFilter -> FilterState -> FilterState
@@ -1324,8 +1983,27 @@ mkMockClientEnv ::
        (HttpRequest -> IO (Either Text HttpResponse))
     -> IO (ClientEnv, IORef [HttpRequest], IORef [EditorCommand])
 mkMockClientEnv handler = do
+    (env, reqRef, cmdRef, _, _, _) <- mkFullMockClientEnv handler (pure (Right [])) (pure FilePickCancelled)
+    pure (env, reqRef, cmdRef)
+
+mkFullMockClientEnv ::
+       (HttpRequest -> IO (Either Text HttpResponse))
+    -> IO (Either Text [StoredDraft])
+    -> IO FilePickResult
+    -> IO
+        ( ClientEnv
+        , IORef [HttpRequest]
+        , IORef [EditorCommand]
+        , IORef [StoredDraft]
+        , IORef [DocumentId]
+        , IORef [ExportSpec]
+        )
+mkFullMockClientEnv handler listDraftsIo pickFileIo = do
     reqRef <- newIORef []
     cmdRef <- newIORef []
+    savedDraftsRef <- newIORef []
+    deletedIdsRef <- newIORef []
+    exportsRef <- newIORef []
     let transport :: HttpTransport
         transport = HttpTransport $ \ req -> do
             modifyIORef' reqRef (\ xs -> xs <> [req])
@@ -1337,14 +2015,32 @@ mkMockClientEnv handler = do
             , transport = transport
             }
 
+        storage :: DraftStorage
+        storage = DraftStorage
+            { scheduleSaveDraft = \ sd -> modifyIORef' savedDraftsRef (\ xs -> xs <> [sd])
+            , deleteStoredDraft = \ did -> modifyIORef' deletedIdsRef (\ xs -> xs <> [did])
+            , listStoredDrafts  = listDraftsIo
+            }
+
+        transfer :: FileTransferClient
+        transfer = FileTransferClient
+            { exportFile = \ exportSpec -> do
+                modifyIORef' exportsRef (\ xs -> xs <> [exportSpec])
+                pure (Right ())
+            , pickImportFile = pickFileIo
+            }
+
         env :: ClientEnv
         env = ClientEnv
-            { apiClient     = client
-            , extensions    = bundledExtensions
-            , messages      = jaMessages
-            , sendEditorCmd = \ cmd -> modifyIORef' cmdRef (\ xs -> xs <> [cmd])
+            { apiClient         = client
+            , extensions        = bundledExtensions
+            , messages          = jaMessages
+            , sendEditorCmd     = \ cmd -> modifyIORef' cmdRef (\ xs -> xs <> [cmd])
+            , draftStorage      = storage
+            , fileTransfer      = transfer
+            , getCurrentUtcTime = pure sampleLaterUtcTime
             }
-    pure (env, reqRef, cmdRef)
+    pure (env, reqRef, cmdRef, savedDraftsRef, deletedIdsRef, exportsRef)
 
 runUpdateStep ::
        ClientEnv

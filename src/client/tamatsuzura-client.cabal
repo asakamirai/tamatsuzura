@@ -25,8 +25,10 @@ library client-core
   exposed-modules:
     TamaTsuzura.Client.Api
     TamaTsuzura.Client.App
+    TamaTsuzura.Client.DraftStorage
     TamaTsuzura.Client.EditorBridge
     TamaTsuzura.Client.Ffi
+    TamaTsuzura.Client.FileTransfer
     TamaTsuzura.Client.I18n
     TamaTsuzura.Client.Markdown
     TamaTsuzura.Client.View
@@ -34,6 +36,7 @@ library client-core
       aeson                     >= 2.1  && < 2.3
     , base                      >= 4.18 && < 5
     , bytestring                >= 0.11 && < 0.13
+    , containers                >= 0.6  && < 0.8
     , miso                      >= 1.15 && < 1.16
     , mtl                       >= 2.2  && < 2.4
     , tamatsuzura-common
@@ -54,8 +57,10 @@ library
   reexported-modules:
       TamaTsuzura.Client.Api
     , TamaTsuzura.Client.App
+    , TamaTsuzura.Client.DraftStorage
     , TamaTsuzura.Client.EditorBridge
     , TamaTsuzura.Client.Ffi
+    , TamaTsuzura.Client.FileTransfer
     , TamaTsuzura.Client.I18n
     , TamaTsuzura.Client.Markdown
     , TamaTsuzura.Client.View
@@ -90,6 +95,7 @@ test-suite tamatsuzura-client-test
       aeson                     >= 2.1  && < 2.3
     , base                      >= 4.18 && < 5
     , bytestring                >= 0.11 && < 0.13
+    , containers                >= 0.6  && < 0.8
     , hspec                     >= 2.11 && < 2.12
     , miso                      >= 1.15 && < 1.16
     , QuickCheck                >= 2.14 && < 2.16

@@ -40,7 +40,7 @@ bundle_wasm_assets() {
   node "${post_link}" -i "${dist_dir}/tamatsuzura-client.wasm" -o "${dist_dir}/ghc_wasm_jsffi.js"
 
   if [ -d "src/client/web" ]; then
-    cp src/client/web/index.html src/client/web/index.js src/client/web/wasi-shim.js src/client/web/styles.css "${dist_dir}/"
+    cp src/client/web/index.html src/client/web/index.js src/client/web/browser-bridge.js src/client/web/wasi-shim.js src/client/web/styles.css "${dist_dir}/"
     if [ -f "src/client/web/package.json" ]; then
       local need_install=0
       if [ ! -d "src/client/web/node_modules" ] || [ ! -x "src/client/web/node_modules/.bin/esbuild" ]; then
@@ -68,6 +68,7 @@ bundle_wasm_assets() {
     exit 1
   fi
   node --check "${dist_dir}/editor-bridge.js"
+  node --check "${dist_dir}/browser-bridge.js"
 
   # Verify that every import required by tamatsuzura-client.wasm is satisfied by wasi-shim.js and ghc_wasm_jsffi.js
   node --input-type=module -e '

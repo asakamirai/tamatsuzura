@@ -11,6 +11,7 @@ module TamaTsuzura.Client.View
     ) where
 
 import           Data.Either                     (fromRight)
+import qualified Data.Map.Strict                 as Map
 import           Data.Maybe                      (isJust, isNothing)
 import           Data.Text                       (Text)
 import qualified Data.Text                       as Txt
@@ -33,6 +34,7 @@ import           TamaTsuzura.Client.App
     , hasActiveFilters
     , isCurrentDocumentDirty
     )
+import           TamaTsuzura.Client.DraftStorage (DraftSyncState(..), StoredDraft(..))
 import           TamaTsuzura.Client.EditorBridge (EditorStats(..))
 import           TamaTsuzura.Client.I18n         (UiMessages(..), formatDocumentFormat)
 import           TamaTsuzura.Client.Markdown     (renderMarkdownView)
@@ -89,9 +91,16 @@ viewHeader msgs state =
                 ( [ HP.type_ "button"
                   , HP.class_ "tt-btn tt-btn-primary tt-btn-compact"
                   , HE.onClick RequestCreateDocument
-                  ] <> disabledAttr state.isCreatingDocument
+                  ] <> disabledAttr isCreatingOrImporting
                 )
                 [ text (ms createLabel) ]
+            , H.button_
+                ( [ HP.type_ "button"
+                  , HP.class_ "tt-btn tt-btn-secondary tt-btn-compact"
+                  , HE.onClick RequestImportDocument
+                  ] <> disabledAttr isCreatingOrImporting
+                )
+                [ text (ms importLabel) ]
             , H.button_
                 ( [ HP.type_ "button"
                   , HP.class_ "tt-btn tt-btn-secondary tt-btn-compact"
@@ -107,6 +116,15 @@ viewHeader msgs state =
         if state.isCreatingDocument
             then msgs.actionCreating
             else msgs.actionNewDocument
+
+    importLabel :: Text
+    importLabel =
+        if state.isImportingDocument
+            then msgs.actionImporting
+            else msgs.actionImport
+
+    isCreatingOrImporting :: Bool
+    isCreatingOrImporting = state.isCreatingDocument || state.isImportingDocument
 
     isRefreshing :: Bool
     isRefreshing = state.isLoadingDocuments || state.connectionStatus == ConnChecking
@@ -125,6 +143,33 @@ viewNotifications msgs state =
     H.div_ [ HP.class_ "tt-notifications" ]
         [ viewErrorBanner msgs state.lastError
         , viewNoticeBanner msgs state.statusNotice
+        , viewOrphanedDraftBanner msgs state state.orphanedDraft
+        ]
+
+viewOrphanedDraftBanner ::
+       UiMessages
+    -> ClientState
+    -> Maybe StoredDraft
+    -> View () () ClientState ClientAction
+viewOrphanedDraftBanner _ _ Nothing = H.div_ [ HP.class_ "tt-slot-empty" ] []
+viewOrphanedDraftBanner msgs state (Just _) =
+    H.div_ [ HP.class_ "tt-banner tt-banner-warn", HP.role_ "alert" ]
+        [ H.span_ [ HP.class_ "tt-banner-text" ] [ text (ms msgs.draftOrphanedBanner) ]
+        , H.div_ [ HP.class_ "tt-banner-actions" ]
+            [ H.button_
+                ( [ HP.type_ "button"
+                  , HP.class_ "tt-btn tt-btn-primary tt-btn-xs"
+                  , HE.onClick RecoverOrphanedDraft
+                  ] <> disabledAttr (state.isCreatingDocument || state.isImportingDocument)
+                )
+                [ text (ms msgs.actionRecoverOrphanDraft) ]
+            , H.button_
+                [ HP.type_ "button"
+                , HP.class_ "tt-btn tt-btn-ghost tt-btn-xs"
+                , HE.onClick DiscardOrphanedDraft
+                ]
+                [ text (ms msgs.actionDiscardDraft) ]
+            ]
         ]
 
 viewErrorBanner :: UiMessages -> Maybe Text -> View () () ClientState ClientAction
@@ -340,6 +385,7 @@ viewDocumentRow msgs state summary =
                 ( [ H.span_ [ HP.class_ "tt-doc-format" ]
                         [ text (ms (formatDocumentFormat msgs summary.format)) ]
                   ]
+                    <> draftIndicator
                     <> folderBadge summary.folder
                     <> [ H.span_ [ HP.class_ "tt-doc-updated" ]
                             [ text (ms (formatUtcTimestamp summary.updatedAt)) ]
@@ -354,6 +400,15 @@ viewDocumentRow msgs state summary =
   where
     isSelected :: Bool
     isSelected = fmap (.id) state.selectedDocument == Just summary.id
+
+    hasStoredDraft :: Bool
+    hasStoredDraft = Map.member summary.id state.storedDrafts
+
+    draftIndicator :: [View () () ClientState ClientAction]
+    draftIndicator
+        | hasStoredDraft =
+            [ H.span_ [ HP.class_ "tt-doc-draft-badge" ] [ text (ms msgs.badgeHasDraft) ] ]
+        | otherwise = []
 
     rowClass :: Text
     rowClass = if isSelected then "tt-doc-item tt-doc-item-active" else "tt-doc-item"
@@ -406,7 +461,7 @@ viewEditorPane msgs state =
                             ( [ HP.type_ "button"
                               , HP.class_ "tt-btn tt-btn-primary"
                               , HE.onClick RequestCreateDocument
-                              ] <> disabledAttr state.isCreatingDocument
+                              ] <> disabledAttr (state.isCreatingDocument || state.isImportingDocument)
                             )
                             [ text (ms msgs.actionNewDocument) ]
                         ]
@@ -419,9 +474,10 @@ viewActiveEditor msgs state doc =
     H.div_ [ HP.class_ "tt-editor-shell" ]
         [ viewEditorToolbar msgs state doc
         , if readOnly
-            then H.div_ [ HP.class_ "tt-banner tt-banner-warn" ]
+            then H.div_ [ HP.class_ "tt-banner tt-banner-warn", HP.role_ "status" ]
                 [ H.span_ [] [ text (ms msgs.trashReadOnlyBanner) ] ]
             else H.div_ [ HP.class_ "tt-slot-empty" ] []
+        , viewDraftRecoveryBanner msgs state doc readOnly
         , viewTitleAndMetadata msgs state readOnly
         , if state.searchPanel.isOpen
             then viewSearchPanel msgs state.searchPanel readOnly
@@ -432,6 +488,57 @@ viewActiveEditor msgs state doc =
   where
     readOnly :: Bool
     readOnly = isTrashed doc
+
+viewDraftRecoveryBanner ::
+       UiMessages
+    -> ClientState
+    -> Document
+    -> Bool
+    -> View () () ClientState ClientAction
+viewDraftRecoveryBanner msgs state doc readOnly =
+    let isSaving :: Bool
+        isSaving = isJust state.savingDocument
+    in  case state.staleDraftPrompt of
+            Just sd | sd.docId == doc.id ->
+                H.div_ [ HP.class_ "tt-banner tt-banner-warn", HP.role_ "status" ]
+                    [ H.span_ [ HP.class_ "tt-banner-text" ]
+                        [ text (ms (if readOnly then msgs.draftTrashedBanner else msgs.draftStaleBanner)) ]
+                    , H.div_ [ HP.class_ "tt-banner-actions" ]
+                        ( [ H.button_
+                                ( [ HP.type_ "button"
+                                  , HP.class_ "tt-btn tt-btn-primary tt-btn-xs"
+                                  , HE.onClick ApplyStaleDraft
+                                  ] <> disabledAttr isSaving
+                                )
+                                [ text (ms msgs.actionApplyDraft) ]
+                          | not readOnly
+                          ]
+                            <> [ H.button_
+                                    ( [ HP.type_ "button"
+                                      , HP.class_ "tt-btn tt-btn-ghost tt-btn-xs"
+                                      , HE.onClick DiscardCurrentDraft
+                                      ] <> disabledAttr isSaving
+                                    )
+                                    [ text (ms msgs.actionDiscardDraft) ]
+                               ]
+                        )
+                    ]
+            _
+                | not readOnly && state.restoredDraftDocId == Just doc.id ->
+                    H.div_ [ HP.class_ "tt-banner tt-banner-info", HP.role_ "status" ]
+                        [ H.span_ [ HP.class_ "tt-banner-text" ] [ text (ms msgs.draftRestoredBanner) ]
+                        , H.div_ [ HP.class_ "tt-banner-actions" ]
+                            [ H.button_
+                                ( [ HP.type_ "button"
+                                  , HP.class_ "tt-btn tt-btn-ghost tt-btn-xs"
+                                  , HE.onClick DiscardCurrentDraft
+                                  ] <> disabledAttr isSaving
+                                )
+                                [ text (ms msgs.actionDiscardDraft) ]
+                            ]
+                        ]
+                | otherwise ->
+                    H.div_ [ HP.class_ "tt-slot-empty" ] []
 
 viewEditorToolbar :: UiMessages -> ClientState -> Document -> View () () ClientState ClientAction
 viewEditorToolbar msgs state doc =
@@ -473,6 +580,12 @@ viewEditorToolbar msgs state doc =
                         , HE.onClick ToggleMetadataPanel
                         ]
                         [ text (ms msgs.actionMetadataToggle) ]
+                   , H.button_
+                        [ HP.type_ "button"
+                        , HP.class_ "tt-btn tt-btn-secondary tt-btn-compact"
+                        , HE.onClick ExportCurrentDocument
+                        ]
+                        [ text (ms msgs.actionExport) ]
                    ]
                 <> [ H.button_
                         ( [ HP.type_ "button"
@@ -776,13 +889,15 @@ viewEditorStatusBar :: UiMessages -> ClientState -> Bool -> View () () ClientSta
 viewEditorStatusBar msgs state readOnly =
     H.footer_ [ HP.class_ "tt-statusbar" ]
         [ H.div_ [ HP.class_ "tt-status-metrics" ]
-            [ H.span_ []
-                [ text (ms (showInt stats.lineCount <> msgs.statsLinesUnit)) ]
-            , H.span_ []
-                [ text (ms (showInt stats.charCount <> msgs.statsCharsUnit)) ]
-            , H.span_ []
-                [ text (ms (msgs.statsCursorPrefix <> " " <> showInt stats.cursorLine <> ":" <> showInt stats.cursorCol)) ]
-            ]
+            ( [ H.span_ []
+                    [ text (ms (showInt stats.lineCount <> msgs.statsLinesUnit)) ]
+              , H.span_ []
+                    [ text (ms (showInt stats.charCount <> msgs.statsCharsUnit)) ]
+              , H.span_ []
+                    [ text (ms (msgs.statsCursorPrefix <> " " <> showInt stats.cursorLine <> ":" <> showInt stats.cursorCol)) ]
+              ]
+                <> draftSyncIndicator
+            )
         , viewExtensionQuickActions msgs state.extensionMetadatas readOnly
         ]
   where
@@ -791,6 +906,28 @@ viewEditorStatusBar msgs state readOnly =
 
     showInt :: Int -> Text
     showInt = Txt.pack . show
+
+    draftSyncIndicator :: [View () () ClientState ClientAction]
+    draftSyncIndicator
+        | readOnly = []
+        | otherwise = case state.draftSyncState of
+            DraftSyncIdle -> []
+            DraftSyncPending ->
+                [ H.span_ [ HP.class_ "tt-draft-status tt-draft-status-pending", HP.role_ "status" ]
+                    [ text (ms msgs.draftStatePending) ]
+                ]
+            DraftSyncSaved{} ->
+                [ H.span_ [ HP.class_ "tt-draft-status tt-draft-status-saved", HP.role_ "status" ]
+                    [ text (ms msgs.draftStateSaved) ]
+                ]
+            DraftSyncFailed detail ->
+                [ H.span_
+                    [ HP.class_ "tt-draft-status tt-draft-status-failed"
+                    , HP.role_ "alert"
+                    , HP.title_ (ms (msgs.errDraftStoragePrefix <> ": " <> detail))
+                    ]
+                    [ text (ms msgs.draftStateFailed) ]
+                ]
 
 viewExtensionQuickActions ::
        UiMessages

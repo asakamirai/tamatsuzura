@@ -16,6 +16,11 @@ module TamaTsuzura.Client.App
     , EditorDraft(..)
     , emptyEditorDraft
     , draftFromDocument
+    , editorDraftFromStored
+    , toStoredDraft
+    , DraftReconcileResult(..)
+    , reconcileDocumentWithDraft
+    , buildRecoveryRequestFromStoredDraft
     , SearchPanelState(..)
     , emptySearchPanelState
     , ClientState(..)
@@ -38,6 +43,8 @@ module TamaTsuzura.Client.App
     , applyDocumentsResult
     , applyTagsResult
     , applyFoldersResult
+    , applyDraftsLoaded
+    , applyDraftStorageEvent
     , applyDocumentLoaded
     , applyDocumentCreated
     , applyDocumentSaved
@@ -57,13 +64,16 @@ import           Control.Monad.State.Class       (get)
 import           Data.Either                     (fromRight)
 import           Data.Foldable                   (for_)
 import           Data.List                       (find)
-import           Data.Maybe                      (isJust)
+import           Data.Map.Strict                 (Map)
+import qualified Data.Map.Strict                 as Map
+import           Data.Maybe                      (isJust, isNothing)
 import           Data.Text                       (Text)
 import qualified Data.Text                       as Txt
+import           Data.Time.Clock                 (UTCTime, getCurrentTime)
 import           Miso                            (App, Component(..), Effect, View, component, io, io_, modify)
 import           TamaTsuzura.Client.Api
     ( ApiClient
-    , ApiClientError
+    , ApiClientError(..)
     , createDocument
     , fetchHealth
     , getDocument
@@ -74,6 +84,15 @@ import           TamaTsuzura.Client.Api
     , restoreDocument
     , softDeleteDocument
     , updateDocument
+    )
+import           TamaTsuzura.Client.DraftStorage
+    ( DraftStorage(..)
+    , DraftStorageEvent(..)
+    , DraftSyncState(..)
+    , StoredDraft(..)
+    , browserDraftStorage
+    , draftStorageEventsSub
+    , latestStoredDraft
     )
 import           TamaTsuzura.Client.EditorBridge
     ( EditorCommand(..)
@@ -87,9 +106,19 @@ import           TamaTsuzura.Client.EditorBridge
     , editorEventsSub
     , emptyEditorStats
     )
+import           TamaTsuzura.Client.FileTransfer
+    ( ExportSpec(..)
+    , FilePickResult(..)
+    , FileTransferClient(..)
+    , ImportedFile(..)
+    , browserFileTransferClient
+    , buildExportSpec
+    , prepareImportedDocumentRequest
+    )
 import           TamaTsuzura.Client.I18n
     ( UiMessages(..)
     , formatApiClientError
+    , formatFileImportError
     , formatValidationError
     )
 import           TamaTsuzura.Common.Api
@@ -111,11 +140,13 @@ import           TamaTsuzura.Common.Document
     , DocumentFormat(..)
     , DocumentId
     , DocumentSummary(..)
+    , DocumentTitle
     , FolderPath
     , Tag
     , TagSet
     , defaultDocumentFormat
     , emptyDocumentBody
+    , emptyDocumentTitle
     , emptyTagSet
     , isTrashed
     , mkDocumentTitle
@@ -130,26 +161,36 @@ import           TamaTsuzura.Common.Validation   (ValidationError)
 import           TamaTsuzura.ExtensionApi        (Extension(..), ExtensionId, ExtensionMetadata(..))
 
 -- | Miso コンポーネント実行時に外部から注入される不変の依存環境。
--- 関数を含む 'Extension' や 'HttpTransport'・エディタコマンド送出器を 'ClientState' (Model) から
--- 切り離すことで、Model の純粋な同値比較 ('Eq') と単体テスト容易性を両立する。
+-- 関数を含む 'Extension' や 'HttpTransport'・エディタコマンド送出器・ローカルストレージ・
+-- ファイル入出力クライアントを 'ClientState' (Model) から切り離すことで、
+-- Model の純粋な同値比較 ('Eq') と単体テスト容易性を両立する。
 data ClientEnv = ClientEnv
-    { apiClient     :: !ApiClient
+    { apiClient         :: !ApiClient
       -- ^ M1 REST API 通信クライアント
-    , extensions    :: ![Extension]
+    , extensions        :: ![Extension]
       -- ^ 結線層から注入された同梱拡張一覧
-    , messages      :: !UiMessages
+    , messages          :: !UiMessages
       -- ^ UI 表示文言カタログ
-    , sendEditorCmd :: !(EditorCommand -> IO ())
+    , sendEditorCmd     :: !(EditorCommand -> IO ())
       -- ^ CodeMirror 6 ブリッジへのコマンド送出関数 (テスト時はモック注入可)
+    , draftStorage      :: !DraftStorage
+      -- ^ IndexedDB ドラフト自動退避クライアント (テスト時はインメモリ注入可)
+    , fileTransfer      :: !FileTransferClient
+      -- ^ ローカルファイルのエクスポート・インポートクライアント (テスト時はモック注入可)
+    , getCurrentUtcTime :: !(IO UTCTime)
+      -- ^ ドラフト退避時刻の取得関数 (テスト時は決定的クロック注入可)
     }
 
--- | 標準の CodeMirror 6 JSFFI 送出器を用いる 'ClientEnv' を構築する。
+-- | 標準のブラウザ JSFFI 実装群を用いる 'ClientEnv' を構築する。
 defaultClientEnv :: ApiClient -> [Extension] -> UiMessages -> ClientEnv
 defaultClientEnv client exts msgs = ClientEnv
-    { apiClient     = client
-    , extensions    = exts
-    , messages      = msgs
-    , sendEditorCmd = dispatchEditorCommand
+    { apiClient         = client
+    , extensions        = exts
+    , messages          = msgs
+    , sendEditorCmd     = dispatchEditorCommand
+    , draftStorage      = browserDraftStorage
+    , fileTransfer      = browserFileTransferClient
+    , getCurrentUtcTime = getCurrentTime
     }
 
 -- | サーバとの接続状態。
@@ -190,6 +231,10 @@ data PendingNavigation
       -- ^ 稼働中 / ゴミ箱タブを切り替える
     | NavReturnToList
       -- ^ モバイルで一覧画面へ戻る
+    | NavImportDocument
+      -- ^ ローカルファイルから新規文書をインポートする
+    | NavRecoverOrphanedDraft
+      -- ^ 孤立ドラフトを新規文書として復元する
     deriving (Eq, Show)
 
 -- | 文書一覧の検索・整理フィルタ状態。
@@ -251,6 +296,71 @@ draftFromDocument doc = EditorDraft
     , folderInput = maybe "" toText doc.folder
     , tagsInput   = formatTagsInput doc.tags
     }
+
+-- | IndexedDB に退避された 'StoredDraft' をエディタ上の 'EditorDraft' へ復元変換する。
+editorDraftFromStored :: StoredDraft -> EditorDraft
+editorDraftFromStored sd = EditorDraft
+    { titleInput  = sd.titleInput
+    , body        = sd.body
+    , format      = sd.format
+    , folderInput = sd.folderInput
+    , tagsInput   = sd.tagsInput
+    }
+
+-- | 現在の保存済み 'Document' と編集中 'EditorDraft' から IndexedDB 退避用 'StoredDraft' を構築する。
+toStoredDraft :: Document -> EditorDraft -> UTCTime -> StoredDraft
+toStoredDraft doc currentDraft now = StoredDraft
+    { docId         = doc.id
+    , titleInput    = currentDraft.titleInput
+    , body          = currentDraft.body
+    , format        = currentDraft.format
+    , folderInput   = currentDraft.folderInput
+    , tagsInput     = currentDraft.tagsInput
+    , baseUpdatedAt = doc.updatedAt
+    , savedAt       = now
+    }
+
+-- | サーバから取得した 'Document' とローカル 'StoredDraft' の照合結果。
+data DraftReconcileResult
+    = NoLocalDraft
+      -- ^ ローカルドラフトは存在しない
+    | RedundantLocalDraft
+      -- ^ ローカルドラフトの内容がサーバ版と同一のため自動削除してよい
+    | RestoreLocalDraft !StoredDraft
+      -- ^ 同一ベース版からの未保存変更であり安全に自動復元できる
+    | PromptStaleLocalDraft !StoredDraft
+      -- ^ サーバ側が更新済み、またはゴミ箱内文書のため自動上書きせずユーザー判断を促す
+    deriving (Eq, Show)
+
+-- | サーバ文書とローカルドラフトを照合し、自動復元・自動掃除・警告提示のいずれを取るか判定する。
+reconcileDocumentWithDraft :: Document -> Maybe StoredDraft -> DraftReconcileResult
+reconcileDocumentWithDraft _ Nothing = NoLocalDraft
+reconcileDocumentWithDraft doc (Just sd)
+    | isTrashed doc = PromptStaleLocalDraft sd
+    | not (isDraftDirty doc (editorDraftFromStored sd)) = RedundantLocalDraft
+    | sd.baseUpdatedAt == doc.updatedAt = RestoreLocalDraft sd
+    | otherwise = PromptStaleLocalDraft sd
+
+-- | サーバ上で削除済み (404) となった孤立ドラフトから新規作成リクエストを安全に構築する。
+-- タイトル・フォルダ・タグに編集途中の不正値が含まれていた場合でも本文救出を優先して既定値へフォールバックする。
+buildRecoveryRequestFromStoredDraft :: StoredDraft -> Either ValidationError CreateDocumentRequest
+buildRecoveryRequestFromStoredDraft sd = do
+    validBody <- validateDocumentBody sd.body
+    let validTitle :: DocumentTitle
+        validTitle = fromRight emptyDocumentTitle (mkDocumentTitle sd.titleInput)
+
+        validFolder :: Maybe FolderPath
+        validFolder = fromRight Nothing (parseFolderInput sd.folderInput)
+
+        validTags :: TagSet
+        validTags = fromRight emptyTagSet (parseTagsInput sd.tagsInput)
+    Right CreateDocumentRequest
+        { title  = validTitle
+        , body   = validBody
+        , format = sd.format
+        , folder = validFolder
+        , tags   = validTags
+        }
 
 -- | エディタ内検索・置換パネルの状態。
 data SearchPanelState = SearchPanelState
@@ -314,10 +424,16 @@ data ClientState = ClientState
       -- ^ 文書一覧読み込み中フラグ
     , isCreatingDocument           :: !Bool
       -- ^ 新規文書作成中フラグ
+    , isImportingDocument          :: !Bool
+      -- ^ ローカルファイルインポート中フラグ
     , pendingListReloadAfterCreate :: !Bool
       -- ^ ゴミ箱タブからの新規作成完了後に稼働中一覧を再取得するフラグ (POST/GET レース防止)
+    , pendingListReloadAfterImport :: !Bool
+      -- ^ ゴミ箱タブからのインポート完了後に稼働中一覧を再取得するフラグ
     , openingDocumentId            :: !(Maybe DocumentId)
       -- ^ 現在 GET 中の文書 ID (レース時の古い応答を無視するためのガード)
+    , autoOpeningDraftId           :: !(Maybe DocumentId)
+      -- ^ 起動時の自動ドラフト復元で GET 中の文書 ID
     , savingDocument               :: !(Maybe (DocumentId, EditorDraft))
       -- ^ 現在 PUT 保存中の (文書 ID, 送信時点のドラフト) (二重送信防止および保存中追加入力の保持)
     , mutatingDocumentId           :: !(Maybe DocumentId)
@@ -326,6 +442,16 @@ data ClientState = ClientState
       -- ^ 現在開いている保存済み文書スナップショット
     , draft                        :: !EditorDraft
       -- ^ 現在編集中のドラフト内容
+    , storedDrafts                 :: !(Map DocumentId StoredDraft)
+      -- ^ IndexedDB に退避されている全未保存ドラフト (文書 ID キー)
+    , draftSyncState               :: !DraftSyncState
+      -- ^ 現在編集中文書のローカルドラフト退避ステータス
+    , restoredDraftDocId           :: !(Maybe DocumentId)
+      -- ^ 未保存ドラフト復元バナーを表示中の対象文書 ID
+    , staleDraftPrompt             :: !(Maybe StoredDraft)
+      -- ^ サーバ側更新済みまたはゴミ箱内文書に残存する未適用ドラフト
+    , orphanedDraft                :: !(Maybe StoredDraft)
+      -- ^ サーバ側で 404 だった自動復元対象ドラフト (新規文書として救出可能)
     , editorSyncVersion            :: !Int
       -- ^ CodeMirror 6 へ外部変更を同期するたびにインクリメントされるバージョン番号
     , editorStats                  :: !EditorStats
@@ -454,6 +580,30 @@ data ClientAction
       -- ^ 完全削除の結果受信
     | ApplyExtension !ExtensionId
       -- ^ 指定した拡張機能を現在の編集本文へ適用する
+    | DraftsLoaded !(Either Text [StoredDraft])
+      -- ^ 起動時の IndexedDB 未保存ドラフト一覧の読み込み結果
+    | DraftStorageEventReceived !DraftStorageEvent
+      -- ^ IndexedDB ドラフト自動退避の完了/失敗通知
+    | ApplyStaleDraft
+      -- ^ サーバ側更新済み文書に対して残存ローカルドラフトを手動適用する
+    | DiscardCurrentDraft
+      -- ^ 現在文書に紐づくローカル未保存ドラフトを破棄してサーバ版へ戻す
+    | RecoverOrphanedDraft
+      -- ^ サーバ削除済み文書の孤立ドラフトを新規文書として復元する
+    | OrphanDraftRecovered !DocumentId !(Either ApiClientError Document)
+      -- ^ 孤立ドラフトからの新規文書作成応答
+    | DiscardOrphanedDraft
+      -- ^ 孤立ドラフトをローカルから破棄する
+    | ExportCurrentDocument
+      -- ^ 現在編集中の文書を Markdown またはプレーンテキストとしてダウンロードする
+    | ExportFinished !Text !(Either Text ())
+      -- ^ エクスポート処理の結果受信 (ファイル名, 成否)
+    | RequestImportDocument
+      -- ^ ローカルファイルからのインポート開始要求 (未保存変更があれば確認ダイアログ)
+    | ImportFilePicked !FilePickResult
+      -- ^ ファイル選択ダイアログからの読み込み結果受信
+    | DocumentImported !Text !(Either ApiClientError Document)
+      -- ^ インポートに伴う @POST /api/documents@ の結果受信 (元ファイル名, 結果)
     | DismissError
       -- ^ 表示中のエラーバナーを閉じる
     | DismissNotice
@@ -474,12 +624,20 @@ initialClientState exts = ClientState
     , listRequestSeq               = 0
     , isLoadingDocuments           = False
     , isCreatingDocument           = False
+    , isImportingDocument          = False
     , pendingListReloadAfterCreate = False
+    , pendingListReloadAfterImport = False
     , openingDocumentId            = Nothing
+    , autoOpeningDraftId           = Nothing
     , savingDocument               = Nothing
     , mutatingDocumentId           = Nothing
     , selectedDocument             = Nothing
     , draft                        = emptyEditorDraft
+    , storedDrafts                 = Map.empty
+    , draftSyncState               = DraftSyncIdle
+    , restoredDraftDocId           = Nothing
+    , staleDraftPrompt             = Nothing
+    , orphanedDraft                = Nothing
     , editorSyncVersion            = 0
     , editorStats                  = emptyEditorStats
     , canUndo                      = False
@@ -687,7 +845,69 @@ applyFoldersResult :: Either ApiClientError FolderListResponse -> ClientState ->
 applyFoldersResult (Right res) state = state { availableFolders = res.folders }
 applyFoldersResult (Left _)    state = state
 
+-- | 起動時の IndexedDB ドラフト一覧読み込み結果をクライアント状態へ純粋に反映する。
+-- すでにユーザーが編集開始した現在文書のドラフトは上書きせず保持し、
+-- まだ未編集のまま開いている文書と一致するドラフトがあれば復元・警告判定を行う。
+applyDraftsLoaded :: UiMessages -> Either Text [StoredDraft] -> ClientState -> ClientState
+applyDraftsLoaded _ (Left errMsg) state =
+    state { draftSyncState = DraftSyncFailed errMsg }
+applyDraftsLoaded msgs (Right drafts) state =
+    let loadedMap :: Map DocumentId StoredDraft
+        loadedMap = Map.fromList [ (sd.docId, sd) | sd <- drafts ]
+
+        mergedMap :: Map DocumentId StoredDraft
+        mergedMap = Map.union state.storedDrafts loadedMap
+
+        baseState :: ClientState
+        baseState = state { storedDrafts = mergedMap }
+    in  case state.selectedDocument of
+            Just doc | not (isDraftDirty doc state.draft) ->
+                case reconcileDocumentWithDraft doc (Map.lookup doc.id mergedMap) of
+                    NoLocalDraft -> baseState
+                    RedundantLocalDraft ->
+                        baseState { storedDrafts = Map.delete doc.id mergedMap }
+                    RestoreLocalDraft sd ->
+                        baseState
+                            { draft              = editorDraftFromStored sd
+                            , editorSyncVersion  = baseState.editorSyncVersion + 1
+                            , editorStats        = computeTextStats (toText sd.body)
+                            , editorViewMode     = normalizeViewMode sd.format baseState.editorViewMode
+                            , draftSyncState     = DraftSyncSaved sd.savedAt
+                            , restoredDraftDocId = Just doc.id
+                            , staleDraftPrompt   = Nothing
+                            , statusNotice       = Just msgs.noticeDraftRestored
+                            }
+                    PromptStaleLocalDraft sd ->
+                        baseState { staleDraftPrompt = Just sd }
+            _ -> baseState
+
+-- | IndexedDB ブリッジからの非同期退避イベントをクライアント状態へ反映する。
+applyDraftStorageEvent :: DraftStorageEvent -> ClientState -> ClientState
+applyDraftStorageEvent evt state = case evt of
+    DraftEvtSaved docId ts ->
+        let nextStored :: Map DocumentId StoredDraft
+            nextStored = Map.adjust (\ sd -> sd { savedAt = ts }) docId state.storedDrafts
+
+            isSelectedDirty :: Bool
+            isSelectedDirty =
+                fmap (.id) state.selectedDocument == Just docId
+                    && isCurrentDocumentDirty state
+                    && state.draftSyncState /= DraftSyncIdle
+        in  state
+                { storedDrafts   = nextStored
+                , draftSyncState = if isSelectedDirty then DraftSyncSaved ts else state.draftSyncState
+                }
+    DraftEvtSaveFailed mDocId errMsg ->
+        let matchesSelected :: Bool
+            matchesSelected = case mDocId of
+                Nothing    -> isJust state.selectedDocument
+                Just docId -> fmap (.id) state.selectedDocument == Just docId
+        in  if matchesSelected
+                then state { draftSyncState = DraftSyncFailed errMsg }
+                else state
+
 -- | 単一文書取得応答を反映する。より新しい選択要求が発生済みの古い応答は無視する。
+-- ローカル IndexedDB に未保存ドラフトが存在する場合は 'reconcileDocumentWithDraft' に従って復元または警告提示する。
 applyDocumentLoaded ::
        UiMessages
     -> DocumentId
@@ -698,26 +918,102 @@ applyDocumentLoaded msgs reqId result state
     | state.openingDocumentId /= Just reqId = state
     | otherwise = case result of
         Right doc ->
-            let nextMode :: EditorViewMode
-                nextMode = normalizeViewMode doc.format state.editorViewMode
-            in  state
-                    { openingDocumentId = Nothing
-                    , selectedDocument  = Just doc
-                    , draft             = draftFromDocument doc
-                    , editorSyncVersion = state.editorSyncVersion + 1
-                    , editorStats       = computeTextStats (toText doc.body)
-                    , editorViewMode    = nextMode
-                    , canUndo           = False
-                    , canRedo           = False
-                    , mobilePane        = PaneEditor
-                    , lastError         = Nothing
-                    , statusNotice      = Nothing
-                    }
+            case reconcileDocumentWithDraft doc (Map.lookup doc.id state.storedDrafts) of
+                RestoreLocalDraft sd ->
+                    state
+                        { openingDocumentId  = Nothing
+                        , autoOpeningDraftId = Nothing
+                        , selectedDocument   = Just doc
+                        , draft              = editorDraftFromStored sd
+                        , draftSyncState     = DraftSyncSaved sd.savedAt
+                        , restoredDraftDocId = Just doc.id
+                        , staleDraftPrompt   = Nothing
+                        , editorSyncVersion  = state.editorSyncVersion + 1
+                        , editorStats        = computeTextStats (toText sd.body)
+                        , editorViewMode     = normalizeViewMode sd.format state.editorViewMode
+                        , canUndo            = False
+                        , canRedo            = False
+                        , mobilePane         = PaneEditor
+                        , lastError          = Nothing
+                        , statusNotice       = Just msgs.noticeDraftRestored
+                        }
+                PromptStaleLocalDraft sd ->
+                    state
+                        { openingDocumentId  = Nothing
+                        , autoOpeningDraftId = Nothing
+                        , selectedDocument   = Just doc
+                        , draft              = draftFromDocument doc
+                        , draftSyncState     = DraftSyncIdle
+                        , restoredDraftDocId = Nothing
+                        , staleDraftPrompt   = Just sd
+                        , editorSyncVersion  = state.editorSyncVersion + 1
+                        , editorStats        = computeTextStats (toText doc.body)
+                        , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
+                        , canUndo            = False
+                        , canRedo            = False
+                        , mobilePane         = PaneEditor
+                        , lastError          = Nothing
+                        , statusNotice       = Nothing
+                        }
+                RedundantLocalDraft ->
+                    state
+                        { openingDocumentId  = Nothing
+                        , autoOpeningDraftId = Nothing
+                        , selectedDocument   = Just doc
+                        , draft              = draftFromDocument doc
+                        , storedDrafts       = Map.delete doc.id state.storedDrafts
+                        , draftSyncState     = DraftSyncIdle
+                        , restoredDraftDocId = Nothing
+                        , staleDraftPrompt   = Nothing
+                        , editorSyncVersion  = state.editorSyncVersion + 1
+                        , editorStats        = computeTextStats (toText doc.body)
+                        , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
+                        , canUndo            = False
+                        , canRedo            = False
+                        , mobilePane         = PaneEditor
+                        , lastError          = Nothing
+                        , statusNotice       = Nothing
+                        }
+                NoLocalDraft ->
+                    state
+                        { openingDocumentId  = Nothing
+                        , autoOpeningDraftId = Nothing
+                        , selectedDocument   = Just doc
+                        , draft              = draftFromDocument doc
+                        , draftSyncState     = DraftSyncIdle
+                        , restoredDraftDocId = Nothing
+                        , staleDraftPrompt   = Nothing
+                        , editorSyncVersion  = state.editorSyncVersion + 1
+                        , editorStats        = computeTextStats (toText doc.body)
+                        , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
+                        , canUndo            = False
+                        , canRedo            = False
+                        , mobilePane         = PaneEditor
+                        , lastError          = Nothing
+                        , statusNotice       = Nothing
+                        }
         Left err ->
-            state
-                { openingDocumentId = Nothing
-                , lastError         = Just (formatApiClientError msgs err)
-                }
+            let wasAutoOpen :: Bool
+                wasAutoOpen = state.autoOpeningDraftId == Just reqId
+
+                isNotFound :: Bool
+                isNotFound = case err of
+                    ClientApiError 404 _ -> True
+                    _                    -> False
+            in  if wasAutoOpen && isNotFound
+                    then state
+                        { openingDocumentId  = Nothing
+                        , autoOpeningDraftId = Nothing
+                        , mobilePane         = PaneList
+                        , orphanedDraft      = Map.lookup reqId state.storedDrafts
+                        , lastError          = Nothing
+                        }
+                    else state
+                        { openingDocumentId  = Nothing
+                        , autoOpeningDraftId = Nothing
+                        , mobilePane         = if wasAutoOpen then PaneList else state.mobilePane
+                        , lastError          = Just (formatApiClientError msgs err)
+                        }
 
 -- | 文書新規作成応答をクライアント状態へ純粋に反映する。
 applyDocumentCreated ::
@@ -742,8 +1038,12 @@ applyDocumentCreated _ (Right doc) state =
             , totalDocuments     = nextTotal
             , isCreatingDocument = False
             , openingDocumentId  = Nothing
+            , autoOpeningDraftId = Nothing
             , selectedDocument   = Just doc
             , draft              = draftFromDocument doc
+            , draftSyncState     = DraftSyncIdle
+            , restoredDraftDocId = Nothing
+            , staleDraftPrompt   = Nothing
             , editorSyncVersion  = state.editorSyncVersion + 1
             , editorStats        = computeTextStats (toText doc.body)
             , editorViewMode     = ModeEdit
@@ -792,13 +1092,41 @@ applyDocumentSaved msgs savedId result state = case state.savingDocument of
                         if isSameSelected
                             then mergeDraftAfterSave sentDraft (draftFromDocument doc) state.draft
                             else state.draft
+
+                    stillDirty :: Bool
+                    stillDirty = isSameSelected && isDraftDirty doc nextDraft
+
+                    nextStoredDrafts :: Map DocumentId StoredDraft
+                    nextStoredDrafts =
+                        if stillDirty
+                            then state.storedDrafts
+                            else Map.delete doc.id state.storedDrafts
+                    nextDraftSyncState :: DraftSyncState
+                    nextDraftSyncState
+                        | not isSameSelected = state.draftSyncState
+                        | stillDirty         = DraftSyncPending
+                        | otherwise          = DraftSyncIdle
+
+                    nextRestoredDocId :: Maybe DocumentId
+                    nextRestoredDocId
+                        | not isSameSelected = state.restoredDraftDocId
+                        | stillDirty         = state.restoredDraftDocId
+                        | otherwise          = Nothing
+
+                    nextStalePrompt :: Maybe StoredDraft
+                    nextStalePrompt =
+                        if isSameSelected then Nothing else state.staleDraftPrompt
                 in  state
-                        { savingDocument    = Nothing
-                        , documentSummaries = nextSummaries
-                        , selectedDocument  = if isSameSelected then Just doc else state.selectedDocument
-                        , draft             = nextDraft
-                        , lastError         = Nothing
-                        , statusNotice      = Just msgs.noticeSaved
+                        { savingDocument     = Nothing
+                        , documentSummaries  = nextSummaries
+                        , selectedDocument   = if isSameSelected then Just doc else state.selectedDocument
+                        , draft              = nextDraft
+                        , storedDrafts       = nextStoredDrafts
+                        , draftSyncState     = nextDraftSyncState
+                        , restoredDraftDocId = nextRestoredDocId
+                        , staleDraftPrompt   = nextStalePrompt
+                        , lastError          = Nothing
+                        , statusNotice       = Just msgs.noticeSaved
                         }
             Left err ->
                 state
@@ -838,6 +1166,10 @@ applyDocumentSoftDeleted msgs targetId result state = case result of
                 , totalDocuments     = nextTotal
                 , selectedDocument   = if wasSelected then Nothing else state.selectedDocument
                 , draft              = if wasSelected then emptyEditorDraft else state.draft
+                , storedDrafts       = Map.delete targetId state.storedDrafts
+                , draftSyncState     = if wasSelected then DraftSyncIdle else state.draftSyncState
+                , restoredDraftDocId = if wasSelected then Nothing else state.restoredDraftDocId
+                , staleDraftPrompt   = if wasSelected then Nothing else state.staleDraftPrompt
                 , editorStats        = if wasSelected then emptyEditorStats else state.editorStats
                 , canUndo            = not wasSelected && state.canUndo
                 , canRedo            = not wasSelected && state.canRedo
@@ -916,6 +1248,10 @@ applyDocumentPermanentlyDeleted msgs targetId result state = case result of
                 , totalDocuments         = max 0 (state.totalDocuments - removedCount)
                 , selectedDocument       = if wasSelected then Nothing else state.selectedDocument
                 , draft                  = if wasSelected then emptyEditorDraft else state.draft
+                , storedDrafts           = Map.delete targetId state.storedDrafts
+                , draftSyncState         = if wasSelected then DraftSyncIdle else state.draftSyncState
+                , restoredDraftDocId     = if wasSelected then Nothing else state.restoredDraftDocId
+                , staleDraftPrompt       = if wasSelected then Nothing else state.staleDraftPrompt
                 , editorStats            = if wasSelected then emptyEditorStats else state.editorStats
                 , canUndo                = not wasSelected && state.canUndo
                 , canRedo                = not wasSelected && state.canRedo
@@ -975,7 +1311,9 @@ dismissNotice state = state { statusNotice = Nothing }
 -- | Miso の MVU 更新関数。純粋な状態更新・API 呼び出し・CodeMirror 6 コマンド送出を調停する。
 updateClient :: ClientEnv -> ClientAction -> Effect () () ClientState ClientAction
 updateClient env action = case action of
-    Initialize -> triggerRefreshAll
+    Initialize -> do
+        triggerRefreshAll
+        io (DraftsLoaded <$> env.draftStorage.listStoredDrafts)
     RefreshAll -> triggerRefreshAll
     HealthChecked eHealth ->
         modify (applyHealthResult env.messages eHealth)
@@ -1022,11 +1360,19 @@ updateClient env action = case action of
                 then modify (\ s -> s { pendingNavigation = Just (NavOpenDocument docId) })
                 else executeNavigation (NavOpenDocument docId)
     DocumentLoaded docId eDoc -> do
+        stBefore <- get
+        let shouldCleanRedundant :: Bool
+            shouldCleanRedundant = case eDoc of
+                Right doc
+                    | stBefore.openingDocumentId == Just docId ->
+                        reconcileDocumentWithDraft doc (Map.lookup doc.id stBefore.storedDrafts) == RedundantLocalDraft
+                _ -> False
         modify (applyDocumentLoaded env.messages docId eDoc)
+        when shouldCleanRedundant (io_ (env.draftStorage.deleteStoredDraft docId))
         syncEditorFromCurrentState False
     RequestCreateDocument -> do
         st <- get
-        if st.isCreatingDocument
+        if st.isCreatingDocument || st.isImportingDocument
             then pure ()
             else if isCurrentDocumentDirty st
                 then modify (\ s -> s { pendingNavigation = Just NavCreateDocument })
@@ -1036,9 +1382,13 @@ updateClient env action = case action of
         let shouldReloadList :: Bool
             shouldReloadList = stBefore.pendingListReloadAfterCreate
         modify $ \ s ->
-            (applyDocumentCreated env.messages eDoc s)
-                { pendingListReloadAfterCreate = False
-                }
+            let base :: ClientState
+                base = (applyDocumentCreated env.messages eDoc s)
+                    { pendingListReloadAfterCreate = False
+                    }
+            in  case eDoc of
+                    Right _ | shouldReloadList -> base { filterState = defaultFilterState }
+                    _                          -> base
         syncEditorFromCurrentState False
         case eDoc of
             Right _ -> do
@@ -1054,32 +1404,66 @@ updateClient env action = case action of
             else modify (\ s -> s { mobilePane = PaneList })
     ConfirmDiscardNavigation -> do
         st <- get
-        modify (\ s -> s { pendingNavigation = Nothing })
+        let mDiscardDocId :: Maybe DocumentId
+            mDiscardDocId = fmap (.id) st.selectedDocument
+
+            shouldRevertDraft :: Bool
+            shouldRevertDraft = case st.pendingNavigation of
+                Just NavImportDocument       -> True
+                Just NavRecoverOrphanedDraft -> True
+                _                            -> False
+        modify $ \ s ->
+            let base :: ClientState
+                base = s
+                    { pendingNavigation  = Nothing
+                    , storedDrafts       = maybe s.storedDrafts (`Map.delete` s.storedDrafts) mDiscardDocId
+                    , draftSyncState     = DraftSyncIdle
+                    , restoredDraftDocId = Nothing
+                    , staleDraftPrompt   = Nothing
+                    }
+            in  if shouldRevertDraft
+                    then
+                        let resetDraft :: EditorDraft
+                            resetDraft = maybe emptyEditorDraft draftFromDocument s.selectedDocument
+                        in  base
+                                { draft             = resetDraft
+                                , editorSyncVersion = s.editorSyncVersion + 1
+                                , editorStats       = computeTextStats (toText resetDraft.body)
+                                , canUndo           = False
+                                , canRedo           = False
+                                }
+                    else base
+        for_ mDiscardDocId (io_ . env.draftStorage.deleteStoredDraft)
+        when shouldRevertDraft (syncEditorFromCurrentState True)
         for_ st.pendingNavigation executeNavigation
     CancelPendingNavigation ->
         modify (\ s -> s { pendingNavigation = Nothing })
-    UpdateDraftTitle txt ->
+    UpdateDraftTitle txt -> do
         modify $ \ st -> st
-            { draft        = st.draft { titleInput = txt }
+            { draft        = setDraftTitle txt st.draft
             , statusNotice = Nothing
             }
+        syncLocalDraftForCurrentState
     UpdateDraftFormat nextFmt -> do
         modify $ \ st -> st
             { draft          = setDraftFormat nextFmt st.draft
             , editorViewMode = normalizeViewMode nextFmt st.editorViewMode
             , statusNotice   = Nothing
             }
+        syncLocalDraftForCurrentState
         syncEditorFromCurrentState False
-    UpdateDraftFolder txt ->
+    UpdateDraftFolder txt -> do
         modify $ \ st -> st
-            { draft        = st.draft { folderInput = txt }
+            { draft        = setDraftFolder txt st.draft
             , statusNotice = Nothing
             }
-    UpdateDraftTags txt ->
+        syncLocalDraftForCurrentState
+    UpdateDraftTags txt -> do
         modify $ \ st -> st
-            { draft        = st.draft { tagsInput = txt }
+            { draft        = setDraftTags txt st.draft
             , statusNotice = Nothing
             }
+        syncLocalDraftForCurrentState
     ToggleMetadataPanel ->
         modify (\ st -> st { metadataPanelOpen = not st.metadataPanelOpen })
     SetEditorViewMode mode ->
@@ -1091,7 +1475,11 @@ updateClient env action = case action of
     DocumentSaved docId eDoc -> do
         modify (applyDocumentSaved env.messages docId eDoc)
         case eDoc of
-            Right _ -> do
+            Right doc -> do
+                stAfter <- get
+                if fmap (.id) stAfter.selectedDocument == Just doc.id && isDraftDirty doc stAfter.draft
+                    then syncLocalDraftForCurrentState
+                    else io_ (env.draftStorage.deleteStoredDraft doc.id)
                 io (TagsLoaded <$> listTags env.apiClient)
                 io (FoldersLoaded <$> listFolders env.apiClient)
             Left _ -> pure ()
@@ -1104,8 +1492,9 @@ updateClient env action = case action of
         _ -> do
             modify (applyEditorEvent evt)
             case evt of
-                EvtOpenSearch{} -> dispatchCurrentSearch
-                _               -> pure ()
+                EvtBodyChanged{} -> syncLocalDraftForCurrentState
+                EvtOpenSearch{}  -> dispatchCurrentSearch
+                _                -> pure ()
     ToggleSearchPanel openReplace -> do
         st <- get
         if st.searchPanel.isOpen && not openReplace
@@ -1168,6 +1557,7 @@ updateClient env action = case action of
         modify (applyDocumentSoftDeleted env.messages docId eDoc)
         case eDoc of
             Right _ -> do
+                io_ (env.draftStorage.deleteStoredDraft docId)
                 when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
                 io (TagsLoaded <$> listTags env.apiClient)
                 io (FoldersLoaded <$> listFolders env.apiClient)
@@ -1210,8 +1600,10 @@ updateClient env action = case action of
             wasSelected = fmap (.id) stBefore.selectedDocument == Just docId
         modify (applyDocumentPermanentlyDeleted env.messages docId eUnit)
         case eUnit of
-            Right () -> when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
-            Left _   -> pure ()
+            Right () -> do
+                io_ (env.draftStorage.deleteStoredDraft docId)
+                when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
+            Left _ -> pure ()
     ApplyExtension extId -> do
         st <- get
         let hasExt :: Bool
@@ -1222,8 +1614,222 @@ updateClient env action = case action of
                     (applyExtensionById env.extensions extId s)
                         { statusNotice = Just env.messages.noticeExtensionApplied
                         }
+                syncLocalDraftForCurrentState
                 syncEditorFromCurrentState False
             _ -> pure ()
+    DraftsLoaded eDrafts -> do
+        stBefore <- get
+        modify (applyDraftsLoaded env.messages eDrafts)
+        case eDrafts of
+            Left _ -> pure ()
+            Right drafts -> do
+                let loadedMap :: Map DocumentId StoredDraft
+                    loadedMap = Map.fromList [ (sd.docId, sd) | sd <- drafts ]
+                case stBefore.selectedDocument of
+                    Just doc | not (isDraftDirty doc stBefore.draft) ->
+                        case reconcileDocumentWithDraft doc (Map.lookup doc.id (Map.union stBefore.storedDrafts loadedMap)) of
+                            RedundantLocalDraft ->
+                                io_ (env.draftStorage.deleteStoredDraft doc.id)
+                            RestoreLocalDraft{} ->
+                                syncEditorFromCurrentState False
+                            _ -> pure ()
+                    Nothing
+                        | isNothing stBefore.openingDocumentId
+                            && not stBefore.isCreatingDocument
+                            && not stBefore.isImportingDocument ->
+                            for_ (latestStoredDraft drafts) $ \ latest -> do
+                                modify $ \ s -> s
+                                    { openingDocumentId  = Just latest.docId
+                                    , autoOpeningDraftId = Just latest.docId
+                                    , mobilePane         = PaneEditor
+                                    }
+                                io (DocumentLoaded latest.docId <$> getDocument env.apiClient latest.docId)
+                    _ -> pure ()
+    DraftStorageEventReceived evt ->
+        modify (applyDraftStorageEvent evt)
+    ApplyStaleDraft -> do
+        st <- get
+        case (st.selectedDocument, st.staleDraftPrompt) of
+            (Just doc, Just sd)
+                | not (isTrashed doc)
+                    && sd.docId == doc.id
+                    && isNothing st.savingDocument -> do
+                    let restoredDraft :: EditorDraft
+                        restoredDraft = editorDraftFromStored sd
+                    modify $ \ s -> s
+                        { draft              = restoredDraft
+                        , editorSyncVersion  = s.editorSyncVersion + 1
+                        , editorStats        = computeTextStats (toText restoredDraft.body)
+                        , editorViewMode     = normalizeViewMode restoredDraft.format s.editorViewMode
+                        , canUndo            = False
+                        , canRedo            = False
+                        , restoredDraftDocId = Just doc.id
+                        , staleDraftPrompt   = Nothing
+                        , statusNotice       = Just env.messages.noticeDraftRestored
+                        }
+                    syncLocalDraftForCurrentState
+                    syncEditorFromCurrentState True
+            _ -> pure ()
+    DiscardCurrentDraft -> do
+        st <- get
+        case st.selectedDocument of
+            Nothing -> pure ()
+            Just doc
+                | isJust st.savingDocument -> pure ()
+                | otherwise -> do
+                    let isOnlyStalePrompt :: Bool
+                        isOnlyStalePrompt = isJust st.staleDraftPrompt
+                    if isOnlyStalePrompt
+                        then modify $ \ s -> s
+                            { storedDrafts     = Map.delete doc.id s.storedDrafts
+                            , staleDraftPrompt = Nothing
+                            , statusNotice     = Just env.messages.noticeDraftDiscarded
+                            }
+                        else do
+                            let serverDraft :: EditorDraft
+                                serverDraft = draftFromDocument doc
+                            modify $ \ s -> s
+                                { draft              = serverDraft
+                                , storedDrafts       = Map.delete doc.id s.storedDrafts
+                                , draftSyncState     = DraftSyncIdle
+                                , restoredDraftDocId = Nothing
+                                , staleDraftPrompt   = Nothing
+                                , editorSyncVersion  = s.editorSyncVersion + 1
+                                , editorStats        = computeTextStats (toText serverDraft.body)
+                                , editorViewMode     = normalizeViewMode serverDraft.format s.editorViewMode
+                                , canUndo            = False
+                                , canRedo            = False
+                                , statusNotice       = Just env.messages.noticeDraftDiscarded
+                                }
+                            syncEditorFromCurrentState True
+                    io_ (env.draftStorage.deleteStoredDraft doc.id)
+    RecoverOrphanedDraft -> do
+        st <- get
+        case st.orphanedDraft of
+            Nothing -> pure ()
+            Just _
+                | st.isCreatingDocument || st.isImportingDocument -> pure ()
+                | isCurrentDocumentDirty st ->
+                    modify (\ s -> s { pendingNavigation = Just NavRecoverOrphanedDraft })
+                | otherwise ->
+                    executeNavigation NavRecoverOrphanedDraft
+    OrphanDraftRecovered oldDocId eDoc -> do
+        stBefore <- get
+        let shouldReloadList :: Bool
+            shouldReloadList = stBefore.pendingListReloadAfterCreate
+        modify $ \ s ->
+            let base :: ClientState
+                base = (applyDocumentCreated env.messages eDoc s)
+                    { pendingListReloadAfterCreate = False
+                    }
+            in  case eDoc of
+                    Right _ -> base
+                        { orphanedDraft = Nothing
+                        , storedDrafts  = Map.delete oldDocId base.storedDrafts
+                        , filterState   = if shouldReloadList then defaultFilterState else base.filterState
+                        , statusNotice  = Just env.messages.noticeDraftRestored
+                        }
+                    Left _ -> base
+        syncEditorFromCurrentState False
+        case eDoc of
+            Right _ -> do
+                io_ (env.draftStorage.deleteStoredDraft oldDocId)
+                when shouldReloadList reloadDocumentsForCurrentFilter
+                io (TagsLoaded <$> listTags env.apiClient)
+                io (FoldersLoaded <$> listFolders env.apiClient)
+                io_ (env.sendEditorCmd CmdFocus)
+            Left _ -> pure ()
+    DiscardOrphanedDraft -> do
+        st <- get
+        for_ st.orphanedDraft $ \ sd -> do
+            modify $ \ s -> s
+                { orphanedDraft = Nothing
+                , storedDrafts  = Map.delete sd.docId s.storedDrafts
+                , statusNotice  = Just env.messages.noticeDraftDiscarded
+                }
+            io_ (env.draftStorage.deleteStoredDraft sd.docId)
+    ExportCurrentDocument -> do
+        st <- get
+        case st.selectedDocument of
+            Nothing -> pure ()
+            Just _  -> do
+                let spec :: ExportSpec
+                    spec = buildExportSpec st.draft.titleInput st.draft.body st.draft.format
+                io (ExportFinished spec.fileName <$> env.fileTransfer.exportFile spec)
+    ExportFinished fileName eRes -> case eRes of
+        Right () ->
+            modify $ \ s -> s
+                { lastError    = Nothing
+                , statusNotice = Just (env.messages.noticeExportedPrefix <> fileName)
+                }
+        Left errMsg ->
+            modify $ \ s -> s
+                { lastError = Just (env.messages.errExportFailedPrefix <> " (" <> errMsg <> ")")
+                }
+    RequestImportDocument -> do
+        st <- get
+        if st.isImportingDocument || st.isCreatingDocument
+            then pure ()
+            else if isCurrentDocumentDirty st
+                then modify (\ s -> s { pendingNavigation = Just NavImportDocument })
+                else executeNavigation NavImportDocument
+    ImportFilePicked pickRes -> case pickRes of
+        FilePickCancelled -> pure ()
+        FilePickError err ->
+            modify (\ s -> s { lastError = Just (formatFileImportError env.messages err) })
+        FilePickSelected imported -> do
+            st <- get
+            if st.isImportingDocument || st.isCreatingDocument
+                then pure ()
+                else do
+                    let fromTrash :: Bool
+                        fromTrash = st.filterState.status == StatusTrashed
+
+                        targetFolder :: Maybe FolderPath
+                        targetFolder = if fromTrash then Nothing else st.filterState.selectedFolder
+
+                        targetTags :: TagSet
+                        targetTags =
+                            if fromTrash
+                                then emptyTagSet
+                                else case st.filterState.selectedTag of
+                                    Nothing -> emptyTagSet
+                                    Just t  -> fromRight emptyTagSet (mkTagSetFromTexts [toText t])
+                    case prepareImportedDocumentRequest imported targetFolder targetTags of
+                        Left err ->
+                            modify (\ s -> s { lastError = Just (formatFileImportError env.messages err) })
+                        Right createReq -> do
+                            modify $ \ s -> s
+                                { isImportingDocument          = True
+                                , pendingListReloadAfterImport = fromTrash
+                                , lastError                    = Nothing
+                                , statusNotice                 = Nothing
+                                }
+                            io (DocumentImported imported.fileName <$> createDocument env.apiClient createReq)
+    DocumentImported fileName eDoc -> do
+        stBefore <- get
+        let shouldReloadList :: Bool
+            shouldReloadList = stBefore.pendingListReloadAfterImport
+        modify $ \ s ->
+            let base :: ClientState
+                base = (applyDocumentCreated env.messages eDoc s)
+                    { isImportingDocument          = False
+                    , pendingListReloadAfterImport = False
+                    }
+            in  case eDoc of
+                    Right _ -> base
+                        { filterState  = if shouldReloadList then defaultFilterState else base.filterState
+                        , statusNotice = Just (env.messages.noticeImportedPrefix <> fileName)
+                        }
+                    Left _ -> base
+        syncEditorFromCurrentState False
+        case eDoc of
+            Right _ -> do
+                when shouldReloadList reloadDocumentsForCurrentFilter
+                io (TagsLoaded <$> listTags env.apiClient)
+                io (FoldersLoaded <$> listFolders env.apiClient)
+                io_ (env.sendEditorCmd CmdFocus)
+            Left _ -> pure ()
     DismissError ->
         modify dismissError
     DismissNotice ->
@@ -1269,9 +1875,10 @@ updateClient env action = case action of
     executeNavigation nav = case nav of
         NavOpenDocument docId -> do
             modify $ \ s -> s
-                { openingDocumentId = Just docId
-                , mobilePane        = PaneEditor
-                , lastError         = Nothing
+                { openingDocumentId  = Just docId
+                , autoOpeningDraftId = Nothing
+                , mobilePane         = PaneEditor
+                , lastError          = Nothing
                 }
             io (DocumentLoaded docId <$> getDocument env.apiClient docId)
         NavCreateDocument -> do
@@ -1281,31 +1888,28 @@ updateClient env action = case action of
 
                 initialReq :: CreateDocumentRequest
                 initialReq = buildCreateRequestFromFilter st.filterState
-
-                nextFilter :: FilterState
-                nextFilter =
-                    if fromTrash
-                        then defaultFilterState
-                        else st.filterState
             modify $ \ s -> s
                 { isCreatingDocument           = True
                 , pendingListReloadAfterCreate = fromTrash
-                , filterState                  = nextFilter
                 , lastError                    = Nothing
                 , statusNotice                 = Nothing
                 }
             io (DocumentCreated <$> createDocument env.apiClient initialReq)
         NavSwitchStatus nextStatus -> do
             modify $ \ s -> s
-                { filterState      = setFilterStatus nextStatus s.filterState
-                , openingDocumentId = Nothing
-                , selectedDocument = Nothing
-                , draft            = emptyEditorDraft
-                , editorStats      = emptyEditorStats
-                , canUndo          = False
-                , canRedo          = False
-                , mobilePane       = PaneList
-                , statusNotice     = Nothing
+                { filterState        = setFilterStatus nextStatus s.filterState
+                , openingDocumentId  = Nothing
+                , autoOpeningDraftId = Nothing
+                , selectedDocument   = Nothing
+                , draft              = emptyEditorDraft
+                , draftSyncState     = DraftSyncIdle
+                , restoredDraftDocId = Nothing
+                , staleDraftPrompt   = Nothing
+                , editorStats        = emptyEditorStats
+                , canUndo            = False
+                , canRedo            = False
+                , mobilePane         = PaneList
+                , statusNotice       = Nothing
                 }
             io_ (env.sendEditorCmd CmdResetEditor)
             reloadDocumentsForCurrentFilter
@@ -1314,15 +1918,65 @@ updateClient env action = case action of
                 let resetDraft :: EditorDraft
                     resetDraft = maybe emptyEditorDraft draftFromDocument s.selectedDocument
                 in  s
-                        { draft             = resetDraft
-                        , editorSyncVersion = s.editorSyncVersion + 1
-                        , editorStats       = computeTextStats (toText resetDraft.body)
-                        , canUndo           = False
-                        , canRedo           = False
-                        , mobilePane        = PaneList
-                        , statusNotice      = Nothing
+                        { draft              = resetDraft
+                        , draftSyncState     = DraftSyncIdle
+                        , restoredDraftDocId = Nothing
+                        , staleDraftPrompt   = Nothing
+                        , editorSyncVersion  = s.editorSyncVersion + 1
+                        , editorStats        = computeTextStats (toText resetDraft.body)
+                        , canUndo            = False
+                        , canRedo            = False
+                        , mobilePane         = PaneList
+                        , statusNotice       = Nothing
                         }
             syncEditorFromCurrentState True
+        NavImportDocument ->
+            io (ImportFilePicked <$> env.fileTransfer.pickImportFile)
+        NavRecoverOrphanedDraft -> do
+            st <- get
+            case st.orphanedDraft of
+                Nothing -> pure ()
+                Just sd
+                    | st.isCreatingDocument || st.isImportingDocument -> pure ()
+                    | otherwise -> case buildRecoveryRequestFromStoredDraft sd of
+                        Left vErr ->
+                            modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
+                        Right createReq -> do
+                            let fromTrash :: Bool
+                                fromTrash = st.filterState.status == StatusTrashed
+                            modify $ \ s -> s
+                                { isCreatingDocument           = True
+                                , pendingListReloadAfterCreate = fromTrash
+                                , lastError                    = Nothing
+                                , statusNotice                 = Nothing
+                                }
+                            io (OrphanDraftRecovered sd.docId <$> createDocument env.apiClient createReq)
+
+    syncLocalDraftForCurrentState :: Effect () () ClientState ClientAction
+    syncLocalDraftForCurrentState = do
+        st <- get
+        case st.selectedDocument of
+            Just doc | not (isTrashed doc) ->
+                if isDraftDirty doc st.draft
+                    then do
+                        let provisional :: StoredDraft
+                            provisional = toStoredDraft doc st.draft doc.updatedAt
+                        modify $ \ s -> s
+                            { storedDrafts     = Map.insert doc.id provisional s.storedDrafts
+                            , draftSyncState   = DraftSyncPending
+                            , staleDraftPrompt = Nothing
+                            }
+                        io_ $ do
+                            now <- env.getCurrentUtcTime
+                            env.draftStorage.scheduleSaveDraft (toStoredDraft doc st.draft now)
+                    else do
+                        modify $ \ s -> s
+                            { storedDrafts       = Map.delete doc.id s.storedDrafts
+                            , draftSyncState     = DraftSyncIdle
+                            , restoredDraftDocId = Nothing
+                            }
+                        io_ (env.draftStorage.deleteStoredDraft doc.id)
+            _ -> pure ()
 
     triggerSaveCurrentDocument :: Effect () () ClientState ClientAction
     triggerSaveCurrentDocument = do
@@ -1381,6 +2035,15 @@ buildCreateRequestFromFilter flt
                 , tags   = initialTags
                 }
 
+setDraftTitle :: Text -> EditorDraft -> EditorDraft
+setDraftTitle nextTitle d = EditorDraft
+    { titleInput  = nextTitle
+    , body        = d.body
+    , format      = d.format
+    , folderInput = d.folderInput
+    , tagsInput   = d.tagsInput
+    }
+
 setDraftBody :: DocumentBody -> EditorDraft -> EditorDraft
 setDraftBody nextBody d = EditorDraft
     { titleInput  = d.titleInput
@@ -1397,6 +2060,24 @@ setDraftFormat nextFmt d = EditorDraft
     , format      = nextFmt
     , folderInput = d.folderInput
     , tagsInput   = d.tagsInput
+    }
+
+setDraftFolder :: Text -> EditorDraft -> EditorDraft
+setDraftFolder nextFolder d = EditorDraft
+    { titleInput  = d.titleInput
+    , body        = d.body
+    , format      = d.format
+    , folderInput = nextFolder
+    , tagsInput   = d.tagsInput
+    }
+
+setDraftTags :: Text -> EditorDraft -> EditorDraft
+setDraftTags nextTags d = EditorDraft
+    { titleInput  = d.titleInput
+    , body        = d.body
+    , format      = d.format
+    , folderInput = d.folderInput
+    , tagsInput   = nextTags
     }
 
 setFilterStatus :: DocumentStatusFilter -> FilterState -> FilterState
@@ -1487,7 +2168,7 @@ normalizeViewMode FormatPlainText _    = ModeEdit
 normalizeViewMode FormatMarkdown  mode = mode
 
 -- | ビュー関数と依存環境を束ねてトップレベル Miso 'App' コンポーネントを構築する。
--- マウント直後に 'Initialize' を発火し、同時に CodeMirror 6 ブリッジからのイベント購読を登録する。
+-- マウント直後に 'Initialize' を発火し、CodeMirror 6 ブリッジおよび IndexedDB ストレージブリッジのイベント購読を登録する。
 mkClientComponent ::
        ClientEnv
     -> (UiMessages -> ClientState -> View () () ClientState ClientAction)
@@ -1495,5 +2176,8 @@ mkClientComponent ::
 mkClientComponent env renderView =
     (component (initialClientState env.extensions) (updateClient env) (renderView env.messages))
         { mount = Just Initialize
-        , subs  = [ editorEventsSub EditorEventReceived ]
+        , subs  =
+            [ editorEventsSub EditorEventReceived
+            , draftStorageEventsSub DraftStorageEventReceived
+            ]
         }
