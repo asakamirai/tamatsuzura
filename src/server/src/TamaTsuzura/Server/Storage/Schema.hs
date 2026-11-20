@@ -57,9 +57,9 @@ newtype StorageHandle = StorageHandle
     }
 
 -- | 本バイナリが期待・サポートする SQLite スキーマバージョン (@PRAGMA user_version@)。
--- v2 で M3 認証向けの @users@ / @sessions@ テーブルおよび関連インデックスを追加した。
+-- v3 で @documents.owner_id@ (外部キー @users(id)@) および所有者分離向けインデックスを追加した。
 currentSchemaVersion :: Int
-currentSchemaVersion = 2
+currentSchemaVersion = 3
 
 -- | 新規に開いた SQLite 接続へ CGI / Warp 運用で必須の PRAGMA 設定を適用する。
 -- ロック競合時に後続 PRAGMA 自体が即座に @SQLITE_BUSY@ とならないよう、
@@ -254,12 +254,12 @@ escapeLikePattern raw = "%" <> Txt.concatMap escapeChar raw <> "%"
 
 applyInitialSchema :: SQLite.Connection -> IO ()
 applyInitialSchema conn = do
-    SQLite.execute_ conn createDocumentsTableSql
-    SQLite.execute_ conn createDocumentTagsTableSql
     SQLite.execute_ conn createUsersTableSql
     SQLite.execute_ conn createSessionsTableSql
-    SQLite.execute_ conn createDeletedUpdatedIndexSql
-    SQLite.execute_ conn createFolderIndexSql
+    SQLite.execute_ conn createDocumentsTableSql
+    SQLite.execute_ conn createDocumentTagsTableSql
+    SQLite.execute_ conn createOwnerDeletedUpdatedIndexSql
+    SQLite.execute_ conn createOwnerFolderIndexSql
     SQLite.execute_ conn createTagIndexSql
     SQLite.execute_ conn createSessionsUserIndexSql
     SQLite.execute_ conn createSessionsExpiresIndexSql
@@ -269,13 +269,15 @@ createDocumentsTableSql :: SQLite.Query
 createDocumentsTableSql =
     "CREATE TABLE IF NOT EXISTS documents (\
     \ id TEXT PRIMARY KEY NOT NULL,\
+    \ owner_id TEXT NOT NULL,\
     \ title TEXT NOT NULL,\
     \ body TEXT NOT NULL,\
     \ format TEXT NOT NULL CHECK (format IN ('markdown', 'plain_text')),\
     \ folder TEXT,\
     \ created_at TEXT NOT NULL,\
     \ updated_at TEXT NOT NULL,\
-    \ deleted_at TEXT\
+    \ deleted_at TEXT,\
+    \ FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE\
     \)"
 
 createDocumentTagsTableSql :: SQLite.Query
@@ -310,15 +312,15 @@ createSessionsTableSql =
     \ FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\
     \)"
 
-createDeletedUpdatedIndexSql :: SQLite.Query
-createDeletedUpdatedIndexSql =
-    "CREATE INDEX IF NOT EXISTS idx_documents_deleted_updated\
-    \ ON documents (deleted_at, updated_at DESC, id ASC)"
+createOwnerDeletedUpdatedIndexSql :: SQLite.Query
+createOwnerDeletedUpdatedIndexSql =
+    "CREATE INDEX IF NOT EXISTS idx_documents_owner_deleted_updated\
+    \ ON documents (owner_id, deleted_at, updated_at DESC, id ASC)"
 
-createFolderIndexSql :: SQLite.Query
-createFolderIndexSql =
-    "CREATE INDEX IF NOT EXISTS idx_documents_folder\
-    \ ON documents (folder) WHERE folder IS NOT NULL"
+createOwnerFolderIndexSql :: SQLite.Query
+createOwnerFolderIndexSql =
+    "CREATE INDEX IF NOT EXISTS idx_documents_owner_folder\
+    \ ON documents (owner_id, folder) WHERE folder IS NOT NULL"
 
 createTagIndexSql :: SQLite.Query
 createTagIndexSql =

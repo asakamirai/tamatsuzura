@@ -16,6 +16,12 @@ module TamaTsuzura.Server.Config
     , envPort
     , envScriptName
     , envStaticDir
+    , envAllowRegistration
+    , envSessionTtlSeconds
+    , envCookieSecure
+    , envTrustProxyHeaders
+    , envHttps
+    , envRequestScheme
     , defaultDbRelativePath
       -- * Warp / CGI ランタイム設定
     , RawWarpOptions(..)
@@ -24,6 +30,7 @@ module TamaTsuzura.Server.Config
     , CgiConfig(..)
     , parseWarpArgs
     , resolveStorageConfig
+    , resolveAuthConfig
     , resolveWarpConfig
     , resolveCgiConfig
     , loadWarpConfig
@@ -37,6 +44,20 @@ import qualified Data.Text                        as Txt
 import qualified System.Environment               as Env
 import qualified System.OsPath                    as OS
 import           TamaTsuzura.Common.Text          (ToText(..))
+import           TamaTsuzura.Server.Auth.Cookie
+    ( AuthConfig(..)
+    , CookieSecureMode(..)
+    , RegistrationPolicy(..)
+    , defaultAuthConfig
+    )
+import           TamaTsuzura.Server.Auth.Crypto   (defaultPasswordHashParams)
+import           TamaTsuzura.Server.Storage.Auth
+    ( SessionTtlSeconds
+    , defaultSessionTtlSeconds
+    , maxSessionTtlSeconds
+    , minSessionTtlSeconds
+    , mkSessionTtlSeconds
+    )
 import           TamaTsuzura.Server.Storage.Types
     ( BusyTimeoutMs
     , StorageConfig(..)
@@ -92,6 +113,30 @@ envScriptName = "SCRIPT_NAME"
 envStaticDir :: String
 envStaticDir = "TAMATSUZURA_STATIC_DIR"
 
+-- | 新規ユーザー登録の可否 (@true@ / @false@、既定 @true@) を指定する環境変数名。
+envAllowRegistration :: String
+envAllowRegistration = "TAMATSUZURA_ALLOW_REGISTRATION"
+
+-- | セッション有効期間 (秒、既定 604800 = 7 日) を指定する環境変数名。
+envSessionTtlSeconds :: String
+envSessionTtlSeconds = "TAMATSUZURA_SESSION_TTL_SECONDS"
+
+-- | セッション Cookie の @Secure@ 属性付与方針 (@auto@ / @always@ / @never@、既定 @auto@) を指定する環境変数名。
+envCookieSecure :: String
+envCookieSecure = "TAMATSUZURA_COOKIE_SECURE"
+
+-- | リバースプロキシの @X-Forwarded-Proto@ / @X-Forwarded-Host@ を信頼するか (@true@ / @false@、既定 @false@) を指定する環境変数名。
+envTrustProxyHeaders :: String
+envTrustProxyHeaders = "TAMATSUZURA_TRUST_PROXY_HEADERS"
+
+-- | CGI/1.1 環境で HTTPS 接続を示す標準環境変数名 (@on@ / @1@)。
+envHttps :: String
+envHttps = "HTTPS"
+
+-- | Apache CGI 等でリクエストスキーム (@https@ / @http@) を示す環境変数名。
+envRequestScheme :: String
+envRequestScheme = "REQUEST_SCHEME"
+
 -- | @TAMATSUZURA_DB_PATH@ および @--db-path@ がともに未指定のときに使用する既定の相対 DB パス。
 defaultDbRelativePath :: String
 defaultDbRelativePath = "data/tamatsuzura.sqlite3"
@@ -125,14 +170,20 @@ data WarpConfig = WarpConfig
       -- ^ SQLite ストレージ設定
     , staticDir :: !(Maybe OS.OsPath)
       -- ^ 静的アセット配信ルートディレクトリ (未指定時は API 専用)
+    , auth      :: !AuthConfig
+      -- ^ 認証・セッション・登録ポリシー設定
     } deriving (Eq, Show)
 
 -- | CGI エントリポイントの検証済み実行設定。
 data CgiConfig = CgiConfig
     { scriptName :: !(Maybe Text)
       -- ^ CGI @SCRIPT_NAME@ の値 (例: @"/api"@ または @"/cgi-bin/tamatsuzura.cgi"@)
+    , isHttps    :: !Bool
+      -- ^ CGI 環境変数 (@HTTPS=on@ / @HTTPS=1@ / @REQUEST_SCHEME=https@) から判定した HTTPS 状態
     , storage    :: !StorageConfig
       -- ^ SQLite ストレージ設定
+    , auth       :: !AuthConfig
+      -- ^ 認証・セッション・登録ポリシー設定
     } deriving (Eq, Show)
 
 -- | コマンドライン引数から待受ポートのみを解釈する簡易パーサ。
@@ -202,6 +253,51 @@ resolveStorageConfig mRawDbPath mRawTimeout =
     resolveTimeout Nothing    = Right defaultBusyTimeoutMs
     resolveTimeout (Just raw) = parseBusyTimeoutString raw
 
+-- | 環境変数一覧から認証・セッション・登録ポリシー設定 ('AuthConfig') を解決する。
+-- Warp と CGI の双方で完全に同一の環境変数名・検証ルールを共有する。
+resolveAuthConfig :: [(String, String)] -> Either Text AuthConfig
+resolveAuthConfig envList = do
+    regPolicy <- resolveRegistrationPolicy (lookup envAllowRegistration envList)
+    ttl       <- resolveSessionTtl (lookup envSessionTtlSeconds envList)
+    secMode   <- resolveCookieSecure (lookup envCookieSecure envList)
+    trustHdrs <- resolveTrustProxy (lookup envTrustProxyHeaders envList)
+    Right AuthConfig
+        { registrationPolicy = regPolicy
+        , sessionTtl         = ttl
+        , cookieSecureMode   = secMode
+        , passwordHashParams = defaultPasswordHashParams
+        , trustProxyHeaders  = trustHdrs
+        }
+  where
+    resolveRegistrationPolicy :: Maybe String -> Either Text RegistrationPolicy
+    resolveRegistrationPolicy Nothing    = Right defaultAuthConfig.registrationPolicy
+    resolveRegistrationPolicy (Just raw) = do
+        allowed <- parseBoolEnv envAllowRegistration raw
+        Right (if allowed then RegistrationOpen else RegistrationClosed)
+
+    resolveSessionTtl :: Maybe String -> Either Text SessionTtlSeconds
+    resolveSessionTtl Nothing    = Right defaultSessionTtlSeconds
+    resolveSessionTtl (Just raw) = parseSessionTtlString raw
+
+    resolveCookieSecure :: Maybe String -> Either Text CookieSecureMode
+    resolveCookieSecure Nothing    = Right defaultAuthConfig.cookieSecureMode
+    resolveCookieSecure (Just raw) = case Txt.toLower (Txt.strip (Txt.pack raw)) of
+        "auto"   -> Right CookieSecureAuto
+        "always" -> Right CookieSecureAlways
+        "never"  -> Right CookieSecureNever
+        _        ->
+            Left
+                ( "Invalid "
+                    <> Txt.pack envCookieSecure
+                    <> " value: "
+                    <> Txt.pack raw
+                    <> " (expected \"auto\", \"always\", or \"never\")"
+                )
+
+    resolveTrustProxy :: Maybe String -> Either Text Bool
+    resolveTrustProxy Nothing    = Right defaultAuthConfig.trustProxyHeaders
+    resolveTrustProxy (Just raw) = parseBoolEnv envTrustProxyHeaders raw
+
 -- | CLI 引数と環境変数一覧から Warp サーバ設定を解決する。
 -- 同一項目が双方にある場合は CLI 引数を優先し、未指定項目は安全な既定値を用いる。
 resolveWarpConfig ::
@@ -214,28 +310,32 @@ resolveWarpConfig args envList =
         Right rawOpts ->
             case resolvePort rawOpts.rawPort (lookup envPort envList) of
                 Left err -> pure (Left err)
-                Right port -> do
-                    let mDbPath :: Maybe String
-                        mDbPath = firstJust rawOpts.rawDbPath (lookup envDbPath envList)
+                Right port ->
+                    case resolveAuthConfig envList of
+                        Left err -> pure (Left err)
+                        Right authCfg -> do
+                            let mDbPath :: Maybe String
+                                mDbPath = firstJust rawOpts.rawDbPath (lookup envDbPath envList)
 
-                        mTimeout :: Maybe String
-                        mTimeout = firstJust rawOpts.rawBusyTimeoutMs (lookup envDbBusyTimeoutMs envList)
+                                mTimeout :: Maybe String
+                                mTimeout = firstJust rawOpts.rawBusyTimeoutMs (lookup envDbBusyTimeoutMs envList)
 
-                        mStaticDir :: Maybe String
-                        mStaticDir = firstJust rawOpts.rawStaticDir (lookup envStaticDir envList)
-                    eStorage <- resolveStorageConfig mDbPath mTimeout
-                    case eStorage of
-                        Left err         -> pure (Left err)
-                        Right storageCfg -> do
-                            eStatic <- resolveStaticDir mStaticDir
-                            pure $ fmap
-                                (\ mDir -> WarpConfig
-                                    { port      = port
-                                    , storage   = storageCfg
-                                    , staticDir = mDir
-                                    }
-                                )
-                                eStatic
+                                mStaticDir :: Maybe String
+                                mStaticDir = firstJust rawOpts.rawStaticDir (lookup envStaticDir envList)
+                            eStorage <- resolveStorageConfig mDbPath mTimeout
+                            case eStorage of
+                                Left err         -> pure (Left err)
+                                Right storageCfg -> do
+                                    eStatic <- resolveStaticDir mStaticDir
+                                    pure $ fmap
+                                        (\ mDir -> WarpConfig
+                                            { port      = port
+                                            , storage   = storageCfg
+                                            , staticDir = mDir
+                                            , auth      = authCfg
+                                            }
+                                        )
+                                        eStatic
   where
     resolvePort :: Maybe String -> Maybe String -> Either Text ServerPort
     resolvePort mCli mEnv = case firstJust mCli mEnv of
@@ -255,17 +355,31 @@ resolveWarpConfig args envList =
 
 -- | CGI 環境変数一覧から CGI 実行設定を解決する。
 resolveCgiConfig :: [(String, String)] -> IO (Either Text CgiConfig)
-resolveCgiConfig envList = do
-    let mDbPath :: Maybe String
-        mDbPath = lookup envDbPath envList
+resolveCgiConfig envList =
+    case resolveAuthConfig envList of
+        Left err -> pure (Left err)
+        Right authCfg -> do
+            let mDbPath :: Maybe String
+                mDbPath = lookup envDbPath envList
 
-        mTimeout :: Maybe String
-        mTimeout = lookup envDbBusyTimeoutMs envList
+                mTimeout :: Maybe String
+                mTimeout = lookup envDbBusyTimeoutMs envList
 
-        mScriptName :: Maybe Text
-        mScriptName = fmap Txt.pack (lookup envScriptName envList)
-    eStorage <- resolveStorageConfig mDbPath mTimeout
-    pure $ fmap (\ storageCfg -> CgiConfig { scriptName = mScriptName, storage = storageCfg }) eStorage
+                mScriptName :: Maybe Text
+                mScriptName = fmap Txt.pack (lookup envScriptName envList)
+
+                httpsFlag :: Bool
+                httpsFlag = detectCgiHttps envList
+            eStorage <- resolveStorageConfig mDbPath mTimeout
+            pure $ fmap
+                (\ storageCfg -> CgiConfig
+                    { scriptName = mScriptName
+                    , isHttps    = httpsFlag
+                    , storage    = storageCfg
+                    , auth       = authCfg
+                    }
+                )
+                eStorage
 
 -- | プロセスの CLI 引数および環境変数から Warp サーバ設定を読み込む。
 loadWarpConfig :: IO (Either Text WarpConfig)
@@ -277,6 +391,37 @@ loadWarpConfig = do
 -- | プロセスの環境変数から CGI 実行設定を読み込む。
 loadCgiConfig :: IO (Either Text CgiConfig)
 loadCgiConfig = Env.getEnvironment >>= resolveCgiConfig
+
+detectCgiHttps :: [(String, String)] -> Bool
+detectCgiHttps envList =
+    isTruthyHttps (lookup envHttps envList)
+        || isHttpsScheme (lookup envRequestScheme envList)
+  where
+    isTruthyHttps :: Maybe String -> Bool
+    isTruthyHttps Nothing    = False
+    isTruthyHttps (Just raw) =
+        let lowered :: Text
+            lowered = Txt.toLower (Txt.strip (Txt.pack raw))
+        in  lowered == "on" || lowered == "1" || lowered == "true"
+
+    isHttpsScheme :: Maybe String -> Bool
+    isHttpsScheme Nothing    = False
+    isHttpsScheme (Just raw) = Txt.toLower (Txt.strip (Txt.pack raw)) == "https"
+
+parseBoolEnv :: String -> String -> Either Text Bool
+parseBoolEnv varName raw = case Txt.toLower (Txt.strip (Txt.pack raw)) of
+    "true"  -> Right True
+    "1"     -> Right True
+    "false" -> Right False
+    "0"     -> Right False
+    _       ->
+        Left
+            ( "Invalid boolean for "
+                <> Txt.pack varName
+                <> ": "
+                <> Txt.pack raw
+                <> " (expected \"true\" or \"false\")"
+            )
 
 parsePortString :: String -> Either Text ServerPort
 parsePortString raw =
@@ -299,6 +444,22 @@ parseBusyTimeoutString raw =
                         <> Txt.pack raw
                     )
             | otherwise -> mkBusyTimeoutMs (fromInteger n)
+
+parseSessionTtlString :: String -> Either Text SessionTtlSeconds
+parseSessionTtlString raw =
+    case parseStrictInteger raw of
+        Nothing -> Left ("Invalid session TTL value: " <> Txt.pack raw)
+        Just n
+            | n < toInteger minSessionTtlSeconds || n > toInteger maxSessionTtlSeconds ->
+                Left
+                    ( "Session TTL must be between "
+                        <> Txt.pack (show minSessionTtlSeconds)
+                        <> " and "
+                        <> Txt.pack (show maxSessionTtlSeconds)
+                        <> " seconds, got "
+                        <> Txt.pack raw
+                    )
+            | otherwise -> mkSessionTtlSeconds (fromInteger n)
 
 -- | 空白や @+@ 符号・8進/16進表記を許さず、10進整数リテラル (@-?[0-9]+@) のみを厳格に解釈する。
 parseStrictInteger :: String -> Maybe Integer

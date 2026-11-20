@@ -3,6 +3,7 @@ module Main
     ) where
 
 import           ApiSpec         (apiSpec)
+import           AuthApiSpec     (authApiSpec)
 import           AuthCryptoSpec  (authCryptoSpec)
 import           AuthStorageSpec (authStorageSpec)
 import           IntegrationSpec (integrationSpec)
@@ -18,6 +19,7 @@ spec = do
     storageSpec
     authCryptoSpec
     authStorageSpec
+    authApiSpec
     apiSpec
     staticSpec
     integrationSpec

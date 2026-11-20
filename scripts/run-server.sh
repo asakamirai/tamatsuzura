@@ -36,6 +36,18 @@ run_in_docker() {
     if [ -n "${TAMATSUZURA_STATIC_DIR+x}" ]; then
       docker_env_args+=(-e "TAMATSUZURA_STATIC_DIR=${TAMATSUZURA_STATIC_DIR}")
     fi
+    if [ -n "${TAMATSUZURA_ALLOW_REGISTRATION+x}" ]; then
+      docker_env_args+=(-e "TAMATSUZURA_ALLOW_REGISTRATION=${TAMATSUZURA_ALLOW_REGISTRATION}")
+    fi
+    if [ -n "${TAMATSUZURA_SESSION_TTL_SECONDS+x}" ]; then
+      docker_env_args+=(-e "TAMATSUZURA_SESSION_TTL_SECONDS=${TAMATSUZURA_SESSION_TTL_SECONDS}")
+    fi
+    if [ -n "${TAMATSUZURA_COOKIE_SECURE+x}" ]; then
+      docker_env_args+=(-e "TAMATSUZURA_COOKIE_SECURE=${TAMATSUZURA_COOKIE_SECURE}")
+    fi
+    if [ -n "${TAMATSUZURA_TRUST_PROXY_HEADERS+x}" ]; then
+      docker_env_args+=(-e "TAMATSUZURA_TRUST_PROXY_HEADERS=${TAMATSUZURA_TRUST_PROXY_HEADERS}")
+    fi
     PORT="${PORT}" docker compose -f docker/docker-compose.yml run --rm --service-ports "${docker_env_args[@]}" dev "$@"
   else
     echo "Error: Docker or docker/docker-compose.yml is not available." >&2

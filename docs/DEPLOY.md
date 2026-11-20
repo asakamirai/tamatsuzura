@@ -16,6 +16,10 @@
    - 必須・任意環境変数:
      - `TAMATSUZURA_DB_PATH`: SQLite DB ファイルパス（例: `/var/lib/tamatsuzura/tamatsuzura.sqlite3`、未指定時は `data/tamatsuzura.sqlite3`）。
      - `TAMATSUZURA_DB_BUSY_TIMEOUT_MS`: SQLite ロック待機時間ミリ秒（`0..300000`、既定値 `5000`）。
+     - `TAMATSUZURA_ALLOW_REGISTRATION`: ブラウザからの新規ユーザー登録許可（`true` / `false`、既定値 `true`。クローズド運用時は `false`）。
+     - `TAMATSUZURA_SESSION_TTL_SECONDS`: SQLite セッションおよび Cookie `Max-Age` 有効期間秒数（`60..31536000`、既定値 `604800` = 7 日）。
+     - `TAMATSUZURA_COOKIE_SECURE`: セッション Cookie の `Secure` 属性方針（`auto` / `always` / `never`、既定値 `auto`。CGI の `HTTPS=on` / `REQUEST_SCHEME=https` を自動検出）。
+     - `TAMATSUZURA_TRUST_PROXY_HEADERS`: リバースプロキシ配下で `X-Forwarded-Proto` / `X-Forwarded-Host` を信頼するか（`true` / `false`、既定値 `false`）。
 2. **スタンドアロン HTTP サーバ / Docker コンテナ**:
    - Warp HTTP サーバ（`tamatsuzura-server`、`warp` ベース）と静的アセットを同梱した構成。ローカル開発や VPS / リバースプロキシ（Nginx / Cloudflare 等）背後での常駐運用に使用。
    - 起動例: `tamatsuzura-server --port 8080 --db-path /var/lib/tamatsuzura/tamatsuzura.sqlite3 --busy-timeout-ms 5000`（環境変数 `PORT` / `TAMATSUZURA_DB_PATH` / `TAMATSUZURA_DB_BUSY_TIMEOUT_MS` も使用可能）。

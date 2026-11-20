@@ -1,3 +1,4 @@
+{-# LANGUAGE DataKinds             #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE NoFieldSelectors      #-}
 {-# LANGUAGE OverloadedRecordDot   #-}
@@ -7,7 +8,9 @@ module TamaTsuzura.Server.App
     ( -- * WAI アプリケーション構築
       maxRawRequestBodyBytes
     , mkApplication
+    , mkApplicationWithAuth
     , mkWarpApplication
+    , mkWarpApplicationWithAuth
     , mkCgiApplication
     , configErrorApplication
     , normalizeCgiRequest
@@ -21,7 +24,7 @@ module TamaTsuzura.Server.App
     , CgiConfig(..)
     ) where
 
-import           Control.Exception                (Exception, catch, throwIO)
+import           Control.Exception                (Exception, catch, evaluate, throwIO)
 import           Control.Monad.IO.Class           (liftIO)
 import qualified Data.Aeson                       as Aeson
 import           Data.ByteString                  (ByteString)
@@ -37,6 +40,9 @@ import qualified Network.Wai                      as Wai
 import           Servant
     ( Context(..)
     , Handler
+    , Header
+    , Headers
+    , IsSecure(..)
     , NoContent(..)
     , Server
     , (:<|>)(..)
@@ -58,12 +64,24 @@ import           TamaTsuzura.Common.Api
     , validateUpdateDocumentRequest
     , validationErrorToApiError
     )
+import           TamaTsuzura.Common.Auth
+    ( AuthSessionResponse(..)
+    , LoginRequest(..)
+    , RegisterRequest(..)
+    , UserId
+    , UserProfile(..)
+    , validateRegisterRequest
+    )
 import           TamaTsuzura.Common.Document      (Document, DocumentId)
 import           TamaTsuzura.Common.Text          (ToText(..))
 import           TamaTsuzura.Server.Api
-    ( DocumentByIdApi
+    ( AuthApi
+    , CsrfVerifiedSession(..)
+    , DocumentByIdApi
     , DocumentsApi
+    , RawCookieHeader(..)
     , RawDocumentListQuery(..)
+    , SessionAuthContext(..)
     , TamaTsuzuraApi
     , apiErrorFormatters
     , apiErrorToServerError
@@ -71,6 +89,30 @@ import           TamaTsuzura.Server.Api
     , parseDocumentIdParam
     , parseDocumentListQuery
     , tamaTsuzuraApiProxy
+    )
+import           TamaTsuzura.Server.Auth.Cookie
+    ( AuthConfig(..)
+    , RegistrationPolicy(..)
+    , buildClearSessionCookieHeader
+    , buildSessionCookieHeader
+    , defaultAuthConfig
+    , extractSessionTokenFromCookieValue
+    )
+import           TamaTsuzura.Server.Auth.Crypto
+    ( SessionTokenHash
+    , hashPassword
+    , hashPasswordWithSalt
+    , hashSessionToken
+    , mkSessionToken
+    , verifyPassword
+    )
+import           TamaTsuzura.Server.Auth.Middleware
+    ( csrfSessionAuthHandler
+    , noStoreCacheMiddleware
+    , normalizeCookieHeadersMiddleware
+    , normalizeRequestSecurityMiddleware
+    , originCheckMiddleware
+    , sessionAuthHandler
     )
 import           TamaTsuzura.Server.Config
     ( CgiConfig(..)
@@ -89,6 +131,15 @@ import           TamaTsuzura.Server.Storage
     , storageErrorToApiError
     )
 import qualified TamaTsuzura.Server.Storage       as Storage
+import           TamaTsuzura.Server.Storage.Auth
+    ( AuthenticatedSession(..)
+    , StoredSession(..)
+    , StoredUser(..)
+    , getUserByUsername
+    , logoutSession
+    , registerUserWithSession
+    , rotateLoginSession
+    )
 
 -- | 生の HTTP リクエストボディに対するハード上限 (16 MiB)。
 -- 文書本文の上限 (5 MiB UTF-8) に JSON エスケープやメタデータの余裕を持たせつつ、
@@ -101,30 +152,47 @@ data RequestBodyTooLarge = RequestBodyTooLarge
 
 instance Exception RequestBodyTooLarge
 
--- | 指定した 'StorageConfig' を用いて CGI と Warp の双方で共有される
--- 完全ステートレスな WAI / Servant アプリケーションを構築する。
+-- | 既定の 'defaultAuthConfig' と指定した 'StorageConfig' を用いて
+-- CGI と Warp の双方で共有される完全ステートレスな WAI / Servant アプリケーションを構築する。
 mkApplication :: StorageConfig -> Wai.Application
-mkApplication storageCfg =
-    limitRequestBodyMiddleware maxRawRequestBodyBytes
+mkApplication = mkApplicationWithAuth defaultAuthConfig
+
+-- | 指定した 'AuthConfig' と 'StorageConfig' を用いて
+-- CGI と Warp の双方で共有される完全ステートレスな WAI / Servant アプリケーションを構築する。
+mkApplicationWithAuth :: AuthConfig -> StorageConfig -> Wai.Application
+mkApplicationWithAuth authCfg storageCfg =
+    noStoreCacheMiddleware
+        . limitRequestBodyMiddleware maxRawRequestBodyBytes
         . normalizeErrorResponseMiddleware
+        . normalizeCookieHeadersMiddleware
+        . normalizeRequestSecurityMiddleware authCfg.trustProxyHeaders
+        . originCheckMiddleware authCfg.trustProxyHeaders
         $ Servant.serveWithContext
             tamaTsuzuraApiProxy
-            (apiErrorFormatters :. EmptyContext)
-            (serverHandlers storageCfg)
+            ( apiErrorFormatters
+                :. sessionAuthHandler storageCfg
+                :. csrfSessionAuthHandler storageCfg
+                :. EmptyContext
+            )
+            (serverHandlers authCfg storageCfg)
 
--- | Warp 開発・スタンドアロン運用向けの WAI アプリケーションを構築する。
+-- | 既定の 'defaultAuthConfig' を用いた Warp 開発・スタンドアロン運用向け WAI アプリケーションを構築する。
 -- @staticDir@ が指定された場合、@/api/...@ 以外へのリクエストを静的アセット配信へ振り分ける。
 mkWarpApplication :: Maybe OsPath -> StorageConfig -> Wai.Application
-mkWarpApplication Nothing storageCfg =
-    mkApplication storageCfg
-mkWarpApplication (Just dir) storageCfg =
-    staticFilesMiddleware dir (mkApplication storageCfg)
+mkWarpApplication mDir = mkWarpApplicationWithAuth mDir defaultAuthConfig
 
--- | CGI 環境 (@SCRIPT_NAME@ による @/api@ マウント差分の吸収を含む) 向けの
+-- | 指定した 'AuthConfig' を用いた Warp 開発・スタンドアロン運用向け WAI アプリケーションを構築する。
+mkWarpApplicationWithAuth :: Maybe OsPath -> AuthConfig -> StorageConfig -> Wai.Application
+mkWarpApplicationWithAuth Nothing authCfg storageCfg =
+    mkApplicationWithAuth authCfg storageCfg
+mkWarpApplicationWithAuth (Just dir) authCfg storageCfg =
+    staticFilesMiddleware dir (mkApplicationWithAuth authCfg storageCfg)
+
+-- | CGI 環境 (@SCRIPT_NAME@ による @/api@ マウント差分および @HTTPS@ 環境変数の吸収を含む) 向けの
 -- WAI アプリケーションを構築する。
 mkCgiApplication :: CgiConfig -> Wai.Application
 mkCgiApplication cgiCfg =
-    cgiScriptNameMiddleware cgiCfg.scriptName (mkApplication cgiCfg.storage)
+    cgiRequestMiddleware cgiCfg.scriptName cgiCfg.isHttps (mkApplicationWithAuth cgiCfg.auth cgiCfg.storage)
 
 -- | CGI 起動時の設定エラー発生時に、クライアントへ内部詳細を漏らさず
 -- 構造化 JSON の HTTP 500 レスポンスを返すフォールバックアプリケーション。
@@ -168,9 +236,16 @@ normalizeCgiRequest (Just scriptName) req
         | BS8.isPrefixOf "/" raw  = "/api" <> raw
         | otherwise               = "/api/" <> raw
 
-cgiScriptNameMiddleware :: Maybe Text -> Wai.Middleware
-cgiScriptNameMiddleware mScriptName app req =
-    app (normalizeCgiRequest mScriptName req)
+cgiRequestMiddleware :: Maybe Text -> Bool -> Wai.Middleware
+cgiRequestMiddleware mScriptName cgiHttps app req =
+    let normalizedPath :: Wai.Request
+        normalizedPath = normalizeCgiRequest mScriptName req
+
+        normalizedReq :: Wai.Request
+        normalizedReq = normalizedPath
+            { Wai.isSecure = Wai.isSecure normalizedPath || cgiHttps
+            }
+    in  app normalizedReq
 
 limitRequestBodyMiddleware :: Int -> Wai.Middleware
 limitRequestBodyMiddleware maxBytes app req respond =
@@ -264,12 +339,20 @@ jsonErrorResponse status apiErr =
         [(Http.hContentType, jsonContentType)]
         (Aeson.encode apiErr)
 
-serverHandlers :: StorageConfig -> Server TamaTsuzuraApi
-serverHandlers storageCfg =
+serverHandlers :: AuthConfig -> StorageConfig -> Server TamaTsuzuraApi
+serverHandlers authCfg storageCfg =
     handleHealth
+        :<|> authHandlers authCfg storageCfg
         :<|> documentsHandlers storageCfg
         :<|> handleListTags storageCfg
         :<|> handleListFolders storageCfg
+
+authHandlers :: AuthConfig -> StorageConfig -> Server AuthApi
+authHandlers authCfg storageCfg =
+    handleRegister authCfg storageCfg
+        :<|> handleLogin authCfg storageCfg
+        :<|> handleLogout authCfg storageCfg
+        :<|> handleMe
 
 documentsHandlers :: StorageConfig -> Server DocumentsApi
 documentsHandlers storageCfg =
@@ -288,8 +371,118 @@ documentByIdHandlers storageCfg rawId =
 handleHealth :: Handler HealthStatus
 handleHealth = pure healthOk
 
+handleRegister ::
+       AuthConfig
+    -> StorageConfig
+    -> IsSecure
+    -> Maybe RawCookieHeader
+    -> RegisterRequest
+    -> Handler (Headers '[Header "Set-Cookie" Text] AuthSessionResponse)
+handleRegister authCfg storageCfg isSec mCookieHdr req = do
+    case authCfg.registrationPolicy of
+        RegistrationClosed ->
+            Servant.throwError $ apiErrorToServerError ApiError
+                { code    = ErrForbidden
+                , message = "User registration is currently disabled"
+                , field   = Nothing
+                }
+        RegistrationOpen -> pure ()
+
+    validatedReq <-
+        either
+            (Servant.throwError . apiErrorToServerError . validationErrorToApiError)
+            pure
+            (validateRegisterRequest req)
+
+    -- 重複ユーザー名の場合は高コストな Argon2id 計算を省略して即時 409 を返す
+    -- (レースコンディション時は createUser の BEGIN IMMEDIATE が原子的重複検査を保証する)
+    mExisting <- runStorage storageCfg (`getUserByUsername` validatedReq.username)
+    case mExisting of
+        Just _ ->
+            Servant.throwError (apiErrorToServerError (storageErrorToApiError (UsernameAlreadyExists validatedReq.username)))
+        Nothing -> pure ()
+
+    -- Argon2id 計算中は SQLite 接続・トランザクションを一切保持しない
+    ePwHash <- liftIO (hashPassword authCfg.passwordHashParams validatedReq.password)
+    pwHash <- case ePwHash of
+        Right h -> pure h
+        Left cryptoErr -> do
+            logStderrText ("Password hashing failed: " <> toText cryptoErr)
+            Servant.throwError (apiErrorToServerError internalServerError)
+
+    let mOldSessionHash :: Maybe SessionTokenHash
+        mOldSessionHash = extractPreviousSessionHash mCookieHdr
+
+    (storedUser, rawToken, storedSession) <- runStorage storageCfg $ \ handle ->
+        registerUserWithSession
+            handle
+            validatedReq.username
+            validatedReq.displayName
+            pwHash
+            authCfg.sessionTtl
+            mOldSessionHash
+
+    let cookieHeader :: Text
+        cookieHeader = buildSessionCookieHeader authCfg.cookieSecureMode (isSec == Secure) authCfg.sessionTtl rawToken
+    pure $ Servant.addHeader cookieHeader AuthSessionResponse
+        { user      = storedUser.profile
+        , csrfToken = storedSession.csrfToken
+        }
+
+handleLogin ::
+       AuthConfig
+    -> StorageConfig
+    -> IsSecure
+    -> Maybe RawCookieHeader
+    -> LoginRequest
+    -> Handler (Headers '[Header "Set-Cookie" Text] AuthSessionResponse)
+handleLogin authCfg storageCfg isSec mCookieHdr req = do
+    mStoredUser <- runStorage storageCfg (`getUserByUsername` req.username)
+    storedUser <- case mStoredUser of
+        Nothing -> do
+            -- 未登録ユーザーでも同一パラメータの Argon2id 計算を実行して応答時間の差によるユーザー列挙を抑制する
+            _ <- liftIO (evaluate (hashPasswordWithSalt authCfg.passwordHashParams dummyTimingSalt req.password))
+            Servant.throwError (apiErrorToServerError invalidCredentialsError)
+        Just userRec ->
+            if verifyPassword req.password userRec.passwordHash
+                then pure userRec
+                else Servant.throwError (apiErrorToServerError invalidCredentialsError)
+
+    let mOldSessionHash :: Maybe SessionTokenHash
+        mOldSessionHash = extractPreviousSessionHash mCookieHdr
+
+    (rawToken, storedSession) <- runStorage storageCfg $ \ handle ->
+        rotateLoginSession handle storedUser.profile.id authCfg.sessionTtl mOldSessionHash
+
+    let cookieHeader :: Text
+        cookieHeader = buildSessionCookieHeader authCfg.cookieSecureMode (isSec == Secure) authCfg.sessionTtl rawToken
+    pure $ Servant.addHeader cookieHeader AuthSessionResponse
+        { user      = storedUser.profile
+        , csrfToken = storedSession.csrfToken
+        }
+
+handleLogout ::
+       AuthConfig
+    -> StorageConfig
+    -> CsrfVerifiedSession
+    -> IsSecure
+    -> Handler (Headers '[Header "Set-Cookie" Text] NoContent)
+handleLogout authCfg storageCfg csrfSession isSec = do
+    () <- runStorage storageCfg (`logoutSession` csrfSession.authenticated.session.tokenHash)
+    let clearHeader :: Text
+        clearHeader = buildClearSessionCookieHeader authCfg.cookieSecureMode (isSec == Secure)
+    pure (Servant.addHeader clearHeader NoContent)
+
+handleMe :: SessionAuthContext -> Handler AuthSessionResponse
+handleMe sessionCtx =
+    pure AuthSessionResponse
+        { user      = sessionCtx.authenticated.user
+        , csrfToken = sessionCtx.authenticated.session.csrfToken
+        }
+
 handleListDocuments ::
        StorageConfig
+    -> SessionAuthContext
     -> Maybe Text
     -> Maybe Text
     -> Maybe Text
@@ -298,8 +491,11 @@ handleListDocuments ::
     -> Maybe Text
     -> Maybe Text
     -> Handler DocumentListResponse
-handleListDocuments storageCfg mStatus mTag mFolder mIncludeSub mSearch mLimit mOffset = do
-    let rawQuery :: RawDocumentListQuery
+handleListDocuments storageCfg sessionCtx mStatus mTag mFolder mIncludeSub mSearch mLimit mOffset = do
+    let ownerId :: UserId
+        ownerId = sessionCtx.authenticated.user.id
+
+        rawQuery :: RawDocumentListQuery
         rawQuery = RawDocumentListQuery
             { rawStatus            = mStatus
             , rawTag               = mTag
@@ -310,53 +506,118 @@ handleListDocuments storageCfg mStatus mTag mFolder mIncludeSub mSearch mLimit m
             , rawOffset            = mOffset
             }
     query <- either (Servant.throwError . apiErrorToServerError) pure (parseDocumentListQuery rawQuery)
-    runStorage storageCfg (`Storage.listDocuments` query)
+    runStorage storageCfg (\ handle -> Storage.listDocuments handle ownerId query)
 
-handleCreateDocument :: StorageConfig -> CreateDocumentRequest -> Handler Document
-handleCreateDocument storageCfg req = do
+handleCreateDocument ::
+       StorageConfig
+    -> CsrfVerifiedSession
+    -> CreateDocumentRequest
+    -> Handler Document
+handleCreateDocument storageCfg csrfSession req = do
+    let ownerId :: UserId
+        ownerId = csrfSession.authenticated.user.id
     validatedReq <-
         either
             (Servant.throwError . apiErrorToServerError . validationErrorToApiError)
             pure
             (validateCreateDocumentRequest req)
-    runStorage storageCfg (`Storage.createDocument` validatedReq)
+    runStorage storageCfg (\ handle -> Storage.createDocument handle ownerId validatedReq)
 
-handleGetDocument :: StorageConfig -> Text -> Handler Document
-handleGetDocument storageCfg rawId = do
+handleGetDocument ::
+       StorageConfig
+    -> Text
+    -> SessionAuthContext
+    -> Handler Document
+handleGetDocument storageCfg rawId sessionCtx = do
+    let ownerId :: UserId
+        ownerId = sessionCtx.authenticated.user.id
     docId <- parseIdOrThrow rawId
-    runStorage storageCfg (`Storage.getDocument` docId)
+    runStorage storageCfg (\ handle -> Storage.getDocument handle ownerId docId)
 
-handleUpdateDocument :: StorageConfig -> Text -> UpdateDocumentRequest -> Handler Document
-handleUpdateDocument storageCfg rawId req = do
+handleUpdateDocument ::
+       StorageConfig
+    -> Text
+    -> CsrfVerifiedSession
+    -> UpdateDocumentRequest
+    -> Handler Document
+handleUpdateDocument storageCfg rawId csrfSession req = do
+    let ownerId :: UserId
+        ownerId = csrfSession.authenticated.user.id
     docId <- parseIdOrThrow rawId
     validatedReq <-
         either
             (Servant.throwError . apiErrorToServerError . validationErrorToApiError)
             pure
             (validateUpdateDocumentRequest req)
-    runStorage storageCfg (\ handle -> Storage.updateDocument handle docId validatedReq)
+    runStorage storageCfg (\ handle -> Storage.updateDocument handle ownerId docId validatedReq)
 
-handleSoftDeleteDocument :: StorageConfig -> Text -> Handler Document
-handleSoftDeleteDocument storageCfg rawId = do
+handleSoftDeleteDocument ::
+       StorageConfig
+    -> Text
+    -> CsrfVerifiedSession
+    -> Handler Document
+handleSoftDeleteDocument storageCfg rawId csrfSession = do
+    let ownerId :: UserId
+        ownerId = csrfSession.authenticated.user.id
     docId <- parseIdOrThrow rawId
-    runStorage storageCfg (`Storage.softDeleteDocument` docId)
+    runStorage storageCfg (\ handle -> Storage.softDeleteDocument handle ownerId docId)
 
-handleRestoreDocument :: StorageConfig -> Text -> Handler Document
-handleRestoreDocument storageCfg rawId = do
+handleRestoreDocument ::
+       StorageConfig
+    -> Text
+    -> CsrfVerifiedSession
+    -> Handler Document
+handleRestoreDocument storageCfg rawId csrfSession = do
+    let ownerId :: UserId
+        ownerId = csrfSession.authenticated.user.id
     docId <- parseIdOrThrow rawId
-    runStorage storageCfg (`Storage.restoreDocument` docId)
+    runStorage storageCfg (\ handle -> Storage.restoreDocument handle ownerId docId)
 
-handlePermanentDeleteDocument :: StorageConfig -> Text -> Handler NoContent
-handlePermanentDeleteDocument storageCfg rawId = do
+handlePermanentDeleteDocument ::
+       StorageConfig
+    -> Text
+    -> CsrfVerifiedSession
+    -> Handler NoContent
+handlePermanentDeleteDocument storageCfg rawId csrfSession = do
+    let ownerId :: UserId
+        ownerId = csrfSession.authenticated.user.id
     docId <- parseIdOrThrow rawId
-    () <- runStorage storageCfg (`Storage.permanentDeleteDocument` docId)
+    () <- runStorage storageCfg (\ handle -> Storage.permanentDeleteDocument handle ownerId docId)
     pure NoContent
 
-handleListTags :: StorageConfig -> Handler TagListResponse
-handleListTags storageCfg = runStorage storageCfg Storage.listTags
+handleListTags :: StorageConfig -> SessionAuthContext -> Handler TagListResponse
+handleListTags storageCfg sessionCtx =
+    runStorage storageCfg (`Storage.listTags` sessionCtx.authenticated.user.id)
 
-handleListFolders :: StorageConfig -> Handler FolderListResponse
-handleListFolders storageCfg = runStorage storageCfg Storage.listFolders
+handleListFolders :: StorageConfig -> SessionAuthContext -> Handler FolderListResponse
+handleListFolders storageCfg sessionCtx =
+    runStorage storageCfg (`Storage.listFolders` sessionCtx.authenticated.user.id)
+
+extractPreviousSessionHash :: Maybe RawCookieHeader -> Maybe SessionTokenHash
+extractPreviousSessionHash Nothing = Nothing
+extractPreviousSessionHash (Just rawHdr) =
+    case extractSessionTokenFromCookieValue rawHdr.unWrap of
+        Nothing -> Nothing
+        Just rawTokText -> case mkSessionToken rawTokText of
+            Left _       -> Nothing
+            Right oldTok -> Just (hashSessionToken oldTok)
+
+dummyTimingSalt :: ByteString
+dummyTimingSalt = "tamatsuzura-salt"
+
+invalidCredentialsError :: ApiError
+invalidCredentialsError = ApiError
+    { code    = ErrUnauthorized
+    , message = "Invalid username or password"
+    , field   = Nothing
+    }
+
+internalServerError :: ApiError
+internalServerError = ApiError
+    { code    = ErrInternalServer
+    , message = "Internal server error"
+    , field   = Nothing
+    }
 
 parseIdOrThrow :: Text -> Handler DocumentId
 parseIdOrThrow rawId =
@@ -376,12 +637,12 @@ runStorage storageCfg action = do
   where
     logIfInternalError :: StorageError -> Handler ()
     logIfInternalError storageErr = case storageErr of
-        UnsupportedSchemaVersion{} -> logStderr storageErr
-        CorruptedData{}            -> logStderr storageErr
-        SqliteOperationError{}     -> logStderr storageErr
+        UnsupportedSchemaVersion{} -> logStderrText (toText storageErr)
+        CorruptedData{}            -> logStderrText (toText storageErr)
+        SqliteOperationError{}     -> logStderrText (toText storageErr)
         _                          -> pure ()
 
-    logStderr :: StorageError -> Handler ()
-    logStderr storageErr =
-        -- CGI 環境では stdout が HTTP レスポンス本体となるため、診断ログは必ず stderr へ出力する
-        liftIO (TxtIO.hPutStrLn Sys.stderr ("[tamatsuzura] " <> toText storageErr))
+logStderrText :: Text -> Handler ()
+logStderrText msg =
+    -- CGI 環境では stdout が HTTP レスポンス本体となるため、診断ログは必ず stderr へ出力する
+    liftIO (TxtIO.hPutStrLn Sys.stderr ("[tamatsuzura] " <> msg))

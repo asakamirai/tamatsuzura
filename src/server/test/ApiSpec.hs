@@ -7,30 +7,30 @@ module ApiSpec
     ( apiSpec
     ) where
 
-import           Control.Exception             (bracket)
-import           Control.Monad.IO.Class        (liftIO)
-import qualified Data.Aeson                    as Aeson
-import           Data.ByteString               (ByteString)
-import qualified Data.ByteString               as BS
-import qualified Data.ByteString.Builder       as Builder
-import qualified Data.ByteString.Char8         as BS8
-import qualified Data.ByteString.Lazy          as LazyBS
-import           Data.Either                   (isLeft)
-import           Data.IORef                    (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
-import           Data.Maybe                    (fromMaybe, isJust)
-import           Data.Text                     (Text)
-import qualified Data.Text                     as Txt
-import qualified Data.Text.Encoding            as TxtEnc
-import qualified Data.UUID                     as UUID
-import qualified Data.UUID.V4                  as UUID4
-import qualified Database.SQLite.Simple        as SQLite
-import qualified Network.HTTP.Types            as Http
-import qualified Network.Wai                   as Wai
-import qualified Network.Wai.Internal          as WaiInternal
-import qualified Network.Wai.Test              as WaiTest
-import qualified System.Directory.OsPath       as DirOS
-import           System.OsPath                 (OsPath)
-import qualified System.OsPath                 as OS
+import           Control.Exception                  (bracket)
+import           Control.Monad.IO.Class             (liftIO)
+import qualified Data.Aeson                         as Aeson
+import           Data.ByteString                    (ByteString)
+import qualified Data.ByteString                    as BS
+import qualified Data.ByteString.Builder            as Builder
+import qualified Data.ByteString.Char8              as BS8
+import qualified Data.ByteString.Lazy               as LazyBS
+import           Data.Either                        (isLeft)
+import           Data.IORef                         (atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
+import           Data.Maybe                         (fromMaybe, isJust)
+import           Data.Text                          (Text)
+import qualified Data.Text                          as Txt
+import qualified Data.Text.Encoding                 as TxtEnc
+import qualified Data.UUID                          as UUID
+import qualified Data.UUID.V4                       as UUID4
+import qualified Database.SQLite.Simple             as SQLite
+import qualified Network.HTTP.Types                 as Http
+import qualified Network.Wai                        as Wai
+import qualified Network.Wai.Internal               as WaiInternal
+import qualified Network.Wai.Test                   as WaiTest
+import qualified System.Directory.OsPath            as DirOS
+import           System.OsPath                      (OsPath)
+import qualified System.OsPath                      as OS
 import           TamaTsuzura.Common.Api
     ( ApiError(..)
     , ApiErrorCode(..)
@@ -45,6 +45,7 @@ import           TamaTsuzura.Common.Api
     , listLimitValue
     , listOffsetValue
     )
+import           TamaTsuzura.Common.Auth            (AuthSessionResponse(..))
 import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentFormat(..)
@@ -53,8 +54,8 @@ import           TamaTsuzura.Common.Document
     , emptyDocumentTitle
     , emptyTagSet
     )
-import           TamaTsuzura.Common.Text       (ToText(..))
-import           TamaTsuzura.Common.Validation (maxDocumentBodyBytes)
+import           TamaTsuzura.Common.Text            (ToText(..))
+import           TamaTsuzura.Common.Validation      (maxDocumentBodyBytes)
 import           TamaTsuzura.Server.Api
     ( RawDocumentListQuery(..)
     , emptyRawDocumentListQuery
@@ -64,20 +65,36 @@ import           TamaTsuzura.Server.Api
 import           TamaTsuzura.Server.App
     ( maxRawRequestBodyBytes
     , mkApplication
+    , mkApplicationWithAuth
     , normalizeCgiRequest
     )
+import           TamaTsuzura.Server.Auth.Cookie
+    ( AuthConfig(..)
+    , CookieSecureMode(..)
+    , RegistrationPolicy(..)
+    , defaultAuthConfig
+    )
+import           TamaTsuzura.Server.Auth.Crypto     (fastTestPasswordHashParams)
+import           TamaTsuzura.Server.Auth.Middleware (csrfHeaderName)
 import           TamaTsuzura.Server.Config
     ( CgiConfig(..)
     , RawWarpOptions(..)
     , WarpConfig(..)
     , defaultServerPort
+    , envAllowRegistration
+    , envCookieSecure
     , envDbBusyTimeoutMs
     , envDbPath
+    , envHttps
     , envPort
+    , envRequestScheme
     , envScriptName
+    , envSessionTtlSeconds
+    , envTrustProxyHeaders
     , mkServerPort
     , parsePortArgs
     , parseWarpArgs
+    , resolveAuthConfig
     , resolveCgiConfig
     , resolveWarpConfig
     , serverPortValue
@@ -88,7 +105,13 @@ import           TamaTsuzura.Server.Storage
     , busyTimeoutMsValue
     , defaultStorageConfig
     )
-import           Test.Hspec                    (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import           TamaTsuzura.Server.Storage.Auth    (sessionTtlSecondsValue)
+import           Test.Hspec                         (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+
+data SessionHeaders = SessionHeaders
+    { cookie :: !ByteString
+    , csrf   :: !ByteString
+    } deriving (Eq, Show)
 
 apiSpec :: Spec
 apiSpec = do
@@ -124,21 +147,48 @@ configSpec = describe "Server configuration and CGI path normalization" $ do
         parseWarpArgs ["--db-path"] `shouldSatisfy` isLeft
         parseWarpArgs ["--unknown", "1"] `shouldSatisfy` isLeft
 
+    it "resolves AuthConfig environment variables and rejects invalid values" $ do
+        defaultResolved <- mustRight (resolveAuthConfig [])
+        defaultResolved `shouldBe` defaultAuthConfig
+
+        customResolved <- mustRight $ resolveAuthConfig
+            [ (envAllowRegistration, "false")
+            , (envSessionTtlSeconds, "3600")
+            , (envCookieSecure, "always")
+            , (envTrustProxyHeaders, "true")
+            ]
+        customResolved.registrationPolicy `shouldBe` RegistrationClosed
+        sessionTtlSecondsValue customResolved.sessionTtl `shouldBe` 3600
+        customResolved.cookieSecureMode `shouldBe` CookieSecureAlways
+        customResolved.trustProxyHeaders `shouldBe` True
+
+        neverResolved <- mustRight $ resolveAuthConfig [(envCookieSecure, "never")]
+        neverResolved.cookieSecureMode `shouldBe` CookieSecureNever
+
+        resolveAuthConfig [(envAllowRegistration, "maybe")] `shouldSatisfy` isLeft
+        resolveAuthConfig [(envSessionTtlSeconds, "59")] `shouldSatisfy` isLeft
+        resolveAuthConfig [(envSessionTtlSeconds, "abc")] `shouldSatisfy` isLeft
+        resolveAuthConfig [(envCookieSecure, "strict")] `shouldSatisfy` isLeft
+        resolveAuthConfig [(envTrustProxyHeaders, "yes")] `shouldSatisfy` isLeft
+
     it "resolves WarpConfig with CLI > env > defaults precedence" $ do
         eDefault <- resolveWarpConfig [] []
         cfgDefault <- mustRight eDefault
         serverPortValue cfgDefault.port `shouldBe` 8080
         busyTimeoutMsValue cfgDefault.storage.busyTimeoutMs `shouldBe` 5000
+        cfgDefault.auth `shouldBe` defaultAuthConfig
 
         let envVars :: [(String, String)]
             envVars =
                 [ (envPort, "4000")
                 , (envDbPath, "/tmp/env.sqlite3")
                 , (envDbBusyTimeoutMs, "1200")
+                , (envAllowRegistration, "false")
                 ]
         cfgFromEnv <- mustRight =<< resolveWarpConfig [] envVars
         serverPortValue cfgFromEnv.port `shouldBe` 4000
         busyTimeoutMsValue cfgFromEnv.storage.busyTimeoutMs `shouldBe` 1200
+        cfgFromEnv.auth.registrationPolicy `shouldBe` RegistrationClosed
 
         cfgCliOverride <- mustRight =<< resolveWarpConfig ["--port", "5000", "--busy-timeout-ms", "0"] envVars
         serverPortValue cfgCliOverride.port `shouldBe` 5000
@@ -149,17 +199,27 @@ configSpec = describe "Server configuration and CGI path normalization" $ do
         eBadTimeout <- resolveWarpConfig [] [(envDbBusyTimeoutMs, "99999999999999999999")]
         eBadTimeout `shouldSatisfy` isLeft
 
-    it "resolves CgiConfig from CGI environment variables" $ do
+    it "resolves CgiConfig from CGI environment variables including HTTPS detection" $ do
         cfg <- mustRight =<< resolveCgiConfig
             [ (envDbPath, "/tmp/cgi.sqlite3")
             , (envDbBusyTimeoutMs, "3500")
             , (envScriptName, "/api")
+            , (envHttps, "on")
+            , (envSessionTtlSeconds, "7200")
             ]
         cfg.scriptName `shouldBe` Just "/api"
+        cfg.isHttps `shouldBe` True
         busyTimeoutMsValue cfg.storage.busyTimeoutMs `shouldBe` 3500
+        sessionTtlSecondsValue cfg.auth.sessionTtl `shouldBe` 7200
         -- テスト用にエンコードして一致を確認する
         expectedPath <- OS.encodeFS "/tmp/cgi.sqlite3"
         cfg.storage.target `shouldBe` StorageFile expectedPath
+
+        cfgScheme <- mustRight =<< resolveCgiConfig [(envRequestScheme, "https")]
+        cfgScheme.isHttps `shouldBe` True
+
+        cfgHttp <- mustRight =<< resolveCgiConfig []
+        cfgHttp.isHttps `shouldBe` False
 
     it "normalizes CGI requests when SCRIPT_NAME consumes /api without double-prefixing" $ do
         let reqHealth :: Wai.Request
@@ -226,11 +286,11 @@ queryParserSpec = describe "Query and path parameter validation" $ do
 
 restEndpointSpec :: Spec
 restEndpointSpec = describe "WAI / Servant REST API endpoints" $ do
-    it "serves GET /api/health with 200 OK JSON" $
+    it "serves GET /api/health with 200 OK JSON without authentication" $
         withTestApp $ \ app ->
             WaiTest.runSession
                 ( do
-                    res <- sendJsonRequest Http.methodGet "/api/health" Nothing
+                    res <- sendJsonRequest Http.methodGet "/api/health" [] Nothing
                     WaiTest.assertStatus 200 res
                     assertJsonContentType res
                     body <- liftDecode res :: WaiTest.Session HealthStatus
@@ -238,12 +298,19 @@ restEndpointSpec = describe "WAI / Servant REST API endpoints" $ do
                 )
                 app
 
-    it "executes full CRUD, trash, restore, permanent delete, filtering, and metadata listing" $
+    it "executes full authenticated CRUD, trash, restore, permanent delete, filtering, and metadata listing" $
         withTestApp $ \ app ->
             WaiTest.runSession
                 ( do
+                    sess <- registerTestUser "api_user"
+                    let readHdrs :: Http.RequestHeaders
+                        readHdrs = [(Http.hCookie, sess.cookie)]
+
+                        writeHdrs :: Http.RequestHeaders
+                        writeHdrs = [(Http.hCookie, sess.cookie), (csrfHeaderName, sess.csrf)]
+
                     -- 1. 空オブジェクト {} による即時メモ作成 (201 Created)
-                    resBlank <- sendJsonRequest Http.methodPost "/api/documents" (Just "{}")
+                    resBlank <- sendJsonRequest Http.methodPost "/api/documents" writeHdrs (Just "{}")
                     WaiTest.assertStatus 201 resBlank
                     assertJsonContentType resBlank
                     blankDoc <- liftDecode resBlank :: WaiTest.Session Document
@@ -263,7 +330,7 @@ restEndpointSpec = describe "WAI / Servant REST API endpoints" $ do
                             , "folder" Aeson..= ("/work/notes/" :: Text)
                             , "tags"   Aeson..= (["haskell", "設計", "haskell"] :: [Text])
                             ]
-                    resFull <- sendJsonRequest Http.methodPost "/api/documents" (Just createPayload)
+                    resFull <- sendJsonRequest Http.methodPost "/api/documents" writeHdrs (Just createPayload)
                     WaiTest.assertStatus 201 resFull
                     fullDoc <- liftDecode resFull :: WaiTest.Session Document
                     liftEq (toText fullDoc.title) "設計メモ"
@@ -273,7 +340,7 @@ restEndpointSpec = describe "WAI / Servant REST API endpoints" $ do
                         fullIdPath = "/api/documents/" <> TxtEnc.encodeUtf8 (toText fullDoc.id)
 
                     -- 3. 単一取得 (200 OK)
-                    resGet <- sendJsonRequest Http.methodGet fullIdPath Nothing
+                    resGet <- sendJsonRequest Http.methodGet fullIdPath readHdrs Nothing
                     WaiTest.assertStatus 200 resGet
                     fetchedDoc <- liftDecode resGet :: WaiTest.Session Document
                     liftEq fetchedDoc fullDoc
@@ -287,7 +354,7 @@ restEndpointSpec = describe "WAI / Servant REST API endpoints" $ do
                             , "folder" Aeson..= ("work/notes/v2" :: Text)
                             , "tags"   Aeson..= (["haskell", "v2"] :: [Text])
                             ]
-                    resUpdate <- sendJsonRequest Http.methodPut fullIdPath (Just updatePayload)
+                    resUpdate <- sendJsonRequest Http.methodPut fullIdPath writeHdrs (Just updatePayload)
                     WaiTest.assertStatus 200 resUpdate
                     updatedDoc <- liftDecode resUpdate :: WaiTest.Session Document
                     liftEq (toText updatedDoc.title) "設計メモ 改訂"
@@ -299,6 +366,7 @@ restEndpointSpec = describe "WAI / Servant REST API endpoints" $ do
                     resListFiltered <- sendJsonRequest
                         Http.methodGet
                         "/api/documents?status=active&tag=haskell&folder=work&include_subfolders=true&q=servant&limit=10&offset=0"
+                        readHdrs
                         Nothing
                     WaiTest.assertStatus 200 resListFiltered
                     filteredList <- liftDecode resListFiltered :: WaiTest.Session DocumentListResponse
@@ -306,79 +374,79 @@ restEndpointSpec = describe "WAI / Servant REST API endpoints" $ do
                     liftEq (map (\ s -> s.id) filteredList.documents) [fullDoc.id]
 
                     -- 6. タグ・フォルダ一覧 (GET /api/tags, GET /api/folders)
-                    resTags <- sendJsonRequest Http.methodGet "/api/tags" Nothing
+                    resTags <- sendJsonRequest Http.methodGet "/api/tags" readHdrs Nothing
                     WaiTest.assertStatus 200 resTags
                     tagList <- liftDecode resTags :: WaiTest.Session TagListResponse
                     liftEq (map toText tagList.tags) ["haskell", "v2"]
 
-                    resFolders <- sendJsonRequest Http.methodGet "/api/folders" Nothing
+                    resFolders <- sendJsonRequest Http.methodGet "/api/folders" readHdrs Nothing
                     WaiTest.assertStatus 200 resFolders
                     folderList <- liftDecode resFolders :: WaiTest.Session FolderListResponse
                     liftEq (map toText folderList.folders) ["work/notes/v2"]
 
                     -- 7. 稼働中文書の完全削除は 409 Conflict
-                    resPermActive <- sendJsonRequest Http.methodDelete (fullIdPath <> "/permanent") Nothing
+                    resPermActive <- sendJsonRequest Http.methodDelete (fullIdPath <> "/permanent") writeHdrs Nothing
                     WaiTest.assertStatus 409 resPermActive
                     permActiveErr <- liftDecode resPermActive :: WaiTest.Session ApiError
                     liftEq permActiveErr.code ErrConflict
 
                     -- 8. 論理削除 (DELETE /api/documents/{id} -> 200 OK) および冪等性
-                    resTrash1 <- sendJsonRequest Http.methodDelete fullIdPath Nothing
+                    resTrash1 <- sendJsonRequest Http.methodDelete fullIdPath writeHdrs Nothing
                     WaiTest.assertStatus 200 resTrash1
                     trashed1 <- liftDecode resTrash1 :: WaiTest.Session Document
                     liftSatisfy trashed1.deletedAt isJust
                     liftEq trashed1.updatedAt updatedDoc.updatedAt
 
-                    resTrash2 <- sendJsonRequest Http.methodDelete fullIdPath Nothing
+                    resTrash2 <- sendJsonRequest Http.methodDelete fullIdPath writeHdrs Nothing
                     WaiTest.assertStatus 200 resTrash2
                     trashed2 <- liftDecode resTrash2 :: WaiTest.Session Document
                     liftEq trashed2 trashed1
 
                     -- 9. ゴミ箱内文書のプレビュー取得は 200 OK、更新は 409 Conflict
-                    resPreview <- sendJsonRequest Http.methodGet fullIdPath Nothing
+                    resPreview <- sendJsonRequest Http.methodGet fullIdPath readHdrs Nothing
                     WaiTest.assertStatus 200 resPreview
                     previewed <- liftDecode resPreview :: WaiTest.Session Document
                     liftEq previewed trashed1
 
-                    resUpdateTrashed <- sendJsonRequest Http.methodPut fullIdPath (Just updatePayload)
+                    resUpdateTrashed <- sendJsonRequest Http.methodPut fullIdPath writeHdrs (Just updatePayload)
                     WaiTest.assertStatus 409 resUpdateTrashed
                     updateTrashedErr <- liftDecode resUpdateTrashed :: WaiTest.Session ApiError
                     liftEq updateTrashedErr.code ErrConflict
 
                     -- 10. ゴミ箱内文書は active フィルタおよび /api/tags, /api/folders から除外される
-                    resTrashedList <- sendJsonRequest Http.methodGet "/api/documents?status=trashed" Nothing
+                    resTrashedList <- sendJsonRequest Http.methodGet "/api/documents?status=trashed" readHdrs Nothing
                     WaiTest.assertStatus 200 resTrashedList
                     trashedList <- liftDecode resTrashedList :: WaiTest.Session DocumentListResponse
                     liftEq trashedList.total 1
                     liftEq (map (\ s -> s.id) trashedList.documents) [fullDoc.id]
 
-                    resEmptyTags <- sendJsonRequest Http.methodGet "/api/tags" Nothing
+                    resEmptyTags <- sendJsonRequest Http.methodGet "/api/tags" readHdrs Nothing
                     WaiTest.assertStatus 200 resEmptyTags
                     emptyTagList <- liftDecode resEmptyTags :: WaiTest.Session TagListResponse
                     liftEq emptyTagList.tags []
 
                     -- 11. 復元 (POST /api/documents/{id}/restore -> 200 OK) および冪等性
-                    resRestore1 <- sendJsonRequest Http.methodPost (fullIdPath <> "/restore") Nothing
+                    resRestore1 <- sendJsonRequest Http.methodPost (fullIdPath <> "/restore") writeHdrs Nothing
                     WaiTest.assertStatus 200 resRestore1
                     restored1 <- liftDecode resRestore1 :: WaiTest.Session Document
                     liftEq restored1.deletedAt Nothing
                     liftEq restored1 updatedDoc
 
-                    resRestore2 <- sendJsonRequest Http.methodPost (fullIdPath <> "/restore") Nothing
+                    resRestore2 <- sendJsonRequest Http.methodPost (fullIdPath <> "/restore") writeHdrs Nothing
                     WaiTest.assertStatus 200 resRestore2
                     restored2 <- liftDecode resRestore2 :: WaiTest.Session Document
                     liftEq restored2 restored1
 
                     -- 12. 再度ゴミ箱移動後に完全削除 (DELETE /api/documents/{id}/permanent -> 204 No Content)
-                    resTrash3 <- sendJsonRequest Http.methodDelete fullIdPath Nothing
+                    resTrash3 <- sendJsonRequest Http.methodDelete fullIdPath writeHdrs Nothing
                     WaiTest.assertStatus 200 resTrash3
 
-                    resPerm <- sendJsonRequest Http.methodDelete (fullIdPath <> "/permanent") Nothing
+                    resPerm <- sendJsonRequest Http.methodDelete (fullIdPath <> "/permanent") writeHdrs Nothing
                     WaiTest.assertStatus 204 resPerm
                     liftEq (WaiTest.simpleBody resPerm) ""
 
                     -- 13. 完全削除後は 404 Not Found
-                    resGone <- sendJsonRequest Http.methodGet fullIdPath Nothing
+                    resGone <- sendJsonRequest Http.methodGet fullIdPath readHdrs Nothing
                     WaiTest.assertStatus 404 resGone
                     goneErr <- liftDecode resGone :: WaiTest.Session ApiError
                     liftEq goneErr.code ErrNotFound
@@ -391,8 +459,15 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
         withTestApp $ \ app ->
             WaiTest.runSession
                 ( do
+                    sess <- registerTestUser "err_user"
+                    let readHdrs :: Http.RequestHeaders
+                        readHdrs = [(Http.hCookie, sess.cookie)]
+
+                        writeHdrs :: Http.RequestHeaders
+                        writeHdrs = [(Http.hCookie, sess.cookie), (csrfHeaderName, sess.csrf)]
+
                     -- 不正パス ID
-                    resBadId <- sendJsonRequest Http.methodGet "/api/documents/bad!id" Nothing
+                    resBadId <- sendJsonRequest Http.methodGet "/api/documents/bad!id" readHdrs Nothing
                     WaiTest.assertStatus 400 resBadId
                     assertJsonContentType resBadId
                     badIdErr <- liftDecode resBadId :: WaiTest.Session ApiError
@@ -400,27 +475,27 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
                     liftEq badIdErr.field (Just "id")
 
                     -- 不正クエリパラメータ (tag の field は "tag")
-                    resBadQuery <- sendJsonRequest Http.methodGet "/api/documents?tag=" Nothing
+                    resBadQuery <- sendJsonRequest Http.methodGet "/api/documents?tag=" readHdrs Nothing
                     WaiTest.assertStatus 400 resBadQuery
                     badQueryErr <- liftDecode resBadQuery :: WaiTest.Session ApiError
                     liftEq badQueryErr.code ErrValidation
                     liftEq badQueryErr.field (Just "tag")
 
                     -- 壊れた JSON
-                    resMalformed <- sendJsonRequest Http.methodPost "/api/documents" (Just "{not-json")
+                    resMalformed <- sendJsonRequest Http.methodPost "/api/documents" writeHdrs (Just "{not-json")
                     WaiTest.assertStatus 400 resMalformed
                     assertJsonContentType resMalformed
                     malformedErr <- liftDecode resMalformed :: WaiTest.Session ApiError
                     liftEq malformedErr.code ErrValidation
 
                     -- 制御文字を含むタイトル
-                    resBadTitle <- sendJsonRequest Http.methodPost "/api/documents" (Just "{\"title\":\"a\\nb\"}")
+                    resBadTitle <- sendJsonRequest Http.methodPost "/api/documents" writeHdrs (Just "{\"title\":\"a\\nb\"}")
                     WaiTest.assertStatus 400 resBadTitle
                     badTitleErr <- liftDecode resBadTitle :: WaiTest.Session ApiError
                     liftEq badTitleErr.code ErrValidation
 
                     -- PUT 必須項目欠落
-                    resIncompletePut <- sendJsonRequest Http.methodPut "/api/documents/doc-1" (Just "{\"title\":\"only\"}")
+                    resIncompletePut <- sendJsonRequest Http.methodPut "/api/documents/doc-1" writeHdrs (Just "{\"title\":\"only\"}")
                     WaiTest.assertStatus 400 resIncompletePut
                     incompleteErr <- liftDecode resIncompletePut :: WaiTest.Session ApiError
                     liftEq incompleteErr.code ErrValidation
@@ -429,13 +504,17 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
 
     it "returns 413 JSON ApiError when document body exceeds 5 MiB (POST/PUT) or raw HTTP body exceeds 16 MiB (KnownLength and ChunkedBody)" $
         withTestApp $ \ app -> do
+            sess <- WaiTest.runSession (registerTestUser "size_user") app
+            let writeHdrs :: Http.RequestHeaders
+                writeHdrs = [(Http.hCookie, sess.cookie), (csrfHeaderName, sess.csrf)]
+
             WaiTest.runSession
                 ( do
                     let oversizedBodyJson :: LazyBS.ByteString
                         oversizedBodyJson = Aeson.encode $ Aeson.object
                             [ "body" Aeson..= Txt.replicate (maxDocumentBodyBytes + 1) "a"
                             ]
-                    resTooLargeDoc <- sendJsonRequest Http.methodPost "/api/documents" (Just oversizedBodyJson)
+                    resTooLargeDoc <- sendJsonRequest Http.methodPost "/api/documents" writeHdrs (Just oversizedBodyJson)
                     WaiTest.assertStatus 413 resTooLargeDoc
                     assertJsonContentType resTooLargeDoc
                     docErr <- liftDecode resTooLargeDoc :: WaiTest.Session ApiError
@@ -443,7 +522,7 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
                     liftEq docErr.field (Just "body")
 
                     -- PUT でも 5 MiB 超の本文を 413 として拒否する
-                    resSeed <- sendJsonRequest Http.methodPost "/api/documents" (Just "{}")
+                    resSeed <- sendJsonRequest Http.methodPost "/api/documents" writeHdrs (Just "{}")
                     WaiTest.assertStatus 201 resSeed
                     seeded <- liftDecode resSeed :: WaiTest.Session Document
                     let seedPath :: ByteString
@@ -457,7 +536,7 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
                             , "folder" Aeson..= (Nothing :: Maybe Text)
                             , "tags"   Aeson..= ([] :: [Text])
                             ]
-                    resTooLargePut <- sendJsonRequest Http.methodPut seedPath (Just oversizedUpdateJson)
+                    resTooLargePut <- sendJsonRequest Http.methodPut seedPath writeHdrs (Just oversizedUpdateJson)
                     WaiTest.assertStatus 413 resTooLargePut
                     assertJsonContentType resTooLargePut
                     putErr <- liftDecode resTooLargePut :: WaiTest.Session ApiError
@@ -468,12 +547,13 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
                         oversizedRawReq =
                             (WaiTest.setPath WaiTest.defaultRequest "/api/documents")
                                 { Wai.requestMethod     = Http.methodPost
-                                , Wai.requestHeaders    = [(Http.hContentType, "application/json")]
+                                , Wai.requestHeaders    = (Http.hContentType, "application/json") : writeHdrs
                                 , Wai.requestBodyLength = Wai.KnownLength (fromIntegral (maxRawRequestBodyBytes + 1))
                                 }
                     resTooLargeRaw <- WaiTest.srequest (WaiTest.SRequest oversizedRawReq "{}")
                     WaiTest.assertStatus 413 resTooLargeRaw
                     assertJsonContentType resTooLargeRaw
+                    liftEq (lookup Http.hCacheControl (WaiTest.simpleHeaders resTooLargeRaw)) (Just "no-store")
                     rawErr <- liftDecode resTooLargeRaw :: WaiTest.Session ApiError
                     liftEq rawErr.code ErrPayloadTooLarge
                 )
@@ -504,7 +584,7 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
                 chunkedReq = Wai.setRequestBodyChunks nextChunk $
                     (WaiTest.setPath WaiTest.defaultRequest "/api/documents")
                         { Wai.requestMethod     = Http.methodPost
-                        , Wai.requestHeaders    = [(Http.hContentType, "application/json")]
+                        , Wai.requestHeaders    = (Http.hContentType, "application/json") : writeHdrs
                         , Wai.requestBodyLength = Wai.ChunkedBody
                         }
             (chunkStatus, chunkHeaders, chunkBody) <- runRawWaiRequest app chunkedReq
@@ -520,27 +600,31 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
         withTestApp $ \ app ->
             WaiTest.runSession
                 ( do
+                    sess <- registerTestUser "status_user"
+                    let writeHdrs :: Http.RequestHeaders
+                        writeHdrs = [(Http.hCookie, sess.cookie), (csrfHeaderName, sess.csrf)]
+
                     -- 404 Not Found (未知パス)
-                    res404 <- sendJsonRequest Http.methodGet "/api/unknown" Nothing
+                    res404 <- sendJsonRequest Http.methodGet "/api/unknown" [] Nothing
                     WaiTest.assertStatus 404 res404
                     assertJsonContentType res404
                     err404 <- liftDecode res404 :: WaiTest.Session ApiError
                     liftEq err404.code ErrNotFound
 
                     -- 405 Method Not Allowed
-                    res405Health <- sendJsonRequest Http.methodPost "/api/health" (Just "{}")
+                    res405Health <- sendJsonRequest Http.methodPost "/api/health" [] (Just "{}")
                     WaiTest.assertStatus 405 res405Health
                     assertJsonContentType res405Health
                     err405Health <- liftDecode res405Health :: WaiTest.Session ApiError
                     liftEq err405Health.code ErrMethodNotAllowed
 
-                    res405Docs <- sendJsonRequest Http.methodDelete "/api/documents" Nothing
+                    res405Docs <- sendJsonRequest Http.methodDelete "/api/documents" [] Nothing
                     WaiTest.assertStatus 405 res405Docs
                     assertJsonContentType res405Docs
                     err405Docs <- liftDecode res405Docs :: WaiTest.Session ApiError
                     liftEq err405Docs.code ErrMethodNotAllowed
 
-                    res405Restore <- sendJsonRequest Http.methodGet "/api/documents/doc-1/restore" Nothing
+                    res405Restore <- sendJsonRequest Http.methodGet "/api/documents/doc-1/restore" [] Nothing
                     WaiTest.assertStatus 405 res405Restore
                     assertJsonContentType res405Restore
                     err405Restore <- liftDecode res405Restore :: WaiTest.Session ApiError
@@ -564,7 +648,7 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
                         plainReq =
                             (WaiTest.setPath WaiTest.defaultRequest "/api/documents")
                                 { Wai.requestMethod  = Http.methodPost
-                                , Wai.requestHeaders = [(Http.hContentType, "text/plain")]
+                                , Wai.requestHeaders = (Http.hContentType, "text/plain") : writeHdrs
                                 }
                     res415 <- WaiTest.srequest (WaiTest.SRequest plainReq "{}")
                     WaiTest.assertStatus 415 res415
@@ -584,7 +668,10 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
                 app = mkApplication (defaultStorageConfig dbPath)
             WaiTest.runSession
                 ( do
-                    res <- sendJsonRequest Http.methodGet "/api/documents" Nothing
+                    -- 形式妥当なセッショントークンで SQLite 照合経路へ到達させ、マスクされた 500 JSON を検証する
+                    let validFormatCookie :: ByteString
+                        validFormatCookie = "tamatsuzura_session=" <> BS8.replicate 43 'a'
+                    res <- sendJsonRequest Http.methodGet "/api/documents" [(Http.hCookie, validFormatCookie)] Nothing
                     WaiTest.assertStatus 500 res
                     assertJsonContentType res
                     err500 <- liftDecode res :: WaiTest.Session ApiError
@@ -594,15 +681,44 @@ errorHandlingSpec = describe "Structured JSON error handling across status codes
                 )
                 app
 
-sendJsonRequest :: Http.Method -> ByteString -> Maybe LazyBS.ByteString -> WaiTest.Session WaiTest.SResponse
-sendJsonRequest method rawPath mBody =
+registerTestUser :: Text -> WaiTest.Session SessionHeaders
+registerTestUser uname = do
+    let payload :: LazyBS.ByteString
+        payload = Aeson.encode $ Aeson.object
+            [ "username" Aeson..= uname
+            , "password" Aeson..= ("valid-test-password" :: Text)
+            ]
+    res <- sendJsonRequest Http.methodPost "/api/auth/register" [] (Just payload)
+    WaiTest.assertStatus 201 res
+    authRes <- liftDecode res :: WaiTest.Session AuthSessionResponse
+    case lookup "Set-Cookie" (WaiTest.simpleHeaders res) of
+        Nothing -> do
+            liftIO (expectationFailure "Missing Set-Cookie on register")
+            liftIO (fail "Unreachable after expectationFailure")
+        Just rawSetCookie ->
+            case BS8.split ';' rawSetCookie of
+                pair : _ -> pure SessionHeaders
+                    { cookie = pair
+                    , csrf   = TxtEnc.encodeUtf8 (toText authRes.csrfToken)
+                    }
+                [] -> do
+                    liftIO (expectationFailure "Malformed Set-Cookie header")
+                    liftIO (fail "Unreachable after expectationFailure")
+
+sendJsonRequest ::
+       Http.Method
+    -> ByteString
+    -> Http.RequestHeaders
+    -> Maybe LazyBS.ByteString
+    -> WaiTest.Session WaiTest.SResponse
+sendJsonRequest method rawPath extraHeaders mBody =
     let headers :: Http.RequestHeaders
         headers = case mBody of
-            Nothing -> [(Http.hAccept, "application/json")]
+            Nothing -> (Http.hAccept, "application/json") : extraHeaders
             Just _  ->
                 [ (Http.hContentType, "application/json")
                 , (Http.hAccept, "application/json")
-                ]
+                ] <> extraHeaders
 
         bodyBytes :: LazyBS.ByteString
         bodyBytes = fromMaybe "" mBody
@@ -651,7 +767,10 @@ assertFieldError expectedField (Right val) =
 withTestApp :: (Wai.Application -> IO a) -> IO a
 withTestApp action =
     withTempDbPath "api.sqlite3" $ \ dbPath ->
-        action (mkApplication (defaultStorageConfig dbPath))
+        action (mkApplicationWithAuth fastAuthCfg (defaultStorageConfig dbPath))
+  where
+    fastAuthCfg :: AuthConfig
+    fastAuthCfg = defaultAuthConfig { passwordHashParams = fastTestPasswordHashParams }
 
 withTempDbPath :: String -> (OsPath -> IO a) -> IO a
 withTempDbPath relFileName action = do

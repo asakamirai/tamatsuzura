@@ -54,3 +54,7 @@ Warp サーバ (`tamatsuzura-server`) および CGI バイナリ (`tamatsuzura-c
 | SQLite DB パス | `TAMATSUZURA_DB_PATH` | `--db-path PATH` | `data/tamatsuzura.sqlite3` |
 | SQLite `busy_timeout` (ms) | `TAMATSUZURA_DB_BUSY_TIMEOUT_MS` | `--busy-timeout-ms MS` | `5000` (範囲: `0..300000`) |
 | 静的アセット配信ディレクトリ (Warp 専用) | `TAMATSUZURA_STATIC_DIR` | `--static-dir DIR` | 未指定 (`scripts/run-server.sh` は `dist/web/index.html` 存在時に `dist/web` を自動設定) |
+| 新規ユーザー登録許可 | `TAMATSUZURA_ALLOW_REGISTRATION` | — | `true` (`false` で新規登録 API を `403` に制限) |
+| セッション有効期間 (秒) | `TAMATSUZURA_SESSION_TTL_SECONDS` | — | `604800` (7 日、範囲: `60..31536000`) |
+| セッション Cookie `Secure` 属性 | `TAMATSUZURA_COOKIE_SECURE` | — | `auto` (`auto` / `always` / `never`) |
+| リバースプロキシヘッダ信頼 | `TAMATSUZURA_TRUST_PROXY_HEADERS` | — | `false` (`true` で `X-Forwarded-Proto` / `X-Forwarded-Host` を参照) |

@@ -23,7 +23,9 @@ library
   exposed-modules:
     TamaTsuzura.Server.Api
     TamaTsuzura.Server.App
+    TamaTsuzura.Server.Auth.Cookie
     TamaTsuzura.Server.Auth.Crypto
+    TamaTsuzura.Server.Auth.Middleware
     TamaTsuzura.Server.Config
     TamaTsuzura.Server.Static
     TamaTsuzura.Server.Storage
@@ -76,6 +78,7 @@ test-suite tamatsuzura-server-test
   main-is:        Spec.hs
   other-modules:
     ApiSpec
+    AuthApiSpec
     AuthCryptoSpec
     AuthStorageSpec
     IntegrationSpec

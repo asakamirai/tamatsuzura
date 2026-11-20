@@ -70,9 +70,9 @@
 
 ---
 
-### MT-2: Warp / CGI 実バイナリでの REST API 疎通と SQLite 永続化検証
+### MT-2: Warp / CGI 実バイナリでの認証・所有者分離・REST API 疎通と SQLite 永続化検証
 
-**確認したいこと**: ビルド済み実バイナリ (`tamatsuzura-server` および `tamatsuzura-cgi`) をそれぞれ独立プロセスとして起動し、同一 SQLite ファイルに対して文書 CRUD・ゴミ箱移動・復元・完全削除が一貫して動作すること。
+**確認したいこと**: ビルド済み実バイナリ (`tamatsuzura-server` および `tamatsuzura-cgi`) をそれぞれ独立プロセスとして起動し、同一 SQLite ファイルに対してユーザー登録・Cookie セッション認証・CSRF 検証・ユーザー間文書分離・文書 CRUD・ゴミ箱移動・復元・完全削除・ログアウトが一貫して動作すること。
 
 **手順**:
 1. リポジトリルートで `scripts/build.sh` を実行し、ワークスペース直下に一時 DB パスを指定する（ホスト実行・Docker 実行の両方から同一ファイルを参照でき、かつ `.gitignore` 対象となる相対パスを使用する）:
@@ -84,37 +84,58 @@
    ```bash
    PORT=18080 scripts/run-server.sh
    ```
-   別ターミナルからヘルスチェックと文書作成を実行する:
+   別ターミナルからヘルスチェック・未認証拒否・ユーザー登録 (Alice)・文書作成を実行する:
    ```bash
    curl -i http://127.0.0.1:18080/api/health
-   curl -i -X POST http://127.0.0.1:18080/api/documents \
+   curl -i http://127.0.0.1:18080/api/documents
+   curl -i -c ./tmp-mt2-alice.cookies -X POST http://127.0.0.1:18080/api/auth/register \
      -H 'Content-Type: application/json' \
+     -d '{"username":"alice","display_name":"アリス","password":"alice-password-123"}'
+   ```
+   返却 JSON の `csrf_token` を `<ALICE_CSRF>` として控え、CSRF なしの拒否および CSRF ありの文書作成を実行する:
+   ```bash
+   curl -i -b ./tmp-mt2-alice.cookies -X POST http://127.0.0.1:18080/api/documents \
+     -H 'Content-Type: application/json' -d '{}'
+   curl -i -b ./tmp-mt2-alice.cookies -X POST http://127.0.0.1:18080/api/documents \
+     -H 'Content-Type: application/json' \
+     -H "X-CSRF-Token: <ALICE_CSRF>" \
      -d '{"title":"MT-2確認","body":"Warp作成本文","folder":"manual/test","tags":["mt2"]}'
    ```
-   - 確認項目: `/api/health` が `HTTP/1.1 200 OK` と `{"status":"ok"}` を返すこと。
-   - 確認項目: `POST /api/documents` が `HTTP/1.1 201 Created` と生成された `id` を含む JSON を返すこと（返却された `id` を `<DOC_ID>` として控える）。
-3. Warp サーバを `Ctrl+C` で停止し、同じ DB ファイルに対して CGI バイナリ (`tamatsuzura-cgi`) を CGI/1.1 環境変数で直接呼び出す:
+   - 確認項目: `/api/health` が `HTTP/1.1 200 OK` と `{"status":"ok"}`、未認証 `/api/documents` が `401 Unauthorized` を返すこと。
+   - 確認項目: `/api/auth/register` が `HTTP/1.1 201 Created`、および `Set-Cookie: tamatsuzura_session=...; Path=/; HttpOnly; SameSite=Lax; ...` を返すこと。
+   - 確認項目: `X-CSRF-Token` なしの `POST /api/documents` が `403 Forbidden` を返し、付与した場合は `HTTP/1.1 201 Created` と生成された `id` を含む JSON を返すこと（返却された `id` を `<DOC_ID>`、`./tmp-mt2-alice.cookies` の `tamatsuzura_session` 値を `<ALICE_TOKEN>` として控える）。
+3. 続けて別ユーザー Bob を登録し、Alice の文書が不可視であることを確認する:
+   ```bash
+   curl -i -c ./tmp-mt2-bob.cookies -X POST http://127.0.0.1:18080/api/auth/register \
+     -H 'Content-Type: application/json' \
+     -d '{"username":"bob","password":"bob-password-123"}'
+   curl -i -b ./tmp-mt2-bob.cookies http://127.0.0.1:18080/api/documents
+   curl -i -b ./tmp-mt2-bob.cookies "http://127.0.0.1:18080/api/documents/<DOC_ID>"
+   ```
+   - 確認項目: Bob の一覧は `{"documents":[],"total":0}`、Alice の `<DOC_ID>` 取得は `404 Not Found` となること。
+4. Warp サーバを `Ctrl+C` で停止し、同じ DB ファイルに対して CGI バイナリ (`tamatsuzura-cgi`) を CGI/1.1 環境変数で直接呼び出し、Warp で発行した Cookie セッションが CGI でも有効であることを確認する:
    - ホストに `stack` がある場合:
      ```bash
      GATEWAY_INTERFACE=CGI/1.1 REQUEST_METHOD=GET SCRIPT_NAME=/cgi-bin/tamatsuzura.cgi \
        PATH_INFO="/api/documents/<DOC_ID>" SERVER_PROTOCOL=HTTP/1.1 SERVER_NAME=localhost \
-       SERVER_PORT=80 REMOTE_ADDR=127.0.0.1 TAMATSUZURA_DB_PATH=./tmp-mt2.sqlite3 \
-       stack exec tamatsuzura-cgi
+       SERVER_PORT=80 REMOTE_ADDR=127.0.0.1 HTTP_COOKIE="tamatsuzura_session=<ALICE_TOKEN>" \
+       TAMATSUZURA_DB_PATH=./tmp-mt2.sqlite3 stack exec tamatsuzura-cgi
      ```
    - Docker 環境 (`USE_DOCKER=1` / ホスト `stack` 未導入) の場合:
      ```bash
      docker compose -f docker/docker-compose.yml run --rm -T \
        -e GATEWAY_INTERFACE=CGI/1.1 -e REQUEST_METHOD=GET -e SCRIPT_NAME=/cgi-bin/tamatsuzura.cgi \
        -e "PATH_INFO=/api/documents/<DOC_ID>" -e SERVER_PROTOCOL=HTTP/1.1 -e SERVER_NAME=localhost \
-       -e SERVER_PORT=80 -e REMOTE_ADDR=127.0.0.1 -e TAMATSUZURA_DB_PATH=./tmp-mt2.sqlite3 \
+       -e SERVER_PORT=80 -e REMOTE_ADDR=127.0.0.1 -e "HTTP_COOKIE=tamatsuzura_session=<ALICE_TOKEN>" \
+       -e TAMATSUZURA_DB_PATH=./tmp-mt2.sqlite3 \
        dev stack --allow-different-user exec tamatsuzura-cgi
      ```
-   - 確認項目: `Status: 200 OK`、`Content-Type: application/json;charset=utf-8`、および手順 2 で作成した文書の JSON が標準出力に返ること。
-4. 同様に CGI バイナリ経由で論理削除 (`REQUEST_METHOD=DELETE`, `PATH_INFO="/api/documents/<DOC_ID>"`)、復元 (`REQUEST_METHOD=POST`, `PATH_INFO="/api/documents/<DOC_ID>/restore"`)、再度の論理削除、完全削除 (`REQUEST_METHOD=DELETE`, `PATH_INFO="/api/documents/<DOC_ID>/permanent"`) を順に実行する。
-   - 確認項目: 論理削除で `Status: 200 OK` かつ `deleted_at` が非 null、復元で `Status: 200 OK` かつ `deleted_at` が `null`、完全削除で `Status: 204 No Content` かつボディ空であること。
-5. 検証終了後、一時 DB ファイル (`./tmp-mt2.sqlite3`, `./tmp-mt2.sqlite3-wal`, `./tmp-mt2.sqlite3-shm`) を削除する。
+   - 確認項目: `Status: 200 OK`、`Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store`、および手順 2 で作成した Alice の文書 JSON が標準出力に返ること。
+5. 同様に CGI バイナリ経由で `HTTP_COOKIE="tamatsuzura_session=<ALICE_TOKEN>"` および `HTTP_X_CSRF_TOKEN="<ALICE_CSRF>"` を指定し、論理削除 (`REQUEST_METHOD=DELETE`, `PATH_INFO="/api/documents/<DOC_ID>"`)、復元 (`REQUEST_METHOD=POST`, `PATH_INFO="/api/documents/<DOC_ID>/restore"`)、再度の論理削除、完全削除 (`REQUEST_METHOD=DELETE`, `PATH_INFO="/api/documents/<DOC_ID>/permanent"`)、最後にログアウト (`REQUEST_METHOD=POST`, `PATH_INFO="/api/auth/logout"`) を順に実行する。
+   - 確認項目: 論理削除で `Status: 200 OK` かつ `deleted_at` が非 null、復元で `Status: 200 OK` かつ `deleted_at` が `null`、完全削除で `Status: 204 No Content` かつボディ空、ログアウトで `Status: 204 No Content` と `Set-Cookie: tamatsuzura_session=; ... Max-Age=0` が返り、ログアウト後の `GET /api/auth/me` が `Status: 401 Unauthorized` となること。
+6. 検証終了後、一時 DB ファイル (`./tmp-mt2.sqlite3`, `./tmp-mt2.sqlite3-wal`, `./tmp-mt2.sqlite3-shm`) および一時 Cookie ファイル (`./tmp-mt2-alice.cookies`, `./tmp-mt2-bob.cookies`) を削除する。
 
-**再実施が必要になる変更**: `src/server/app/{WarpMain,CgiMain}.hs`、`TamaTsuzura.Server.{Config,Api,App,Storage}`、`scripts/run-server.sh`、または本番 CGI / Web サーバ設定の変更時。
+**再実施が必要になる変更**: `src/server/app/{WarpMain,CgiMain}.hs`、`TamaTsuzura.Server.{Config,Api,App,Storage}`、`TamaTsuzura.Server.Auth.*`、`TamaTsuzura.Server.Storage.Auth`、`scripts/run-server.sh`、または本番 CGI / Web サーバ設定の変更時。
 
 ---
 

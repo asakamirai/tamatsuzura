@@ -24,6 +24,9 @@ module TamaTsuzura.Server.Storage.Auth
       -- * セッション永続化操作 (CGI 完全互換 SQLite バックエンド)
     , createSession
     , createSessionWith
+    , registerUserWithSession
+    , rotateLoginSession
+    , logoutSession
     , lookupValidSession
     , lookupValidSessionAt
     , touchSessionAt
@@ -34,6 +37,7 @@ module TamaTsuzura.Server.Storage.Auth
     , purgeExpiredSessionsAt
     ) where
 
+import           Control.Monad                     (forM_)
 import           Data.Bifunctor                    (first)
 import           Data.Text                         (Text)
 import qualified Data.Text                         as Txt
@@ -189,45 +193,8 @@ createUserWith ::
     -> IO (Either StorageError StoredUser)
 createUserWith handle uid now uname mDisplayName pwHash =
     catchSqliteErrors $
-        withImmediateTransaction handle.connection $ do
-            idTaken <- userIdExists handle.connection uid
-            if idTaken
-                then pure (Left (UserIdAlreadyExists uid))
-                else do
-                    nameTaken <- usernameExists handle.connection uname
-                    if nameTaken
-                        then pure (Left (UsernameAlreadyExists uname))
-                        else do
-                            let timestamp :: UTCTime
-                                timestamp = truncateToMicros now
-
-                                timestampText :: Text
-                                timestampText = formatSqliteUtcTime timestamp
-
-                                stored :: StoredUser
-                                stored = StoredUser
-                                    { profile      = UserProfile
-                                        { id          = uid
-                                        , username    = uname
-                                        , displayName = mDisplayName
-                                        , createdAt   = timestamp
-                                        }
-                                    , passwordHash = pwHash
-                                    , updatedAt    = timestamp
-                                    }
-                            SQLite.execute
-                                handle.connection
-                                "INSERT INTO users\
-                                \ (id, username, display_name, password_hash, created_at, updated_at)\
-                                \ VALUES (?, ?, ?, ?, ?, ?)"
-                                ( toText uid
-                                , toText uname
-                                , fmap toText mDisplayName
-                                , passwordHashToText pwHash
-                                , timestampText
-                                , timestampText
-                                )
-                            pure (Right stored)
+        withImmediateTransaction handle.connection $
+            insertUserInTx handle.connection uid now uname mDisplayName pwHash
 
 -- | ユーザー ID でユーザーを検索する。存在しない場合は @Right Nothing@ を返す。
 getUserById ::
@@ -307,39 +274,96 @@ createSessionWith handle tokenHashVal uid csrf now expiresAtRaw =
     in  if expires <= created
             then pure (Left (CorruptedData "Session expiration timestamp must be strictly after creation timestamp"))
             else catchSqliteErrors $
+                withImmediateTransaction handle.connection $
+                    insertSessionInTx handle.connection tokenHashVal uid csrf created expires
+
+-- | 新規ユーザー作成・期限切れセッション掃除・任意の前セッション失効・新規セッション発行を
+-- 単一の @BEGIN IMMEDIATE@ トランザクションで原子的に実行する。
+-- セッション作成失敗時に孤立ユーザー行が残留する事態を防ぎ、CGI 環境でのロック競合回数を最小化する。
+registerUserWithSession ::
+       StorageHandle
+    -> Username
+    -> Maybe DisplayName
+    -> PasswordHash
+    -> SessionTtlSeconds
+    -> Maybe SessionTokenHash
+    -> IO (Either StorageError (StoredUser, SessionToken, StoredSession))
+registerUserWithSession handle uname mDisplayName pwHash ttl mOldSessionHash = do
+    rawUuid <- UUID4.nextRandom
+    case mkUserId (UUID.toText rawUuid) of
+        Left err  -> pure (Left (StorageValidationError err))
+        Right uid -> do
+            rawToken <- generateSessionToken
+            eCsrf <- generateCsrfToken
+            case eCsrf of
+                Left err ->
+                    pure (Left (CorruptedData ("Failed to generate CSRF token: " <> toText err)))
+                Right csrf -> do
+                    now <- getCurrentTime
+                    let created :: UTCTime
+                        created = truncateToMicros now
+
+                        expires :: UTCTime
+                        expires = truncateToMicros (addUTCTime (sessionTtlDiffTime ttl) created)
+
+                        tokenHashVal :: SessionTokenHash
+                        tokenHashVal = hashSessionToken rawToken
+                    catchSqliteErrors $
+                        withImmediateTransaction handle.connection $ do
+                            eUser <- insertUserInTx handle.connection uid created uname mDisplayName pwHash
+                            case eUser of
+                                Left err -> pure (Left err)
+                                Right storedUser -> do
+                                    _ <- purgeExpiredSessionsInTx handle.connection created
+                                    forM_ mOldSessionHash (deleteSessionByHashInTx handle.connection)
+                                    eSession <- insertSessionInTx handle.connection tokenHashVal uid csrf created expires
+                                    pure (fmap (storedUser, rawToken,) eSession)
+
+-- | ログイン成功時の旧セッション失効・期限切れセッション掃除・新セッション発行を
+-- 単一の @BEGIN IMMEDIATE@ トランザクションで原子的に実行する。
+-- 新セッション作成に失敗した場合は旧セッション削除もロールバックされる。
+rotateLoginSession ::
+       StorageHandle
+    -> UserId
+    -> SessionTtlSeconds
+    -> Maybe SessionTokenHash
+    -> IO (Either StorageError (SessionToken, StoredSession))
+rotateLoginSession handle uid ttl mOldSessionHash = do
+    rawToken <- generateSessionToken
+    eCsrf <- generateCsrfToken
+    case eCsrf of
+        Left err ->
+            pure (Left (CorruptedData ("Failed to generate CSRF token: " <> toText err)))
+        Right csrf -> do
+            now <- getCurrentTime
+            let created :: UTCTime
+                created = truncateToMicros now
+
+                expires :: UTCTime
+                expires = truncateToMicros (addUTCTime (sessionTtlDiffTime ttl) created)
+
+                tokenHashVal :: SessionTokenHash
+                tokenHashVal = hashSessionToken rawToken
+            catchSqliteErrors $
                 withImmediateTransaction handle.connection $ do
-                    exists <- userIdExists handle.connection uid
-                    if not exists
-                        then pure (Left (UserNotFound uid))
-                        else do
-                            let createdText :: Text
-                                createdText = formatSqliteUtcTime created
+                    forM_ mOldSessionHash (deleteSessionByHashInTx handle.connection)
+                    _ <- purgeExpiredSessionsInTx handle.connection created
+                    eSession <- insertSessionInTx handle.connection tokenHashVal uid csrf created expires
+                    pure (fmap (rawToken,) eSession)
 
-                                expiresText :: Text
-                                expiresText = formatSqliteUtcTime expires
-
-                                stored :: StoredSession
-                                stored = StoredSession
-                                    { tokenHash      = tokenHashVal
-                                    , userId         = uid
-                                    , csrfToken      = csrf
-                                    , createdAt      = created
-                                    , expiresAt      = expires
-                                    , lastAccessedAt = created
-                                    }
-                            SQLite.execute
-                                handle.connection
-                                "INSERT INTO sessions\
-                                \ (token_hash, user_id, csrf_token, created_at, expires_at, last_accessed_at)\
-                                \ VALUES (?, ?, ?, ?, ?, ?)"
-                                ( toText tokenHashVal
-                                , toText uid
-                                , toText csrf
-                                , createdText
-                                , expiresText
-                                , createdText
-                                )
-                            pure (Right stored)
+-- | ログアウト時の対象セッション削除および期限切れセッション掃除を
+-- 単一の @BEGIN IMMEDIATE@ トランザクションで原子的に実行する。
+logoutSession ::
+       StorageHandle
+    -> SessionTokenHash
+    -> IO (Either StorageError ())
+logoutSession handle tokenHashVal = do
+    now <- getCurrentTime
+    catchSqliteErrors $
+        withImmediateTransaction handle.connection $ do
+            deleteSessionByHashInTx handle.connection tokenHashVal
+            _ <- purgeExpiredSessionsInTx handle.connection (truncateToMicros now)
+            pure (Right ())
 
 -- | Cookie から受け取った生 'SessionToken' を現在時刻で照合し、有効なセッションとユーザーを返す。
 -- 読み取り専用トランザクションのみを使用し、認証済み GET リクエストで SQLite 書き込みロックを取得しない。
@@ -433,10 +457,7 @@ deleteSessionByHash ::
 deleteSessionByHash handle tokenHashVal =
     catchSqliteErrors $
         withImmediateTransaction handle.connection $ do
-            SQLite.execute
-                handle.connection
-                "DELETE FROM sessions WHERE token_hash = ?"
-                (Only (toText tokenHashVal))
+            deleteSessionByHashInTx handle.connection tokenHashVal
             pure (Right ())
 
 -- | 指定ユーザーに属するすべてのセッションを一括失効させ、削除件数を返す。
@@ -468,13 +489,113 @@ purgeExpiredSessionsAt ::
     -> IO (Either StorageError Int)
 purgeExpiredSessionsAt handle now =
     catchSqliteErrors $
-        withImmediateTransaction handle.connection $ do
+        withImmediateTransaction handle.connection $
+            Right <$> purgeExpiredSessionsInTx handle.connection now
+
+insertUserInTx ::
+       SQLite.Connection
+    -> UserId
+    -> UTCTime
+    -> Username
+    -> Maybe DisplayName
+    -> PasswordHash
+    -> IO (Either StorageError StoredUser)
+insertUserInTx conn uid now uname mDisplayName pwHash = do
+    idTaken <- userIdExists conn uid
+    if idTaken
+        then pure (Left (UserIdAlreadyExists uid))
+        else do
+            nameTaken <- usernameExists conn uname
+            if nameTaken
+                then pure (Left (UsernameAlreadyExists uname))
+                else do
+                    let timestamp :: UTCTime
+                        timestamp = truncateToMicros now
+
+                        timestampText :: Text
+                        timestampText = formatSqliteUtcTime timestamp
+
+                        stored :: StoredUser
+                        stored = StoredUser
+                            { profile      = UserProfile
+                                { id          = uid
+                                , username    = uname
+                                , displayName = mDisplayName
+                                , createdAt   = timestamp
+                                }
+                            , passwordHash = pwHash
+                            , updatedAt    = timestamp
+                            }
+                    SQLite.execute
+                        conn
+                        "INSERT INTO users\
+                        \ (id, username, display_name, password_hash, created_at, updated_at)\
+                        \ VALUES (?, ?, ?, ?, ?, ?)"
+                        ( toText uid
+                        , toText uname
+                        , fmap toText mDisplayName
+                        , passwordHashToText pwHash
+                        , timestampText
+                        , timestampText
+                        )
+                    pure (Right stored)
+
+insertSessionInTx ::
+       SQLite.Connection
+    -> SessionTokenHash
+    -> UserId
+    -> CsrfToken
+    -> UTCTime
+    -> UTCTime
+    -> IO (Either StorageError StoredSession)
+insertSessionInTx conn tokenHashVal uid csrf created expires = do
+    exists <- userIdExists conn uid
+    if not exists
+        then pure (Left (UserNotFound uid))
+        else do
+            let createdText :: Text
+                createdText = formatSqliteUtcTime created
+
+                expiresText :: Text
+                expiresText = formatSqliteUtcTime expires
+
+                stored :: StoredSession
+                stored = StoredSession
+                    { tokenHash      = tokenHashVal
+                    , userId         = uid
+                    , csrfToken      = csrf
+                    , createdAt      = created
+                    , expiresAt      = expires
+                    , lastAccessedAt = created
+                    }
             SQLite.execute
-                handle.connection
-                "DELETE FROM sessions WHERE expires_at <= ?"
-                (Only (formatSqliteUtcTime now))
-            deleted <- SQLite.changes handle.connection
-            pure (Right deleted)
+                conn
+                "INSERT INTO sessions\
+                \ (token_hash, user_id, csrf_token, created_at, expires_at, last_accessed_at)\
+                \ VALUES (?, ?, ?, ?, ?, ?)"
+                ( toText tokenHashVal
+                , toText uid
+                , toText csrf
+                , createdText
+                , expiresText
+                , createdText
+                )
+            pure (Right stored)
+
+deleteSessionByHashInTx :: SQLite.Connection -> SessionTokenHash -> IO ()
+deleteSessionByHashInTx conn tokenHashVal =
+    SQLite.execute
+        conn
+        "DELETE FROM sessions WHERE token_hash = ?"
+        (Only (toText tokenHashVal))
+
+purgeExpiredSessionsInTx :: SQLite.Connection -> UTCTime -> IO Int
+purgeExpiredSessionsInTx conn now = do
+    SQLite.execute
+        conn
+        "DELETE FROM sessions WHERE expires_at <= ?"
+        (Only (formatSqliteUtcTime now))
+    SQLite.changes conn
 
 userIdExists :: SQLite.Connection -> UserId -> IO Bool
 userIdExists conn uid = do

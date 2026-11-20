@@ -8,19 +8,19 @@ module TamaTsuzura.Server.Storage
       StorageHandle
     , withStorage
     , inspectStoragePragmas
-      -- * 文書 CRUD
+      -- * 文書 CRUD (所有者分離)
     , createDocument
     , createDocumentWith
     , getDocument
     , listDocuments
     , updateDocument
     , updateDocumentAt
-      -- * 論理削除 (ゴミ箱)・復元・完全削除
+      -- * 論理削除 (ゴミ箱)・復元・完全削除 (所有者分離)
     , softDeleteDocument
     , softDeleteDocumentAt
     , restoreDocument
     , permanentDeleteDocument
-      -- * 整理メタデータ一覧
+      -- * 整理メタデータ一覧 (所有者分離)
     , listTags
     , listFolders
       -- re-export
@@ -67,6 +67,7 @@ import           TamaTsuzura.Common.Api
     , validateCreateDocumentRequest
     , validateUpdateDocumentRequest
     )
+import           TamaTsuzura.Common.Auth           (UserId)
 import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentBody(..)
@@ -144,92 +145,104 @@ withStorage cfg action = catchSqliteErrors $ do
 inspectStoragePragmas :: StorageHandle -> IO (Either StorageError SqlitePragmas)
 inspectStoragePragmas handle = inspectPragmas handle.connection
 
--- | 新しい UUIDv4 の 'DocumentId' と現在の UTC 時刻を用いて文書を新規作成する。
+-- | 新しい UUIDv4 の 'DocumentId' と現在の UTC 時刻を用いて指定ユーザー所有の文書を新規作成する。
 createDocument ::
        StorageHandle
+    -> UserId
     -> CreateDocumentRequest
     -> IO (Either StorageError Document)
-createDocument handle req = do
+createDocument handle ownerId req = do
     rawUuid <- UUID4.nextRandom
     now <- getCurrentTime
     case mkDocumentId (UUID.toText rawUuid) of
         Left err    -> pure (Left (StorageValidationError err))
-        Right docId -> createDocumentWith handle docId now req
+        Right docId -> createDocumentWith handle ownerId docId now req
 
--- | 明示的に指定した 'DocumentId' と作成日時を用いて文書を新規作成する。
+-- | 明示的に指定した所有者 'UserId'・'DocumentId'・作成日時を用いて文書を新規作成する。
+-- 所有者が存在しない場合は外部キーエラーではなく 'UserNotFound' を返し、
 -- 決定的な単体テストや将来のインポート・マイグレーション用途を想定する。
 createDocumentWith ::
        StorageHandle
+    -> UserId
     -> DocumentId
     -> UTCTime
     -> CreateDocumentRequest
     -> IO (Either StorageError Document)
-createDocumentWith handle docId now req =
+createDocumentWith handle ownerId docId now req =
     case validateCreateDocumentRequest req of
         Left err -> pure (Left (StorageValidationError err))
         Right validatedReq ->
             catchSqliteErrors $
                 withImmediateTransaction handle.connection $ do
-                    exists <- documentExists handle.connection docId
-                    if exists
-                        then pure (Left (DocumentIdAlreadyExists docId))
+                    ownerPresent <- ownerExists handle.connection ownerId
+                    if not ownerPresent
+                        then pure (Left (UserNotFound ownerId))
                         else do
-                            let timestamp :: UTCTime
-                                timestamp = truncateToMicros now
+                            exists <- documentExists handle.connection docId
+                            if exists
+                                then pure (Left (DocumentIdAlreadyExists docId))
+                                else do
+                                    let timestamp :: UTCTime
+                                        timestamp = truncateToMicros now
 
-                                timestampText :: Text
-                                timestampText = formatSqliteUtcTime timestamp
+                                        timestampText :: Text
+                                        timestampText = formatSqliteUtcTime timestamp
 
-                                newDoc :: Document
-                                newDoc = Document
-                                    { id        = docId
-                                    , title     = validatedReq.title
-                                    , body      = validatedReq.body
-                                    , format    = validatedReq.format
-                                    , folder    = validatedReq.folder
-                                    , tags      = validatedReq.tags
-                                    , createdAt = timestamp
-                                    , updatedAt = timestamp
-                                    , deletedAt = Nothing
-                                    }
-                            SQLite.execute
-                                handle.connection
-                                "INSERT INTO documents\
-                                \ (id, title, body, format, folder, created_at, updated_at, deleted_at)\
-                                \ VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
-                                ( toText newDoc.id
-                                , toText newDoc.title
-                                , toText newDoc.body
-                                , toText newDoc.format
-                                , fmap toText newDoc.folder
-                                , timestampText
-                                , timestampText
-                                )
-                            insertDocumentTags handle.connection docId newDoc.tags
-                            pure (Right newDoc)
+                                        newDoc :: Document
+                                        newDoc = Document
+                                            { id        = docId
+                                            , title     = validatedReq.title
+                                            , body      = validatedReq.body
+                                            , format    = validatedReq.format
+                                            , folder    = validatedReq.folder
+                                            , tags      = validatedReq.tags
+                                            , createdAt = timestamp
+                                            , updatedAt = timestamp
+                                            , deletedAt = Nothing
+                                            }
+                                    SQLite.execute
+                                        handle.connection
+                                        "INSERT INTO documents\
+                                        \ (id, owner_id, title, body, format, folder, created_at, updated_at, deleted_at)\
+                                        \ VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+                                        ( toText newDoc.id
+                                        , toText ownerId
+                                        , toText newDoc.title
+                                        , toText newDoc.body
+                                        , toText newDoc.format
+                                        , fmap toText newDoc.folder
+                                        , timestampText
+                                        , timestampText
+                                        )
+                                    insertDocumentTags handle.connection docId newDoc.tags
+                                    pure (Right newDoc)
 
--- | 指定した ID の文書 (本文・タグ含む) を取得する。
+-- | 指定ユーザーが所有する文書 (本文・タグ含む) を ID で取得する。
+-- 他ユーザーの文書 ID を指定した場合は存在有無を秘匿するため 'DocumentNotFound' を返す。
 -- ゴミ箱内の文書も復元・完全削除前のプレビュー用途として取得可能とする。
 getDocument ::
        StorageHandle
+    -> UserId
     -> DocumentId
     -> IO (Either StorageError Document)
-getDocument handle docId =
+getDocument handle ownerId docId =
     catchSqliteErrors $
         withReadTransaction handle.connection $
-            fetchDocumentInTx handle.connection docId
+            fetchDocumentInTx handle.connection ownerId docId
 
--- | フィルタ・検索・ページネーション条件に従って文書サマリ一覧と総一致件数を取得する。
+-- | 指定ユーザーが所有する文書を対象に、フィルタ・検索・ページネーション条件に従って
+-- 文書サマリ一覧と総一致件数を取得する。
 -- 一覧取得時は本文列 (@body@) を読み込まず、タグは対象文書分を 1 クエリで一括取得して N+1 を回避する。
 -- 検索条件 (@q@) は SQLite 標準の @lower()@ / @LIKE@ に準拠した ASCII 大文字小文字無視＋部分一致を行う。
 listDocuments ::
        StorageHandle
+    -> UserId
     -> DocumentListQuery
     -> IO (Either StorageError DocumentListResponse)
-listDocuments handle query =
+listDocuments handle ownerId query =
     catchSqliteErrors $
         withReadTransaction handle.connection $ do
-            let (whereSql, filterParams) = buildListFilter query
+            let (whereSql, filterParams) = buildListFilter ownerId query
                 countSql :: SQLite.Query
                 countSql = SQLite.Query ("SELECT COUNT(*) FROM documents d" <> whereSql)
 
@@ -281,25 +294,27 @@ listDocuments handle query =
         , deletedAt = summary.deletedAt
         }
 
--- | 現在の UTC 時刻を用いて稼働中文書の内容・メタデータを全体置換する。
+-- | 現在の UTC 時刻を用いて指定ユーザー所有の稼働中文書の内容・メタデータを全体置換する。
 updateDocument ::
        StorageHandle
+    -> UserId
     -> DocumentId
     -> UpdateDocumentRequest
     -> IO (Either StorageError Document)
-updateDocument handle docId req = do
+updateDocument handle ownerId docId req = do
     now <- getCurrentTime
-    updateDocumentAt handle docId now req
+    updateDocumentAt handle ownerId docId now req
 
--- | 明示的に指定した更新日時を用いて稼働中文書の内容・メタデータを全体置換する。
--- ゴミ箱内の文書に対する更新は 'DocumentInTrash' (HTTP 409) として拒否する。
+-- | 明示的に指定した更新日時を用いて指定ユーザー所有の稼働中文書の内容・メタデータを全体置換する。
+-- 他ユーザーの文書は 'DocumentNotFound' (HTTP 404)、本人所有かつゴミ箱内の文書は 'DocumentInTrash' (HTTP 409) とする。
 updateDocumentAt ::
        StorageHandle
+    -> UserId
     -> DocumentId
     -> UTCTime
     -> UpdateDocumentRequest
     -> IO (Either StorageError Document)
-updateDocumentAt handle docId now req =
+updateDocumentAt handle ownerId docId now req =
     case validateUpdateDocumentRequest req of
         Left err -> pure (Left (StorageValidationError err))
         Right validatedReq ->
@@ -307,8 +322,8 @@ updateDocumentAt handle docId now req =
                 withImmediateTransaction handle.connection $ do
                     rows <- SQLite.query
                         handle.connection
-                        "SELECT created_at, deleted_at FROM documents WHERE id = ?"
-                        (Only (toText docId))
+                        "SELECT created_at, deleted_at FROM documents WHERE id = ? AND owner_id = ?"
+                        (toText docId, toText ownerId)
                         :: IO [(Text, Maybe Text)]
                     case rows of
                         []                        -> pure (Left (DocumentNotFound docId))
@@ -336,13 +351,14 @@ updateDocumentAt handle docId now req =
                                         handle.connection
                                         "UPDATE documents\
                                         \ SET title = ?, body = ?, format = ?, folder = ?, updated_at = ?\
-                                        \ WHERE id = ?"
+                                        \ WHERE id = ? AND owner_id = ?"
                                         ( toText updatedDoc.title
                                         , toText updatedDoc.body
                                         , toText updatedDoc.format
                                         , fmap toText updatedDoc.folder
                                         , formatSqliteUtcTime updatedAt
                                         , toText docId
+                                        , toText ownerId
                                         )
                                     SQLite.execute
                                         handle.connection
@@ -353,27 +369,29 @@ updateDocumentAt handle docId now req =
                         _                         ->
                             pure (Left (CorruptedData ("Duplicate primary key for document: " <> toText docId)))
 
--- | 現在の UTC 時刻を用いて文書を論理削除 (ゴミ箱へ移動) する。
+-- | 現在の UTC 時刻を用いて指定ユーザー所有の文書を論理削除 (ゴミ箱へ移動) する。
 softDeleteDocument ::
        StorageHandle
+    -> UserId
     -> DocumentId
     -> IO (Either StorageError Document)
-softDeleteDocument handle docId = do
+softDeleteDocument handle ownerId docId = do
     now <- getCurrentTime
-    softDeleteDocumentAt handle docId now
+    softDeleteDocumentAt handle ownerId docId now
 
--- | 明示的に指定した削除日時を用いて文書を論理削除 (ゴミ箱へ移動) する。
+-- | 明示的に指定した削除日時を用いて指定ユーザー所有の文書を論理削除 (ゴミ箱へ移動) する。
 -- 冪等性を保証し、既にゴミ箱内の文書については既存の @deleted_at@ を保持して返却する。
 -- 復元時の並び順・最終編集日時を維持するため、@updated_at@ は変更しない。
 softDeleteDocumentAt ::
        StorageHandle
+    -> UserId
     -> DocumentId
     -> UTCTime
     -> IO (Either StorageError Document)
-softDeleteDocumentAt handle docId now =
+softDeleteDocumentAt handle ownerId docId now =
     catchSqliteErrors $
         withImmediateTransaction handle.connection $ do
-            eDoc <- fetchDocumentInTx handle.connection docId
+            eDoc <- fetchDocumentInTx handle.connection ownerId docId
             case eDoc of
                 Left err -> pure (Left err)
                 Right doc -> case doc.deletedAt of
@@ -383,20 +401,21 @@ softDeleteDocumentAt handle docId now =
                             deletedAt = truncateToMicros now
                         SQLite.execute
                             handle.connection
-                            "UPDATE documents SET deleted_at = ? WHERE id = ?"
-                            (formatSqliteUtcTime deletedAt, toText docId)
+                            "UPDATE documents SET deleted_at = ? WHERE id = ? AND owner_id = ?"
+                            (formatSqliteUtcTime deletedAt, toText docId, toText ownerId)
                         pure (Right (setDocumentDeletedAt (Just deletedAt) doc))
 
--- | ゴミ箱内の文書を稼働状態へ復元する (@deleted_at = NULL@)。
+-- | 指定ユーザー所有のゴミ箱内文書を稼働状態へ復元する (@deleted_at = NULL@)。
 -- 冪等性を保証し、既に稼働中の文書についてはそのまま返却する。@updated_at@ は変更しない。
 restoreDocument ::
        StorageHandle
+    -> UserId
     -> DocumentId
     -> IO (Either StorageError Document)
-restoreDocument handle docId =
+restoreDocument handle ownerId docId =
     catchSqliteErrors $
         withImmediateTransaction handle.connection $ do
-            eDoc <- fetchDocumentInTx handle.connection docId
+            eDoc <- fetchDocumentInTx handle.connection ownerId docId
             case eDoc of
                 Left err -> pure (Left err)
                 Right doc -> case doc.deletedAt of
@@ -404,24 +423,26 @@ restoreDocument handle docId =
                     Just _ -> do
                         SQLite.execute
                             handle.connection
-                            "UPDATE documents SET deleted_at = NULL WHERE id = ?"
-                            (Only (toText docId))
+                            "UPDATE documents SET deleted_at = NULL WHERE id = ? AND owner_id = ?"
+                            (toText docId, toText ownerId)
                         pure (Right (setDocumentDeletedAt Nothing doc))
 
--- | ゴミ箱内の文書をストレージから完全削除する。
--- 誤削除防止のため、稼働中の文書に対する呼び出しは 'DocumentNotTrashed' (HTTP 409) として拒否する。
+-- | 指定ユーザー所有のゴミ箱内文書をストレージから完全削除する。
+-- 他ユーザーの文書は 'DocumentNotFound' (HTTP 404)、本人所有かつ稼働中の文書は誤削除防止のため
+-- 'DocumentNotTrashed' (HTTP 409) として拒否する。
 -- 関連タグ行は外部キーの @ON DELETE CASCADE@ により同時に削除される。
 permanentDeleteDocument ::
        StorageHandle
+    -> UserId
     -> DocumentId
     -> IO (Either StorageError ())
-permanentDeleteDocument handle docId =
+permanentDeleteDocument handle ownerId docId =
     catchSqliteErrors $
         withImmediateTransaction handle.connection $ do
             rows <- SQLite.query
                 handle.connection
-                "SELECT deleted_at FROM documents WHERE id = ?"
-                (Only (toText docId))
+                "SELECT deleted_at FROM documents WHERE id = ? AND owner_id = ?"
+                (toText docId, toText ownerId)
                 :: IO [Only (Maybe Text)]
             case rows of
                 []             -> pure (Left (DocumentNotFound docId))
@@ -429,21 +450,22 @@ permanentDeleteDocument handle docId =
                 [Only Just{}]  -> do
                     SQLite.execute
                         handle.connection
-                        "DELETE FROM documents WHERE id = ?"
-                        (Only (toText docId))
+                        "DELETE FROM documents WHERE id = ? AND owner_id = ?"
+                        (toText docId, toText ownerId)
                     pure (Right ())
                 _              -> pure (Left (CorruptedData ("Duplicate primary key for document: " <> toText docId)))
 
--- | 稼働中の文書で使用されている重複なし・昇順ソート済みのタグ一覧を返す。
-listTags :: StorageHandle -> IO (Either StorageError TagListResponse)
-listTags handle = catchSqliteErrors $ do
-    rows <- SQLite.query_
+-- | 指定ユーザーの稼働中文書で使用されている重複なし・昇順ソート済みのタグ一覧を返す。
+listTags :: StorageHandle -> UserId -> IO (Either StorageError TagListResponse)
+listTags handle ownerId = catchSqliteErrors $ do
+    rows <- SQLite.query
         handle.connection
         "SELECT DISTINCT dt.tag\
         \ FROM document_tags dt\
         \ INNER JOIN documents d ON d.id = dt.document_id\
-        \ WHERE d.deleted_at IS NULL\
+        \ WHERE d.owner_id = ? AND d.deleted_at IS NULL\
         \ ORDER BY dt.tag ASC"
+        (Only (toText ownerId))
         :: IO [Only Text]
     pure $ do
         tags <- traverse decodeTag rows
@@ -454,16 +476,17 @@ listTags handle = catchSqliteErrors $ do
     decodeTag :: Only Text -> Either StorageError Tag
     decodeTag (Only rawTag) = mapValidationToCorrupted "tag" (mkTag rawTag)
 
--- | 稼働中の文書で使用されている重複なし・昇順ソート済みのフォルダパス一覧を返す。
+-- | 指定ユーザーの稼働中文書で使用されている重複なし・昇順ソート済みのフォルダパス一覧を返す。
 -- ルート直下 (@folder IS NULL@) の文書は結果に含めない。
-listFolders :: StorageHandle -> IO (Either StorageError FolderListResponse)
-listFolders handle = catchSqliteErrors $ do
-    rows <- SQLite.query_
+listFolders :: StorageHandle -> UserId -> IO (Either StorageError FolderListResponse)
+listFolders handle ownerId = catchSqliteErrors $ do
+    rows <- SQLite.query
         handle.connection
         "SELECT DISTINCT folder\
         \ FROM documents\
-        \ WHERE deleted_at IS NULL AND folder IS NOT NULL\
+        \ WHERE owner_id = ? AND deleted_at IS NULL AND folder IS NOT NULL\
         \ ORDER BY folder ASC"
+        (Only (toText ownerId))
         :: IO [Only Text]
     pure $ do
         folders <- traverse decodeFolder rows
@@ -484,6 +507,15 @@ prepareTargetPath (StorageFile path) = do
     -- sqlite-simple の open には OsPath 版が存在しないため、境界でのみ String へ変換する
     OS.decodeFS path
 
+ownerExists :: SQLite.Connection -> UserId -> IO Bool
+ownerExists conn ownerId = do
+    rows <- SQLite.query
+        conn
+        "SELECT 1 FROM users WHERE id = ? LIMIT 1"
+        (Only (toText ownerId))
+        :: IO [Only Int]
+    pure (not (null rows))
+
 documentExists :: SQLite.Connection -> DocumentId -> IO Bool
 documentExists conn docId = do
     rows <- SQLite.query
@@ -501,14 +533,14 @@ insertDocumentTags conn docId tagSet =
             "INSERT INTO document_tags (document_id, tag) VALUES (?, ?)"
             (toText docId, toText tag)
 
-fetchDocumentInTx :: SQLite.Connection -> DocumentId -> IO (Either StorageError Document)
-fetchDocumentInTx conn docId = do
+fetchDocumentInTx :: SQLite.Connection -> UserId -> DocumentId -> IO (Either StorageError Document)
+fetchDocumentInTx conn ownerId docId = do
     rows <- SQLite.query
         conn
         "SELECT id, title, body, format, folder, created_at, updated_at, deleted_at\
         \ FROM documents\
-        \ WHERE id = ?"
-        (Only (toText docId))
+        \ WHERE id = ? AND owner_id = ?"
+        (toText docId, toText ownerId)
         :: IO [DocumentRow]
     case rows of
         []    -> pure (Left (DocumentNotFound docId))
@@ -553,21 +585,23 @@ fetchTagsByDocumentIds conn docIds = do
     appendTag :: Map DocumentId [Text] -> (DocumentId, Text) -> Map DocumentId [Text]
     appendTag acc (docId, rawTag) = Map.insertWith (<>) docId [rawTag] acc
 
-buildListFilter :: DocumentListQuery -> (Text, [NamedParam])
-buildListFilter query =
+buildListFilter :: UserId -> DocumentListQuery -> (Text, [NamedParam])
+buildListFilter ownerId query =
     let (clauses, params) =
             mconcat
-                [ statusClause query.status
+                [ ownerClause ownerId
+                , statusClause query.status
                 , tagClause query.tag
                 , folderClause query.folder query.includeSubfolders
                 , searchClause query.search
                 ]
         whereSql :: Text
-        whereSql = case clauses of
-            [] -> ""
-            _  -> " WHERE " <> Txt.intercalate " AND " clauses
+        whereSql = " WHERE " <> Txt.intercalate " AND " clauses
     in  (whereSql, params)
   where
+    ownerClause :: UserId -> ([Text], [NamedParam])
+    ownerClause uid = (["d.owner_id = :ownerId"], [":ownerId" := toText uid])
+
     statusClause :: DocumentStatusFilter -> ([Text], [NamedParam])
     statusClause StatusActive  = (["d.deleted_at IS NULL"], [])
     statusClause StatusTrashed = (["d.deleted_at IS NOT NULL"], [])

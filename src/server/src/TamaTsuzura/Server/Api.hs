@@ -3,11 +3,20 @@
 {-# LANGUAGE NoFieldSelectors      #-}
 {-# LANGUAGE OverloadedRecordDot   #-}
 {-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE TypeOperators         #-}
 
 module TamaTsuzura.Server.Api
-    ( -- * Servant API 型定義
-      TamaTsuzuraApi
+    ( -- * 認証コンテキスト・ヘッダ型
+      AuthScheme(..)
+    , SessionAuth
+    , SessionCsrfAuth
+    , SessionAuthContext(..)
+    , CsrfVerifiedSession(..)
+    , RawCookieHeader(..)
+      -- * Servant API 型定義
+    , TamaTsuzuraApi
+    , AuthApi
     , DocumentsApi
     , DocumentByIdApi
     , tamaTsuzuraApiProxy
@@ -23,20 +32,26 @@ module TamaTsuzura.Server.Api
     , apiErrorFormatters
     ) where
 
-import           Data.Aeson                    (encode)
-import           Data.Bifunctor                (first)
-import           Data.ByteString               (ByteString)
-import qualified Data.ByteString.Char8         as BS8
-import qualified Data.Char                     as Char
-import           Data.Proxy                    (Proxy(..))
-import           Data.Text                     (Text)
-import qualified Data.Text                     as Txt
-import qualified Network.HTTP.Types            as Http
+import           Data.Aeson                       (encode)
+import           Data.Bifunctor                   (first)
+import           Data.ByteString                  (ByteString)
+import qualified Data.ByteString.Char8            as BS8
+import qualified Data.Char                        as Char
+import           Data.Proxy                       (Proxy(..))
+import           Data.Text                        (Text)
+import qualified Data.Text                        as Txt
+import qualified Data.Text.Encoding               as TxtEnc
+import qualified Network.HTTP.Types               as Http
 import           Servant
-    ( Capture
+    ( AuthProtect
+    , Capture
     , Delete
     , ErrorFormatters(..)
+    , FromHttpApiData(..)
     , Get
+    , Header
+    , Headers
+    , IsSecure
     , JSON
     , NoContent
     , Post
@@ -45,12 +60,13 @@ import           Servant
     , QueryParam
     , ReqBody
     , ServerError(..)
-    , StdMethod(DELETE)
+    , StdMethod(DELETE, POST)
     , Verb
     , defaultErrorFormatters
     , type (:<|>)
     , type (:>)
     )
+import           Servant.Server.Experimental.Auth (AuthServerData)
 import           TamaTsuzura.Common.Api
     ( ApiError(..)
     , ApiErrorCode(..)
@@ -74,6 +90,11 @@ import           TamaTsuzura.Common.Api
     , parseDocumentStatusFilter
     , validationErrorToApiError
     )
+import           TamaTsuzura.Common.Auth
+    ( AuthSessionResponse
+    , LoginRequest
+    , RegisterRequest
+    )
 import           TamaTsuzura.Common.Document
     ( Document
     , DocumentId
@@ -83,26 +104,97 @@ import           TamaTsuzura.Common.Document
     , mkFolderPath
     , mkTag
     )
-import           TamaTsuzura.Common.Validation (maxListLimit, minListLimit)
-import           Text.Read                     (readMaybe)
+import           TamaTsuzura.Common.Validation    (maxListLimit, minListLimit)
+import           TamaTsuzura.Server.Storage.Auth  (AuthenticatedSession)
+import           Text.Read                        (readMaybe)
+
+-- | Servant 'AuthProtect' 用の独自認証方式タグ。
+-- 型レベル文字列 (@Symbol@) を直接タグに用いると 'AuthServerData' が孤立型族インスタンス
+-- (@-Worphans@) となるため、本モジュール固有の昇格データ型を用いる。
+data AuthScheme
+    = CookieSession
+      -- ^ 読み取り専用エンドポイント向け Cookie セッション認証
+    | CookieSessionCsrf
+      -- ^ 状態変更エンドポイント向け Cookie セッション＋CSRF トークン認証
+
+-- | 読み取り専用エンドポイント向け Cookie セッション認証タグ。
+type SessionAuth = AuthProtect 'CookieSession
+
+-- | 状態変更エンドポイント向け Cookie セッション＋CSRF トークン認証タグ。
+type SessionCsrfAuth = AuthProtect 'CookieSessionCsrf
+
+-- | 読み取り専用認証 ('SessionAuth') を通過したセッションコンテキスト。
+-- 'CsrfVerifiedSession' と別型に分離することで、Servant の 'Context' 解決を一意にしつつ
+-- 状態変更ハンドラでの CSRF 検証漏れをコンパイル時に防止する。
+newtype SessionAuthContext = SessionAuthContext
+    { authenticated :: AuthenticatedSession
+      -- ^ SQLite で検証済みのセッションおよび所有ユーザープロフィール
+    } deriving (Eq, Show)
+
+-- | Cookie セッション認証および @X-CSRF-Token@ 照合 ('SessionCsrfAuth') を通過したセッションコンテキスト。
+-- すべての状態変更エンドポイントハンドラは本型を引数に要求することで CSRF 検証を型レベルで強制する。
+newtype CsrfVerifiedSession = CsrfVerifiedSession
+    { authenticated :: AuthenticatedSession
+      -- ^ SQLite で検証済みかつ CSRF 照合済みのセッションおよび所有ユーザープロフィール
+    } deriving (Eq, Show)
+
+type instance AuthServerData SessionAuth     = SessionAuthContext
+type instance AuthServerData SessionCsrfAuth = CsrfVerifiedSession
+
+-- | @Cookie@ ヘッダを UTF-8 検証で 400 にせず生のバイト列のまま受け取るための薄いラッパ。
+-- 同一オリジン上の無関係な第三者 Cookie に非 UTF-8 値が含まれていても、ログイン・新規登録が
+-- 誤って 400 Bad Request にならないようにするために用いる。
+newtype RawCookieHeader = RawCookieHeader
+    { unWrap :: ByteString
+      -- ^ 生の @Cookie@ ヘッダ値バイト列
+    } deriving (Eq, Show)
+
+instance FromHttpApiData RawCookieHeader where
+    parseUrlPiece = Right . RawCookieHeader . TxtEnc.encodeUtf8
+    parseHeader   = Right . RawCookieHeader
 
 -- | TamaTsuzura REST API 全体の Servant 型定義。
--- @docs/api/openapi.yaml@ の全エンドポイント・HTTP メソッド・ステータスコードと 1 対 1 に対応する。
+-- @docs/api/openapi.yaml@ の全エンドポイント・HTTP メソッド・ステータスコード・認証要件と 1 対 1 に対応する。
 type TamaTsuzuraApi
     = "api"
         :> (    "health"
                   :> Get '[JSON] HealthStatus
+           :<|> "auth"
+                  :> AuthApi
            :<|> "documents"
                   :> DocumentsApi
            :<|> "tags"
+                  :> SessionAuth
                   :> Get '[JSON] TagListResponse
            :<|> "folders"
+                  :> SessionAuth
                   :> Get '[JSON] FolderListResponse
            )
 
+-- | 認証・セッション管理 (@/api/auth/...@) の Servant 型定義。
+type AuthApi
+    =      "register"
+        :> IsSecure
+        :> Header "Cookie" RawCookieHeader
+        :> ReqBody '[JSON] RegisterRequest
+        :> PostCreated '[JSON] (Headers '[Header "Set-Cookie" Text] AuthSessionResponse)
+      :<|> "login"
+        :> IsSecure
+        :> Header "Cookie" RawCookieHeader
+        :> ReqBody '[JSON] LoginRequest
+        :> Post '[JSON] (Headers '[Header "Set-Cookie" Text] AuthSessionResponse)
+      :<|> "logout"
+        :> SessionCsrfAuth
+        :> IsSecure
+        :> Verb 'POST 204 '[JSON] (Headers '[Header "Set-Cookie" Text] NoContent)
+      :<|> "me"
+        :> SessionAuth
+        :> Get '[JSON] AuthSessionResponse
+
 -- | 文書コレクション配下 (@/api/documents...@) の Servant 型定義。
 type DocumentsApi
-    =      QueryParam "status" Text
+    =      SessionAuth
+        :> QueryParam "status" Text
         :> QueryParam "tag" Text
         :> QueryParam "folder" Text
         :> QueryParam "include_subfolders" Text
@@ -110,20 +202,26 @@ type DocumentsApi
         :> QueryParam "limit" Text
         :> QueryParam "offset" Text
         :> Get '[JSON] DocumentListResponse
-      :<|> ReqBody '[JSON] CreateDocumentRequest
+      :<|> SessionCsrfAuth
+        :> ReqBody '[JSON] CreateDocumentRequest
         :> PostCreated '[JSON] Document
       :<|> Capture "id" Text
         :> DocumentByIdApi
 
 -- | 単一文書リソース (@/api/documents/{id}...@) の Servant 型定義。
 type DocumentByIdApi
-    =      Get '[JSON] Document
-      :<|> ReqBody '[JSON] UpdateDocumentRequest
+    =      SessionAuth
+        :> Get '[JSON] Document
+      :<|> SessionCsrfAuth
+        :> ReqBody '[JSON] UpdateDocumentRequest
         :> Put '[JSON] Document
-      :<|> Delete '[JSON] Document
+      :<|> SessionCsrfAuth
+        :> Delete '[JSON] Document
       :<|> "restore"
+        :> SessionCsrfAuth
         :> Post '[JSON] Document
       :<|> "permanent"
+        :> SessionCsrfAuth
         :> Verb 'DELETE 204 '[JSON] NoContent
 
 -- | Servant のルーティング解決に用いる API プロキシ。

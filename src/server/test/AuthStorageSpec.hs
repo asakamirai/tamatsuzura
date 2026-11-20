@@ -71,6 +71,7 @@ import           TamaTsuzura.Server.Storage.Auth
     , sessionTtlSecondsValue
     , touchSessionAt
     )
+import           TamaTsuzura.Server.Storage.Schema (currentSchemaVersion)
 import           Test.Hspec                        (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 authStorageSpec :: Spec
@@ -322,7 +323,7 @@ authStorageSpec = describe "SQLite user and session persistence" $ do
                 eNonCanon <- withStorage cfg2 (`getUserById` uid)
                 eNonCanon `shouldSatisfy` isCorruptedData
 
-    it "rejects legacy schema v1 databases with UnsupportedSchemaVersion" $
+    it "rejects legacy schema v1 and v2 databases with UnsupportedSchemaVersion" $ do
         withTempDbPath "legacy-v1.sqlite3" $ \ dbPath -> do
             -- sqlite-simple の withConnection には OsPath 版がないためテスト準備時のみ String へ変換する
             dbStr <- OS.decodeFS dbPath
@@ -330,7 +331,14 @@ authStorageSpec = describe "SQLite user and session persistence" $ do
                 SQLite.execute_ conn "PRAGMA user_version = 1"
             anyUid <- mustRight (mkUserId "any")
             eRes <- withStorage (defaultStorageConfig dbPath) (`getUserById` anyUid)
-            eRes `shouldBe` Left (UnsupportedSchemaVersion 1 2)
+            eRes `shouldBe` Left (UnsupportedSchemaVersion 1 currentSchemaVersion)
+        withTempDbPath "legacy-v2.sqlite3" $ \ dbPath -> do
+            dbStr <- OS.decodeFS dbPath
+            SQLite.withConnection dbStr $ \ conn ->
+                SQLite.execute_ conn "PRAGMA user_version = 2"
+            anyUid <- mustRight (mkUserId "any")
+            eRes <- withStorage (defaultStorageConfig dbPath) (`getUserById` anyUid)
+            eRes `shouldBe` Left (UnsupportedSchemaVersion 2 currentSchemaVersion)
 
     it "rejects invalid session expiry timestamps on createSessionWith and touchSessionAt" $
         withInMemory $ \ storage -> do
