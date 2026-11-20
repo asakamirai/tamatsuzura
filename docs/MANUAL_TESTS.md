@@ -118,6 +118,37 @@
 
 ---
 
+### MT-3: Miso/Wasm クライアントのブラウザ起動と M1 REST API 疎通確認
+
+**確認したいこと**: `scripts/build-wasm.sh` で生成した `dist/web/` の Wasm バンドルがモダンブラウザ（スマートフォン幅および PC 幅）で正常に起動し、Warp 開発サーバ経由で M1 REST API（ヘルスチェック・文書一覧取得・新規メモ作成）と疎通できること。
+
+**手順**:
+1. リポジトリルートでネイティブおよび Wasm バンドルをビルドする（Docker 経由で実行する場合は `USE_DOCKER=1` を付与）:
+   ```bash
+   scripts/build.sh
+   ```
+   - 確認項目: `dist/web/` 配下に `index.html`, `index.js`, `wasi-shim.js`, `ghc_wasm_jsffi.js`, `styles.css`, `tamatsuzura-client.wasm` の 6 ファイルが生成され、Wasm インポート検証ログが表示されること。
+2. 一時 SQLite DB を指定して開発用 Warp サーバを起動する（`dist/web/index.html` が存在するため静的アセット配信が自動で有効になる。Docker 経由で実行する場合は `USE_DOCKER=1` を付与）:
+   ```bash
+   TAMATSUZURA_DB_PATH=./tmp-mt3.sqlite3 PORT=18080 scripts/run-server.sh
+   ```
+   - 確認項目: 標準出力に `Serving static client assets from dist/web` と表示されること。
+3. ブラウザ（Chromium 系または Firefox）で `http://127.0.0.1:18080/` を開き、開発者ツールでモバイル表示（例: 幅 390px）も確認する。
+   - 確認項目: 「TamaTsuzura を起動しています...」の表示から Miso 画面へ切り替わり、ヘッダに **TamaTsuzura** および緑色のバッジ **サーバ接続済み** が表示されること。
+   - 確認項目: ブラウザコンソールに未捕捉のエラー（WASI / JSFFI LinkError や 404）が出ないこと。
+   - 確認項目: 文書一覧セクションに **0件** および「文書はまだありません。「新規メモ作成」から最初のメモを作成できます。」が表示され、読み込み済み拡張機能セクションに **行末空白の除去** が表示されること。
+4. **新規メモ作成** ボタンを押す。
+   - 確認項目: ボタンが一時的に **作成中...** に切り替わった後、文書一覧が **1件** になり、タイトル **無題**・形式 **Markdown** の行が追加され、「最後に作成した文書」カードに作成された文書 ID が表示されること。
+5. ブラウザを再読み込み (F5) し、さらに **再読込** ボタンを押す。
+   - 確認項目: 再読み込み後も **サーバ接続済み** となり、手順 4 で作成した文書（**1件** / **無題**）が SQLite から復元表示されること。
+6. Warp サーバを停止した状態で **再読込** ボタンを押す。
+   - 確認項目: 接続バッジが赤色の **接続エラー** に変わり、「サーバへ接続できませんでした (...)」を含むエラーバナーと **閉じる** ボタンが表示されること。**閉じる** を押すとバナーが消えること。
+7. 検証終了後、一時 DB ファイル (`./tmp-mt3.sqlite3`, `./tmp-mt3.sqlite3-wal`, `./tmp-mt3.sqlite3-shm`) を削除する。
+
+**再実施が必要になる変更**: `src/client/src-core/TamaTsuzura/Client/{Ffi,Api,App,View,I18n}.hs`、`src/client/app/Main.hs`、`src/client/web/*`、`scripts/build-wasm.sh`、`TamaTsuzura.Server.Static` の変更時。
+
+---
+
 ## 実施記録
 
 | 日付 | 項目番号 | 対象コミット / バージョン | 実施者 | 結果 | 備考 |

@@ -118,6 +118,7 @@ configSpec = describe "Server configuration and CGI path normalization" $ do
                 { rawPort          = Just "9090"
                 , rawDbPath        = Just "tmp/app.sqlite3"
                 , rawBusyTimeoutMs = Just "2500"
+                , rawStaticDir     = Nothing
                 }
         parseWarpArgs ["--port", "8080", "--port", "9090"] `shouldSatisfy` isLeft
         parseWarpArgs ["--db-path"] `shouldSatisfy` isLeft

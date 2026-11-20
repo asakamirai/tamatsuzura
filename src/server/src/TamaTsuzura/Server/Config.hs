@@ -15,6 +15,7 @@ module TamaTsuzura.Server.Config
     , envDbBusyTimeoutMs
     , envPort
     , envScriptName
+    , envStaticDir
     , defaultDbRelativePath
       -- * Warp / CGI ランタイム設定
     , RawWarpOptions(..)
@@ -87,6 +88,10 @@ envPort = "PORT"
 envScriptName :: String
 envScriptName = "SCRIPT_NAME"
 
+-- | Warp 開発サーバの静的アセット配信ディレクトリを指定する環境変数名。
+envStaticDir :: String
+envStaticDir = "TAMATSUZURA_STATIC_DIR"
+
 -- | @TAMATSUZURA_DB_PATH@ および @--db-path@ がともに未指定のときに使用する既定の相対 DB パス。
 defaultDbRelativePath :: String
 defaultDbRelativePath = "data/tamatsuzura.sqlite3"
@@ -99,6 +104,8 @@ data RawWarpOptions = RawWarpOptions
       -- ^ @--db-path@ 引数の生文字列
     , rawBusyTimeoutMs :: !(Maybe String)
       -- ^ @--busy-timeout-ms@ 引数の生文字列
+    , rawStaticDir     :: !(Maybe String)
+      -- ^ @--static-dir@ 引数の生文字列
     } deriving (Eq, Show)
 
 -- | 全項目未指定の 'RawWarpOptions'。
@@ -107,14 +114,17 @@ emptyRawWarpOptions = RawWarpOptions
     { rawPort          = Nothing
     , rawDbPath        = Nothing
     , rawBusyTimeoutMs = Nothing
+    , rawStaticDir     = Nothing
     }
 
 -- | Warp スタンドアロンサーバの検証済み起動設定。
 data WarpConfig = WarpConfig
-    { port    :: !ServerPort
+    { port      :: !ServerPort
       -- ^ 待受ポート番号
-    , storage :: !StorageConfig
+    , storage   :: !StorageConfig
       -- ^ SQLite ストレージ設定
+    , staticDir :: !(Maybe OS.OsPath)
+      -- ^ 静的アセット配信ルートディレクトリ (未指定時は API 専用)
     } deriving (Eq, Show)
 
 -- | CGI エントリポイントの検証済み実行設定。
@@ -138,7 +148,7 @@ parseWarpArgs :: [String] -> Either Text RawWarpOptions
 parseWarpArgs = go emptyRawWarpOptions
   where
     usageMsg :: Text
-    usageMsg = "Usage: tamatsuzura-server [--port PORT] [--db-path PATH] [--busy-timeout-ms MS]"
+    usageMsg = "Usage: tamatsuzura-server [--port PORT] [--db-path PATH] [--busy-timeout-ms MS] [--static-dir DIR]"
 
     go :: RawWarpOptions -> [String] -> Either Text RawWarpOptions
     go opts [] = Right opts
@@ -154,6 +164,10 @@ parseWarpArgs = go emptyRawWarpOptions
         case opts.rawBusyTimeoutMs of
             Just _  -> Left "Duplicate option: --busy-timeout-ms"
             Nothing -> go opts { rawBusyTimeoutMs = Just val } rest
+    go opts ("--static-dir" : val : rest) =
+        case opts.rawStaticDir of
+            Just _  -> Left "Duplicate option: --static-dir"
+            Nothing -> go opts { rawStaticDir = Just val } rest
     go _ _ = Left usageMsg
 
 -- | 生の DB パス文字列と @busy_timeout@ 文字列から 'StorageConfig' を構築する。
@@ -206,13 +220,38 @@ resolveWarpConfig args envList =
 
                         mTimeout :: Maybe String
                         mTimeout = firstJust rawOpts.rawBusyTimeoutMs (lookup envDbBusyTimeoutMs envList)
+
+                        mStaticDir :: Maybe String
+                        mStaticDir = firstJust rawOpts.rawStaticDir (lookup envStaticDir envList)
                     eStorage <- resolveStorageConfig mDbPath mTimeout
-                    pure $ fmap (\ storageCfg -> WarpConfig { port = port, storage = storageCfg }) eStorage
+                    case eStorage of
+                        Left err         -> pure (Left err)
+                        Right storageCfg -> do
+                            eStatic <- resolveStaticDir mStaticDir
+                            pure $ fmap
+                                (\ mDir -> WarpConfig
+                                    { port      = port
+                                    , storage   = storageCfg
+                                    , staticDir = mDir
+                                    }
+                                )
+                                eStatic
   where
     resolvePort :: Maybe String -> Maybe String -> Either Text ServerPort
     resolvePort mCli mEnv = case firstJust mCli mEnv of
         Nothing  -> Right defaultServerPort
         Just raw -> parsePortString raw
+
+    resolveStaticDir :: Maybe String -> IO (Either Text (Maybe OS.OsPath))
+    resolveStaticDir Nothing = pure (Right Nothing)
+    resolveStaticDir (Just raw)
+        | Txt.null (Txt.strip (Txt.pack raw)) = pure (Left "Static directory path must not be empty")
+        | otherwise = do
+            -- 環境変数・CLI 引数は base が String で返すため、境界で OsPath へエンコードする
+            eOsPath <- try (OS.encodeFS raw) :: IO (Either IOException OS.OsPath)
+            pure $ case eOsPath of
+                Left ioErr   -> Left ("Invalid static directory path: " <> Txt.pack (show ioErr))
+                Right osPath -> Right (Just osPath)
 
 -- | CGI 環境変数一覧から CGI 実行設定を解決する。
 resolveCgiConfig :: [(String, String)] -> IO (Either Text CgiConfig)

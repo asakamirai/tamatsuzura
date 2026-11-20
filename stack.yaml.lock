@@ -3,7 +3,14 @@
 # For more information, please see the documentation at:
 #   https://docs.haskellstack.org/en/stable/topics/lock_files
 
-packages: []
+packages:
+- completed:
+    hackage: miso-1.15.0.0@sha256:da1bca7040017ac20b518e908719fd135904a1c32c77823c1089c2567ea62314,8854
+    pantry-tree:
+      sha256: 5b0a909e3c1308c106fb3cbe1c4e00e5f73c3bf509b7afbb9754a31cda25eede
+      size: 11033
+  original:
+    hackage: miso-1.15.0.0
 snapshots:
 - completed:
     sha256: 41f9239dc333bda1509499cc8449dd196a10b2c78cb0a0ceed63a0eedb2bea2c

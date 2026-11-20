@@ -8,7 +8,21 @@ USE_DOCKER="${USE_DOCKER:-0}"
 cd "${ROOT_DIR}"
 
 PORT="${PORT:-8080}"
+
+# Automatically serve dist/web when a built Wasm bundle exists and TAMATSUZURA_STATIC_DIR was not explicitly set.
+# Passing TAMATSUZURA_STATIC_DIR="" explicitly disables static serving.
+if [ -z "${TAMATSUZURA_STATIC_DIR+x}" ]; then
+  if [ -f "dist/web/index.html" ]; then
+    export TAMATSUZURA_STATIC_DIR="dist/web"
+  fi
+elif [ -z "${TAMATSUZURA_STATIC_DIR}" ]; then
+  unset TAMATSUZURA_STATIC_DIR
+fi
+
 echo "Starting TamaTsuzura development server on port ${PORT}..."
+if [ -n "${TAMATSUZURA_STATIC_DIR:-}" ]; then
+  echo "Serving static client assets from ${TAMATSUZURA_STATIC_DIR}"
+fi
 
 run_in_docker() {
   if command -v docker >/dev/null 2>&1 && [ -f "docker/docker-compose.yml" ]; then
@@ -18,6 +32,9 @@ run_in_docker() {
     fi
     if [ -n "${TAMATSUZURA_DB_BUSY_TIMEOUT_MS+x}" ]; then
       docker_env_args+=(-e "TAMATSUZURA_DB_BUSY_TIMEOUT_MS=${TAMATSUZURA_DB_BUSY_TIMEOUT_MS}")
+    fi
+    if [ -n "${TAMATSUZURA_STATIC_DIR+x}" ]; then
+      docker_env_args+=(-e "TAMATSUZURA_STATIC_DIR=${TAMATSUZURA_STATIC_DIR}")
     fi
     PORT="${PORT}" docker compose -f docker/docker-compose.yml run --rm --service-ports "${docker_env_args[@]}" dev "$@"
   else

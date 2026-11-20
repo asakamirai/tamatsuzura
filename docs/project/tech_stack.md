@@ -24,4 +24,4 @@
 
 - `scripts/` 配下のラッパースクリプト (`scripts/check.sh` 等) を統一窓口とし、ホスト側からは単一コマンドでビルド・テスト・Lint を完結できるようにします。
 - ホストに `stack` / `hlint` 等のツールが導入されている環境ではホスト側ツールを優先して高速かつ Antigravity 標準サンドボックス内で実行し、未導入環境やクリーンな再現性検証時 (`USE_DOCKER=1`) には Docker コンテナへフォールバックします。
-- Wasm クライアントのビルドツールチェーン（`ghc-wasm-meta` `FLAVOUR=9.10` / `wasm32-wasi-cabal`）は Docker 開発イメージ（`docker/Dockerfile`）に標準組み込み済みであり、`scripts/build-wasm.sh`（および `scripts/build.sh` / `scripts/check.sh`）から統一的に実行できます。
+- Wasm クライアントのビルドツールチェーン（`ghc-wasm-meta` `FLAVOUR=9.12` / `wasm32-wasi-cabal`、Miso 1.15 の Wasm JSFFI 要件に適合）は Docker 開発イメージ（`docker/Dockerfile`）に標準組み込み済みであり、`scripts/build-wasm.sh`（および `scripts/build.sh` / `scripts/check.sh`）から統一的に実行できます。

@@ -1,7 +1,6 @@
 FROM ubuntu:22.04
 
 ARG HLINT_VERSION=3.8
-ARG GHC_WASM_FLAVOUR=9.10
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
@@ -56,7 +55,8 @@ RUN ARCH="$(uname -m)" \
     && hlint --version \
     && printf 'module Main where\nmain :: IO ()\nmain = putStrLn "ok"\n' | hlint -
 
-# Install GHC WebAssembly backend (ghc-wasm-meta) and expose a non-interactive exec helper
+# Install GHC WebAssembly backend (ghc-wasm-meta; GHC 9.12 required by Miso 1.9+ Wasm JSFFI / MultilineStrings)
+ARG GHC_WASM_FLAVOUR=9.12
 RUN export FLAVOUR="${GHC_WASM_FLAVOUR}" \
     && curl --proto '=https' --tlsv1.2 -fsSL https://gitlab.haskell.org/haskell-wasm/ghc-wasm-meta/-/raw/master/bootstrap.sh | sh \
     && printf '#!/bin/sh\nset -eu\n. /root/.ghc-wasm/env\nexec "$@"\n' > /usr/local/bin/ghc-wasm-exec \

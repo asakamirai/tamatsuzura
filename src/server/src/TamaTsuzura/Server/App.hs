@@ -7,6 +7,7 @@ module TamaTsuzura.Server.App
     ( -- * WAI アプリケーション構築
       maxRawRequestBodyBytes
     , mkApplication
+    , mkWarpApplication
     , mkCgiApplication
     , configErrorApplication
     , normalizeCgiRequest
@@ -42,6 +43,7 @@ import           Servant
     )
 import qualified Servant
 import qualified System.IO                        as Sys
+import           System.OsPath                    (OsPath)
 import           TamaTsuzura.Common.Api
     ( ApiError(..)
     , ApiErrorCode(..)
@@ -79,6 +81,7 @@ import           TamaTsuzura.Server.Config
     , parsePortArgs
     , serverPortValue
     )
+import           TamaTsuzura.Server.Static        (staticFilesMiddleware)
 import           TamaTsuzura.Server.Storage
     ( StorageConfig
     , StorageError(..)
@@ -108,6 +111,14 @@ mkApplication storageCfg =
             tamaTsuzuraApiProxy
             (apiErrorFormatters :. EmptyContext)
             (serverHandlers storageCfg)
+
+-- | Warp 開発・スタンドアロン運用向けの WAI アプリケーションを構築する。
+-- @staticDir@ が指定された場合、@/api/...@ 以外へのリクエストを静的アセット配信へ振り分ける。
+mkWarpApplication :: Maybe OsPath -> StorageConfig -> Wai.Application
+mkWarpApplication Nothing storageCfg =
+    mkApplication storageCfg
+mkWarpApplication (Just dir) storageCfg =
+    staticFilesMiddleware dir (mkApplication storageCfg)
 
 -- | CGI 環境 (@SCRIPT_NAME@ による @/api@ マウント差分の吸収を含む) 向けの
 -- WAI アプリケーションを構築する。

@@ -66,7 +66,7 @@ M0 にて確定した構成です（パッケージ間依存の詳細は [docs/p
 - `src/AGENTS.md`: `src/` 配下編集時に自動適用される実装ガードレール
 - `docs/`: 要件・計画・コーディング規約・API 仕様・手動検証手順・マイルストーン完了記録 (`docs/project/history/`)
 - `scripts/`: ビルド・テスト・Lint・Wasm ビルド・開発サーバ起動の共通ラッパースクリプト
-- `docker/`: 開発用 `Dockerfile`（Stack + HLint + GHC 9.10 Wasm + Node.js/pnpm）および `docker-compose.yml`
+- `docker/`: 開発用 `Dockerfile`（Stack + HLint + GHC 9.12 Wasm + Node.js/pnpm）および `docker-compose.yml`
 - `.agents/`: Antigravity カスタマイズ（`skills/`, `hooks.json`, `hooks/`）
 
 ---

@@ -24,6 +24,7 @@ library
     TamaTsuzura.Server.Api
     TamaTsuzura.Server.App
     TamaTsuzura.Server.Config
+    TamaTsuzura.Server.Static
     TamaTsuzura.Server.Storage
     TamaTsuzura.Server.Storage.Schema
     TamaTsuzura.Server.Storage.Types
@@ -72,6 +73,7 @@ test-suite tamatsuzura-server-test
   other-modules:
     ApiSpec
     IntegrationSpec
+    StaticSpec
     StorageSpec
   ghc-options:    -threaded -rtsopts -with-rtsopts=-N
   build-depends:

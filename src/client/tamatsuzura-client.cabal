@@ -23,11 +23,24 @@ library client-core
   import:          shared-options
   hs-source-dirs:  src-core
   exposed-modules:
+    TamaTsuzura.Client.Api
     TamaTsuzura.Client.App
+    TamaTsuzura.Client.Ffi
+    TamaTsuzura.Client.I18n
+    TamaTsuzura.Client.View
   build-depends:
-      base                      >= 4.18 && < 5
+      aeson                     >= 2.1  && < 2.3
+    , base                      >= 4.18 && < 5
+    , bytestring                >= 0.11 && < 0.13
+    , miso                      >= 1.15 && < 1.16
     , tamatsuzura-common
     , tamatsuzura-extension-api
+    , text                      >= 2.0  && < 2.2
+    , time                      >= 1.12 && < 1.15
+  if arch(wasm32)
+    default-extensions: JavaScriptFFI
+    cpp-options: -DWASM
+    build-depends: ghc-experimental >= 0.1 && < 9.1500
 
 -- 公開ライブラリはコアと結線層 (ExtensionRegistry) を束ねる。
 library
@@ -36,7 +49,11 @@ library
   exposed-modules:
     TamaTsuzura.Client.ExtensionRegistry
   reexported-modules:
-    TamaTsuzura.Client.App
+      TamaTsuzura.Client.Api
+    , TamaTsuzura.Client.App
+    , TamaTsuzura.Client.Ffi
+    , TamaTsuzura.Client.I18n
+    , TamaTsuzura.Client.View
   build-depends:
       base                      >= 4.18 && < 5
     , client-core
@@ -49,6 +66,7 @@ executable tamatsuzura-client
   main-is:        Main.hs
   build-depends:
       base               >= 4.18 && < 5
+    , miso               >= 1.15 && < 1.16
     , tamatsuzura-client
   if arch(wasm32)
     default-extensions: JavaScriptFFI
@@ -64,8 +82,14 @@ test-suite tamatsuzura-client-test
   hs-source-dirs: test
   main-is:        Spec.hs
   build-depends:
-      base                      >= 4.18 && < 5
+      aeson                     >= 2.1  && < 2.3
+    , base                      >= 4.18 && < 5
+    , bytestring                >= 0.11 && < 0.13
     , hspec                     >= 2.11 && < 2.12
+    , miso                      >= 1.15 && < 1.16
+    , QuickCheck                >= 2.14 && < 2.16
     , tamatsuzura-client
     , tamatsuzura-common
     , tamatsuzura-extension-api
+    , text                      >= 2.0  && < 2.2
+    , time                      >= 1.12 && < 1.15

@@ -4,6 +4,7 @@ module Main
 
 import           ApiSpec         (apiSpec)
 import           IntegrationSpec (integrationSpec)
+import           StaticSpec      (staticSpec)
 import           StorageSpec     (storageSpec)
 import           Test.Hspec      (Spec, hspec)
 
@@ -14,4 +15,5 @@ spec :: Spec
 spec = do
     storageSpec
     apiSpec
+    staticSpec
     integrationSpec
