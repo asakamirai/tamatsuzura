@@ -88,7 +88,8 @@ import           TamaTsuzura.Common.Document
 import           TamaTsuzura.Common.Text           (ToText(..))
 import           TamaTsuzura.Common.Validation     (ValidationError)
 import           TamaTsuzura.Server.Storage.Schema
-    ( asciiToLower
+    ( StorageHandle(..)
+    , asciiToLower
     , catchSqliteErrors
     , configureConnection
     , escapeLikePattern
@@ -114,16 +115,6 @@ import           TamaTsuzura.Server.Storage.Types
     , mkBusyTimeoutMs
     , storageErrorToApiError
     )
-
--- | 初期化済み SQLite 接続を内包する不透明なストレージハンドル。
--- 接続の詳細や生 SQL を呼び出し側へ露出せず、PRAGMA 設定・スキーマ初期化済みの状態だけを型で保証する。
---
--- __スレッド安全性に関する前提__: 1 つの 'StorageHandle' は排他機構を持たない単一の SQLite 接続に対応する。
--- 複数スレッドから同一ハンドルを同時に操作するとトランザクションが交錯するため、
--- Warp 常駐サーバでもリクエスト単位で 'withStorage' を呼び出すか、外部で直列化して利用すること。
-newtype StorageHandle = StorageHandle
-    { connection :: SQLite.Connection
-    }
 
 type DocumentRow = (Text, Text, Text, Text, Maybe Text, Text, Text, Maybe Text)
 

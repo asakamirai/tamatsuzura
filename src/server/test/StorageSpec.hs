@@ -38,6 +38,7 @@ import           TamaTsuzura.Common.Api
     , mkListOffset
     , mkSearchQuery
     )
+import           TamaTsuzura.Common.Auth           (mkUserId, mkUsername)
 import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentBody(..)
@@ -157,10 +158,19 @@ configAndUtilSpec = describe "Storage config and utilities" $ do
 
     it "maps StorageError to ApiError without leaking internal details" $ do
         docId <- mustRight (mkDocumentId "doc-1")
+        uid <- mustRight (mkUserId "user-1")
+        uname <- mustRight (mkUsername "alice")
         (storageErrorToApiError (DocumentNotFound docId)).code `shouldBe` ErrNotFound
         (storageErrorToApiError (DocumentInTrash docId)).code `shouldBe` ErrConflict
         (storageErrorToApiError (DocumentNotTrashed docId)).code `shouldBe` ErrConflict
         (storageErrorToApiError (DocumentIdAlreadyExists docId)).code `shouldBe` ErrConflict
+        let dupUserErr :: ApiError
+            dupUserErr = storageErrorToApiError (UsernameAlreadyExists uname)
+        dupUserErr.code `shouldBe` ErrConflict
+        dupUserErr.field `shouldBe` Just "username"
+        (storageErrorToApiError (UserIdAlreadyExists uid)).code `shouldBe` ErrConflict
+        (storageErrorToApiError (UserNotFound uid)).code `shouldBe` ErrNotFound
+        (storageErrorToApiError SessionNotFound).code `shouldBe` ErrUnauthorized
         (storageErrorToApiError (StorageValidationError (BodyTooLarge (maxDocumentBodyBytes + 1) maxDocumentBodyBytes))).code
             `shouldBe` ErrPayloadTooLarge
         let internalErr :: ApiError

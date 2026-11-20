@@ -253,6 +253,8 @@ jsonContentType = "application/json; charset=utf-8"
 -- | 'ApiErrorCode' を対応する HTTP ステータスコードへ写像する。
 apiErrorHttpStatus :: ApiErrorCode -> Http.Status
 apiErrorHttpStatus ErrValidation       = Http.status400
+apiErrorHttpStatus ErrUnauthorized     = Http.status401
+apiErrorHttpStatus ErrForbidden        = Http.status403
 apiErrorHttpStatus ErrNotFound         = Http.status404
 apiErrorHttpStatus ErrConflict         = Http.status409
 apiErrorHttpStatus ErrPayloadTooLarge  = Http.status413

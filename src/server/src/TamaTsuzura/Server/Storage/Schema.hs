@@ -4,8 +4,10 @@
 {-# LANGUAGE OverloadedStrings     #-}
 
 module TamaTsuzura.Server.Storage.Schema
-    ( -- * スキーマバージョンと初期化
-      currentSchemaVersion
+    ( -- * ストレージハンドル (内部共有)
+      StorageHandle(..)
+      -- * スキーマバージョンと初期化
+    , currentSchemaVersion
     , configureConnection
     , initializeSchema
     , inspectPragmas
@@ -42,9 +44,22 @@ import           TamaTsuzura.Server.Storage.Types
     , busyTimeoutMsValue
     )
 
+-- | 初期化済み SQLite 接続を内包するストレージハンドル。
+-- 公開モジュール ('TamaTsuzura.Server.Storage' 等) ではコンストラクタを隠蔽し、
+-- PRAGMA 設定・スキーマ初期化済みの状態だけを型で保証する。
+--
+-- __スレッド安全性に関する前提__: 1 つの 'StorageHandle' は排他機構を持たない単一の SQLite 接続に対応する。
+-- 複数スレッドから同一ハンドルを同時に操作するとトランザクションが交錯するため、
+-- Warp 常駐サーバでもリクエスト単位で 'withStorage' を呼び出すか、外部で直列化して利用すること。
+newtype StorageHandle = StorageHandle
+    { connection :: SQLite.Connection
+      -- ^ 初期化済み SQLite 接続
+    }
+
 -- | 本バイナリが期待・サポートする SQLite スキーマバージョン (@PRAGMA user_version@)。
+-- v2 で M3 認証向けの @users@ / @sessions@ テーブルおよび関連インデックスを追加した。
 currentSchemaVersion :: Int
-currentSchemaVersion = 1
+currentSchemaVersion = 2
 
 -- | 新規に開いた SQLite 接続へ CGI / Warp 運用で必須の PRAGMA 設定を適用する。
 -- ロック競合時に後続 PRAGMA 自体が即座に @SQLITE_BUSY@ とならないよう、
@@ -77,8 +92,8 @@ configureConnection cfg conn = catchSqliteErrors $ do
 -- 読み取り専用リクエストが不要な書き込みロックを取らないよう、まずトランザクション外で
 -- @PRAGMA user_version@ を確認する (ダブルチェックロッキング)。
 -- 未初期化 (@0@) の場合のみ @BEGIN IMMEDIATE@ トランザクションへ入り再確認した上で
--- テーブル・インデックスを作成する。本バイナリより新しいスキーマバージョンが設定されている場合は
--- データ破壊を防ぐため 'UnsupportedSchemaVersion' を返す。
+-- テーブル・インデックスを作成する。対応していないスキーマバージョン (@0@ および 'currentSchemaVersion' 以外)
+-- が設定されている場合はデータ不整合・破壊を防ぐため 'UnsupportedSchemaVersion' を返す。
 initializeSchema :: SQLite.Connection -> IO (Either StorageError ())
 initializeSchema conn = catchSqliteErrors $ do
     eVersion <- readSingleIntPragma conn "PRAGMA user_version"
@@ -241,9 +256,13 @@ applyInitialSchema :: SQLite.Connection -> IO ()
 applyInitialSchema conn = do
     SQLite.execute_ conn createDocumentsTableSql
     SQLite.execute_ conn createDocumentTagsTableSql
+    SQLite.execute_ conn createUsersTableSql
+    SQLite.execute_ conn createSessionsTableSql
     SQLite.execute_ conn createDeletedUpdatedIndexSql
     SQLite.execute_ conn createFolderIndexSql
     SQLite.execute_ conn createTagIndexSql
+    SQLite.execute_ conn createSessionsUserIndexSql
+    SQLite.execute_ conn createSessionsExpiresIndexSql
     SQLite.execute_ conn (SQLite.Query ("PRAGMA user_version = " <> Txt.pack (show currentSchemaVersion)))
 
 createDocumentsTableSql :: SQLite.Query
@@ -268,6 +287,29 @@ createDocumentTagsTableSql =
     \ FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE\
     \)"
 
+createUsersTableSql :: SQLite.Query
+createUsersTableSql =
+    "CREATE TABLE IF NOT EXISTS users (\
+    \ id TEXT PRIMARY KEY NOT NULL,\
+    \ username TEXT NOT NULL UNIQUE CHECK (username = lower(username) AND username = trim(username)),\
+    \ display_name TEXT,\
+    \ password_hash TEXT NOT NULL,\
+    \ created_at TEXT NOT NULL,\
+    \ updated_at TEXT NOT NULL\
+    \)"
+
+createSessionsTableSql :: SQLite.Query
+createSessionsTableSql =
+    "CREATE TABLE IF NOT EXISTS sessions (\
+    \ token_hash TEXT PRIMARY KEY NOT NULL,\
+    \ user_id TEXT NOT NULL,\
+    \ csrf_token TEXT NOT NULL,\
+    \ created_at TEXT NOT NULL,\
+    \ expires_at TEXT NOT NULL,\
+    \ last_accessed_at TEXT NOT NULL,\
+    \ FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE\
+    \)"
+
 createDeletedUpdatedIndexSql :: SQLite.Query
 createDeletedUpdatedIndexSql =
     "CREATE INDEX IF NOT EXISTS idx_documents_deleted_updated\
@@ -282,6 +324,16 @@ createTagIndexSql :: SQLite.Query
 createTagIndexSql =
     "CREATE INDEX IF NOT EXISTS idx_document_tags_tag\
     \ ON document_tags (tag, document_id)"
+
+createSessionsUserIndexSql :: SQLite.Query
+createSessionsUserIndexSql =
+    "CREATE INDEX IF NOT EXISTS idx_sessions_user_id\
+    \ ON sessions (user_id)"
+
+createSessionsExpiresIndexSql :: SQLite.Query
+createSessionsExpiresIndexSql =
+    "CREATE INDEX IF NOT EXISTS idx_sessions_expires_at\
+    \ ON sessions (expires_at)"
 
 readSingleIntPragma :: SQLite.Connection -> SQLite.Query -> IO (Either StorageError Int)
 readSingleIntPragma conn pragmaSql = do

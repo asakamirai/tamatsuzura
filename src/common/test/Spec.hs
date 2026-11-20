@@ -41,6 +41,27 @@ import           TamaTsuzura.Common.Api
     , validateUpdateDocumentRequest
     , validationErrorToApiError
     )
+import           TamaTsuzura.Common.Auth
+    ( AuthSessionResponse(..)
+    , CsrfToken
+    , DisplayName
+    , LoginRequest(..)
+    , Password
+    , RegisterRequest(..)
+    , UserId
+    , UserProfile(..)
+    , Username
+    , mkCsrfToken
+    , mkDisplayName
+    , mkPassword
+    , mkUserId
+    , mkUsername
+    , passwordByteLength
+    , passwordCharLength
+    , unsafePasswordText
+    , validateNewPassword
+    , validateRegisterRequest
+    )
 import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentBody(..)
@@ -78,16 +99,24 @@ import           TamaTsuzura.Common.Text       (ToText(..))
 import           TamaTsuzura.Common.Validation
     ( ValidationError(..)
     , defaultListLimit
+    , maxCsrfTokenLength
+    , maxDisplayNameLength
     , maxDocumentBodyBytes
     , maxDocumentIdLength
     , maxDocumentTitleLength
     , maxFolderDepth
     , maxFolderPathLength
     , maxListLimit
+    , maxPasswordBytes
     , maxSearchQueryLength
     , maxTagLength
     , maxTagsPerDocument
+    , maxUserIdLength
+    , maxUsernameLength
+    , minCsrfTokenLength
     , minListLimit
+    , minPasswordLength
+    , minUsernameLength
     , validationErrorField
     )
 import           Test.Hspec                    (Spec, describe, expectationFailure, hspec, it, shouldBe, shouldSatisfy)
@@ -128,6 +157,13 @@ genValidFolderSegments = do
     genSegment = do
         chars <- listOf1 (elements segAlphabet)
         pure (Txt.take 16 (Txt.pack chars))
+
+genValidUsernameText :: Gen Text
+genValidUsernameText = do
+    hd <- elements (['a' .. 'z'] <> ['A' .. 'Z'] <> ['0' .. '9'])
+    restLen <- chooseInt (minUsernameLength - 1, maxUsernameLength - 1)
+    rest <- vectorOf restLen (elements (['a' .. 'z'] <> ['A' .. 'Z'] <> ['0' .. '9'] <> ['_', '-']))
+    pure (Txt.pack (hd : rest))
 
 isStrictlyAscending :: Ord a => [a] -> Bool
 isStrictlyAscending []             = True
@@ -585,6 +621,20 @@ spec = do
                     , (SearchQueryContainsControlChar,          "q")
                     , (ListLimitOutOfRange 0 1 200,             "limit")
                     , (NegativeListOffset (-1),                 "offset")
+                    , (EmptyUserId,                             "user_id")
+                    , (UserIdTooLong 65 64,                     "user_id")
+                    , (InvalidUserIdChar "bad/uid",             "user_id")
+                    , (UsernameTooShort 2 3,                    "username")
+                    , (UsernameTooLong 33 32,                   "username")
+                    , (InvalidUsernameFormat "-bad",            "username")
+                    , (EmptyDisplayName,                        "display_name")
+                    , (DisplayNameTooLong 65 64,                "display_name")
+                    , (DisplayNameContainsControlChar,          "display_name")
+                    , (EmptyPassword,                           "password")
+                    , (PasswordTooShort 4 8,                    "password")
+                    , (PasswordTooLong 129 128,                 "password")
+                    , (PasswordContainsNullChar,                "password")
+                    , (InvalidCsrfToken,                        "csrf_token")
                     ]
             map (validationErrorField . fst) cases `shouldBe` map snd cases
 
@@ -594,3 +644,191 @@ spec = do
                 emptyInput = []
             mkTagSet emptyInput `shouldBe` Right emptyTagSet
             emptyDocumentBody `shouldBe` DocumentBody ""
+
+    describe "Authentication domain types and DTOs" $ do
+        it "validates UserId boundaries and JSON roundtrip" $ do
+            fmap toText (mkUserId "8f14e45f-ea9a-4f3b-8a6d-123456789abc")
+                `shouldBe` Right "8f14e45f-ea9a-4f3b-8a6d-123456789abc"
+            let maxUid :: Text
+                maxUid = Txt.replicate maxUserIdLength "u"
+            fmap toText (mkUserId maxUid) `shouldBe` Right maxUid
+            mkUserId "" `shouldBe` Left EmptyUserId
+            mkUserId (Txt.replicate (maxUserIdLength + 1) "u")
+                `shouldBe` Left (UserIdTooLong (maxUserIdLength + 1) maxUserIdLength)
+            mkUserId "user/1" `shouldBe` Left (InvalidUserIdChar "user/1")
+            (Aeson.decode "\"user/1\"" :: Maybe UserId) `shouldBe` Nothing
+
+        it "normalizes Username to lowercase ASCII and validates format boundaries" $ do
+            fmap toText (mkUsername "  Alice_01-dev  ") `shouldBe` Right "alice_01-dev"
+            mkUsername "ab" `shouldBe` Left (UsernameTooShort 2 minUsernameLength)
+            mkUsername (Txt.replicate (maxUsernameLength + 1) "a")
+                `shouldBe` Left (UsernameTooLong (maxUsernameLength + 1) maxUsernameLength)
+            mkUsername "_alice" `shouldBe` Left (InvalidUsernameFormat "_alice")
+            mkUsername "-alice" `shouldBe` Left (InvalidUsernameFormat "-alice")
+            mkUsername "alice.dev" `shouldBe` Left (InvalidUsernameFormat "alice.dev")
+            mkUsername "ありす" `shouldBe` Left (InvalidUsernameFormat "ありす")
+            mkUsername "alice\n01" `shouldBe` Left (InvalidUsernameFormat "alice\n01")
+            (Aeson.decode "\"_invalid\"" :: Maybe Username) `shouldBe` Nothing
+
+        it "satisfies Username normalization idempotency and JSON roundtrip property" $
+            forAll genValidUsernameText $ \ rawName ->
+                case mkUsername rawName of
+                    Left _      -> False
+                    Right uname ->
+                        mkUsername (toText uname) == Right uname
+                            && mkUsername (" " <> rawName <> " ") == Right uname
+                            && Aeson.decode (Aeson.encode uname) == Just uname
+
+        it "validates optional DisplayName with trimming, control-char rejection, and length limits" $ do
+            fmap toText (mkDisplayName "  アリス  ") `shouldBe` Right "アリス"
+            mkDisplayName "" `shouldBe` Left EmptyDisplayName
+            mkDisplayName "   " `shouldBe` Left EmptyDisplayName
+            mkDisplayName "line1\nline2" `shouldBe` Left DisplayNameContainsControlChar
+            let maxName :: Text
+                maxName = Txt.replicate maxDisplayNameLength "あ"
+            fmap toText (mkDisplayName maxName) `shouldBe` Right maxName
+            mkDisplayName (Txt.replicate (maxDisplayNameLength + 1) "あ")
+                `shouldBe` Left (DisplayNameTooLong (maxDisplayNameLength + 1) maxDisplayNameLength)
+            (Aeson.decode "\"\"" :: Maybe DisplayName) `shouldBe` Nothing
+
+        it "validates Password, redacts Show output, preserves whitespace, and enforces signup min length" $ do
+            mkPassword "" `shouldBe` Left EmptyPassword
+            mkPassword "abc\0defg" `shouldBe` Left PasswordContainsNullChar
+            mkPassword (Txt.replicate (maxPasswordBytes + 1) "a")
+                `shouldBe` Left (PasswordTooLong (maxPasswordBytes + 1) maxPasswordBytes)
+            let multibyteOver :: Text
+                multibyteOver = Txt.replicate ((maxPasswordBytes `div` 3) + 1) "あ"
+            mkPassword multibyteOver
+                `shouldBe` Left (PasswordTooLong (((maxPasswordBytes `div` 3) + 1) * 3) maxPasswordBytes)
+
+            -- ログイン用に 8 文字未満も mkPassword 自体は通しつつ、validateNewPassword で拒否する
+            case mkPassword " short " of
+                Left err -> expectationFailure ("Expected short password to construct for login, got: " <> show err)
+                Right pw -> do
+                    unsafePasswordText pw `shouldBe` " short "
+                    passwordCharLength pw `shouldBe` 7
+                    passwordByteLength pw `shouldBe` 7
+                    show pw `shouldBe` "<redacted>"
+                    validateNewPassword pw `shouldBe` Left (PasswordTooShort 7 minPasswordLength)
+
+            case mkPassword "correct-horse-battery" of
+                Left err -> expectationFailure ("Expected valid password, got: " <> show err)
+                Right pw -> do
+                    validateNewPassword pw `shouldBe` Right pw
+                    show pw `shouldBe` "<redacted>"
+                    Aeson.decode (Aeson.encode pw) `shouldBe` Just pw
+            -- 正当境界値: ちょうど 8 文字およびちょうど 128 UTF-8 バイト
+            case mkPassword (Txt.replicate minPasswordLength "p") of
+                Left err -> expectationFailure ("Expected 8-char password to succeed, got: " <> show err)
+                Right pw -> validateNewPassword pw `shouldBe` Right pw
+            case mkPassword (Txt.replicate maxPasswordBytes "a") of
+                Left err -> expectationFailure ("Expected 128-byte password to succeed, got: " <> show err)
+                Right pw -> do
+                    passwordByteLength pw `shouldBe` maxPasswordBytes
+                    validateNewPassword pw `shouldBe` Right pw
+            (Aeson.decode "\"\"" :: Maybe Password) `shouldBe` Nothing
+            (Aeson.decode "\"abc\\u0000def\"" :: Maybe Password) `shouldBe` Nothing
+
+        it "validates CsrfToken boundaries, URL-safe alphabet, and redacts Show" $ do
+            let minToken :: Text
+                minToken = Txt.replicate minCsrfTokenLength "A"
+                maxToken :: Text
+                maxToken = Txt.replicate maxCsrfTokenLength "z"
+            fmap toText (mkCsrfToken minToken) `shouldBe` Right minToken
+            fmap toText (mkCsrfToken maxToken) `shouldBe` Right maxToken
+            case (mkCsrfToken minToken, mkCsrfToken (Txt.replicate minCsrfTokenLength "B")) of
+                (Right tokA, Right tokB) -> do
+                    show tokA `shouldBe` "<CsrfToken>"
+                    (tokA == tokA) `shouldBe` True
+                    (tokA == tokB) `shouldBe` False
+                _ -> expectationFailure "Expected valid CsrfToken samples"
+            mkCsrfToken (Txt.replicate (minCsrfTokenLength - 1) "A") `shouldBe` Left InvalidCsrfToken
+            mkCsrfToken (Txt.replicate (maxCsrfTokenLength + 1) "A") `shouldBe` Left InvalidCsrfToken
+            mkCsrfToken (Txt.replicate minCsrfTokenLength "!") `shouldBe` Left InvalidCsrfToken
+            (Aeson.decode "\"too-short\"" :: Maybe CsrfToken) `shouldBe` Nothing
+
+        it "encodes and decodes UserProfile, RegisterRequest, LoginRequest, and AuthSessionResponse matching OpenAPI" $ do
+            case (mkUserId "user-1", mkUsername "Alice_01", mkDisplayName "アリス", mkPassword "password123", mkPassword "short77", mkCsrfToken (Txt.replicate 43 "a")) of
+                (Right uid, Right uname, Right dname, Right pw, Right shortPw, Right csrf) -> do
+                    let profile :: UserProfile
+                        profile = UserProfile
+                            { id          = uid
+                            , username    = uname
+                            , displayName = Just dname
+                            , createdAt   = sampleTime
+                            }
+                        profileNoDisplay :: UserProfile
+                        profileNoDisplay = UserProfile
+                            { id          = uid
+                            , username    = uname
+                            , displayName = Nothing
+                            , createdAt   = sampleTime
+                            }
+                        sessionRes :: AuthSessionResponse
+                        sessionRes = AuthSessionResponse
+                            { user      = profile
+                            , csrfToken = csrf
+                            }
+                        regReq :: RegisterRequest
+                        regReq = RegisterRequest
+                            { username    = uname
+                            , displayName = Just dname
+                            , password    = pw
+                            }
+                        shortRegReq :: RegisterRequest
+                        shortRegReq = RegisterRequest
+                            { username    = uname
+                            , displayName = Nothing
+                            , password    = shortPw
+                            }
+                        loginReq :: LoginRequest
+                        loginReq = LoginRequest
+                            { username = uname
+                            , password = pw
+                            }
+                    Aeson.toJSON profile `shouldBe` Aeson.object
+                        [ "id"           Aeson..= ("user-1" :: Text)
+                        , "username"     Aeson..= ("alice_01" :: Text)
+                        , "display_name" Aeson..= ("アリス" :: Text)
+                        , "created_at"   Aeson..= sampleTime
+                        ]
+                    Aeson.toJSON profileNoDisplay `shouldBe` Aeson.object
+                        [ "id"           Aeson..= ("user-1" :: Text)
+                        , "username"     Aeson..= ("alice_01" :: Text)
+                        , "display_name" Aeson..= Aeson.Null
+                        , "created_at"   Aeson..= sampleTime
+                        ]
+                    Aeson.toJSON sessionRes `shouldBe` Aeson.object
+                        [ "user"       Aeson..= profile
+                        , "csrf_token" Aeson..= toText csrf
+                        ]
+                    Aeson.decode (Aeson.encode profile) `shouldBe` Just profile
+                    Aeson.decode (Aeson.encode profileNoDisplay) `shouldBe` Just profileNoDisplay
+                    Aeson.decode (Aeson.encode sessionRes) `shouldBe` Just sessionRes
+                    Aeson.decode (Aeson.encode regReq) `shouldBe` Just regReq
+                    Aeson.decode (Aeson.encode loginReq) `shouldBe` Just loginReq
+                    validateRegisterRequest regReq `shouldBe` Right regReq
+                    validateRegisterRequest shortRegReq `shouldBe` Left (PasswordTooShort 7 minPasswordLength)
+
+                    -- UserProfile の必須 nullable キー display_name が欠落した JSON は拒否される
+                    let missingDisplayKey :: Aeson.Value
+                        missingDisplayKey = Aeson.object
+                            [ "id"         Aeson..= ("user-1" :: Text)
+                            , "username"   Aeson..= ("alice_01" :: Text)
+                            , "created_at" Aeson..= sampleTime
+                            ]
+                    (Aeson.decode (Aeson.encode missingDisplayKey) :: Maybe UserProfile) `shouldBe` Nothing
+
+                    -- display_name 省略・null は Nothing として解釈される
+                    let omittedDisplay :: Maybe RegisterRequest
+                        omittedDisplay = Aeson.decode "{\"username\":\"Alice_01\",\"password\":\"password123\"}"
+                        nullDisplay :: Maybe RegisterRequest
+                        nullDisplay = Aeson.decode "{\"username\":\"Alice_01\",\"display_name\":null,\"password\":\"password123\"}"
+                    fmap (\ r -> r.displayName) omittedDisplay `shouldBe` Just Nothing
+                    fmap (\ r -> r.displayName) nullDisplay `shouldBe` Just Nothing
+
+                    -- Show 出力に平文パスワードおよび生 CSRF トークンが含まれない
+                    Txt.isInfixOf "password123" (Txt.pack (show regReq)) `shouldBe` False
+                    Txt.isInfixOf "password123" (Txt.pack (show loginReq)) `shouldBe` False
+                    Txt.isInfixOf (toText csrf) (Txt.pack (show sessionRes)) `shouldBe` False
+                _ -> expectationFailure "Expected sample auth DTO components to construct successfully"

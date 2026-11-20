@@ -246,6 +246,8 @@ normalizeErrorResponseMiddleware app req respond =
 
     statusToFallbackApiError :: Http.Status -> ApiError
     statusToFallbackApiError status = case Http.statusCode status of
+        401 -> ApiError { code = ErrUnauthorized,     message = "Authentication required",                             field = Nothing }
+        403 -> ApiError { code = ErrForbidden,        message = "Forbidden",                                           field = Nothing }
         404 -> ApiError { code = ErrNotFound,         message = "Endpoint not found",                                  field = Nothing }
         405 -> ApiError { code = ErrMethodNotAllowed, message = "Method not allowed",                                  field = Nothing }
         406 -> ApiError { code = ErrValidation,       message = "Not acceptable (only application/json is supported)", field = Nothing }

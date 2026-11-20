@@ -13,6 +13,14 @@ module TamaTsuzura.Common.Validation
     , minListLimit
     , maxListLimit
     , defaultListLimit
+    , maxUserIdLength
+    , minUsernameLength
+    , maxUsernameLength
+    , maxDisplayNameLength
+    , minPasswordLength
+    , maxPasswordBytes
+    , minCsrfTokenLength
+    , maxCsrfTokenLength
       -- * バリデーションエラー型
     , ValidationError(..)
     , validationErrorField
@@ -67,6 +75,38 @@ maxListLimit = 200
 defaultListLimit :: Int
 defaultListLimit = 50
 
+-- | ユーザー ID の最大文字数 (UUIDv4 36 文字や将来のプレフィックス付き ID を収容する上限)。
+maxUserIdLength :: Int
+maxUserIdLength = 64
+
+-- | ユーザー名の最小文字数。
+minUsernameLength :: Int
+minUsernameLength = 3
+
+-- | ユーザー名の最大文字数。
+maxUsernameLength :: Int
+maxUsernameLength = 32
+
+-- | 任意の表示名の最大文字数。
+maxDisplayNameLength :: Int
+maxDisplayNameLength = 64
+
+-- | 新規登録時に要求するパスワードの最小文字数。
+minPasswordLength :: Int
+minPasswordLength = 8
+
+-- | パスワードの最大 UTF-8 バイト長 (Argon2id 計算による DoS を防ぐための上限)。
+maxPasswordBytes :: Int
+maxPasswordBytes = 128
+
+-- | CSRF トークンの最小文字数 (256 bit エントロピーの Base64URL 等を保証)。
+minCsrfTokenLength :: Int
+minCsrfTokenLength = 32
+
+-- | CSRF トークンの最大文字数。
+maxCsrfTokenLength :: Int
+maxCsrfTokenLength = 128
+
 -- | 共通ドメイン型および API 入力パラメータの検証失敗理由。
 -- 例外ではなく戻り値 ('Either') として扱うため、呼び出し側が機械的にエラー分類できる ADT として定義する。
 data ValidationError
@@ -110,6 +150,34 @@ data ValidationError
       -- ^ 一覧取得件数上限が許容範囲外である (実際値, 下限, 上限)
     | NegativeListOffset !Int
       -- ^ 一覧取得オフセットが負数である
+    | EmptyUserId
+      -- ^ ユーザー ID が空文字列である
+    | UserIdTooLong !Int !Int
+      -- ^ ユーザー ID が上限文字数を超えている (実際値, 上限)
+    | InvalidUserIdChar !Text
+      -- ^ ユーザー ID に URL セーフな ASCII 英数字・ハイフン・アンダースコア以外の文字が含まれている
+    | UsernameTooShort !Int !Int
+      -- ^ ユーザー名が下限文字数未満である (実際値, 下限)
+    | UsernameTooLong !Int !Int
+      -- ^ ユーザー名が上限文字数を超えている (実際値, 上限)
+    | InvalidUsernameFormat !Text
+      -- ^ ユーザー名が許可書式 (ASCII 英数字で始まり英数字・ハイフン・アンダースコアのみ) に違反している
+    | EmptyDisplayName
+      -- ^ 前後空白除去後の表示名が空である (未設定は 'Nothing' で表現する)
+    | DisplayNameTooLong !Int !Int
+      -- ^ 表示名が上限文字数を超えている (実際値, 上限)
+    | DisplayNameContainsControlChar
+      -- ^ 表示名に制御文字が含まれている
+    | EmptyPassword
+      -- ^ パスワードが空文字列である
+    | PasswordTooShort !Int !Int
+      -- ^ パスワードが下限文字数未満である (実際値, 下限)
+    | PasswordTooLong !Int !Int
+      -- ^ パスワードの UTF-8 バイト長が上限を超えている (実際値, 上限)
+    | PasswordContainsNullChar
+      -- ^ パスワードに NUL 文字が含まれている
+    | InvalidCsrfToken
+      -- ^ CSRF トークンの書式または長さが不正である
     deriving (Eq)
 
 instance ToText ValidationError where
@@ -153,6 +221,34 @@ instance ToText ValidationError where
         "List limit " <> showInt actual <> " is out of range (" <> showInt low <> ".." <> showInt high <> ")"
     toText (NegativeListOffset actual) =
         "List offset must be non-negative, got " <> showInt actual
+    toText EmptyUserId =
+        "User ID must not be empty"
+    toText (UserIdTooLong actual limit) =
+        "User ID length " <> showInt actual <> " exceeds maximum " <> showInt limit
+    toText (InvalidUserIdChar raw) =
+        "User ID contains invalid characters: " <> raw
+    toText (UsernameTooShort actual minLen) =
+        "Username length " <> showInt actual <> " is shorter than minimum " <> showInt minLen
+    toText (UsernameTooLong actual maxLen) =
+        "Username length " <> showInt actual <> " exceeds maximum " <> showInt maxLen
+    toText (InvalidUsernameFormat raw) =
+        "Invalid username format: " <> raw <> " (must start with ASCII letter/digit and use only ASCII letters, digits, '_', or '-')"
+    toText EmptyDisplayName =
+        "Display name must not be empty (use null when unset)"
+    toText (DisplayNameTooLong actual limit) =
+        "Display name length " <> showInt actual <> " exceeds maximum " <> showInt limit
+    toText DisplayNameContainsControlChar =
+        "Display name must not contain control characters"
+    toText EmptyPassword =
+        "Password must not be empty"
+    toText (PasswordTooShort actual minLen) =
+        "Password length " <> showInt actual <> " is shorter than minimum " <> showInt minLen
+    toText (PasswordTooLong actual maxBytes) =
+        "Password byte length " <> showInt actual <> " exceeds maximum " <> showInt maxBytes <> " bytes"
+    toText PasswordContainsNullChar =
+        "Password must not contain NUL characters"
+    toText InvalidCsrfToken =
+        "CSRF token is malformed"
 
 instance Show ValidationError where
     show = Txt.unpack . toText
@@ -182,6 +278,20 @@ validationErrorField SearchQueryTooLong{}           = "q"
 validationErrorField SearchQueryContainsControlChar = "q"
 validationErrorField ListLimitOutOfRange{}          = "limit"
 validationErrorField NegativeListOffset{}           = "offset"
+validationErrorField EmptyUserId                    = "user_id"
+validationErrorField UserIdTooLong{}                = "user_id"
+validationErrorField InvalidUserIdChar{}            = "user_id"
+validationErrorField UsernameTooShort{}             = "username"
+validationErrorField UsernameTooLong{}              = "username"
+validationErrorField InvalidUsernameFormat{}        = "username"
+validationErrorField EmptyDisplayName               = "display_name"
+validationErrorField DisplayNameTooLong{}           = "display_name"
+validationErrorField DisplayNameContainsControlChar = "display_name"
+validationErrorField EmptyPassword                  = "password"
+validationErrorField PasswordTooShort{}             = "password"
+validationErrorField PasswordTooLong{}              = "password"
+validationErrorField PasswordContainsNullChar       = "password"
+validationErrorField InvalidCsrfToken               = "csrf_token"
 
 showInt :: Int -> Text
 showInt = Txt.pack . show

@@ -3,6 +3,8 @@ module Main
     ) where
 
 import           ApiSpec         (apiSpec)
+import           AuthCryptoSpec  (authCryptoSpec)
+import           AuthStorageSpec (authStorageSpec)
 import           IntegrationSpec (integrationSpec)
 import           StaticSpec      (staticSpec)
 import           StorageSpec     (storageSpec)
@@ -14,6 +16,8 @@ main = hspec spec
 spec :: Spec
 spec = do
     storageSpec
+    authCryptoSpec
+    authStorageSpec
     apiSpec
     staticSpec
     integrationSpec

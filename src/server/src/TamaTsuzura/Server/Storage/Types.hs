@@ -30,6 +30,7 @@ import           TamaTsuzura.Common.Api
     , ApiErrorCode(..)
     , validationErrorToApiError
     )
+import           TamaTsuzura.Common.Auth       (UserId, Username)
 import           TamaTsuzura.Common.Document   (DocumentId)
 import           TamaTsuzura.Common.Text       (ToText(..))
 import           TamaTsuzura.Common.Validation (ValidationError)
@@ -128,6 +129,14 @@ data StorageError
       -- ^ 稼働中の文書に対して完全削除を試みた (HTTP 409 相当)
     | DocumentIdAlreadyExists !DocumentId
       -- ^ 既に存在する文書 ID での新規作成を試みた (HTTP 409 相当)
+    | UsernameAlreadyExists !Username
+      -- ^ 既に登録済みのユーザー名で新規登録を試みた (HTTP 409 相当)
+    | UserIdAlreadyExists !UserId
+      -- ^ 既に存在するユーザー ID での新規作成を試みた (HTTP 409 相当)
+    | UserNotFound !UserId
+      -- ^ 指定されたユーザーが存在しない (HTTP 404 相当)
+    | SessionNotFound
+      -- ^ 指定されたセッションが存在しない、または期限切れである (HTTP 401 相当)
     | StorageValidationError !ValidationError
       -- ^ 永続化境界で検出したドメイン制約違反 (本文サイズ上限超過など)
     | UnsupportedSchemaVersion !Int !Int
@@ -147,6 +156,14 @@ instance ToText StorageError where
         "Document must be moved to trash before permanent deletion: " <> toText docId
     toText (DocumentIdAlreadyExists docId) =
         "Document ID already exists: " <> toText docId
+    toText (UsernameAlreadyExists uname) =
+        "Username is already registered: " <> toText uname
+    toText (UserIdAlreadyExists uid) =
+        "User ID already exists: " <> toText uid
+    toText (UserNotFound uid) =
+        "User not found: " <> toText uid
+    toText SessionNotFound =
+        "Session not found or expired"
     toText (StorageValidationError err) =
         toText err
     toText (UnsupportedSchemaVersion actual supported) =
@@ -186,6 +203,26 @@ storageErrorToApiError err@DocumentNotTrashed{}      = ApiError
     }
 storageErrorToApiError err@DocumentIdAlreadyExists{} = ApiError
     { code    = ErrConflict
+    , message = toText err
+    , field   = Nothing
+    }
+storageErrorToApiError err@UsernameAlreadyExists{}   = ApiError
+    { code    = ErrConflict
+    , message = toText err
+    , field   = Just "username"
+    }
+storageErrorToApiError err@UserIdAlreadyExists{}     = ApiError
+    { code    = ErrConflict
+    , message = toText err
+    , field   = Nothing
+    }
+storageErrorToApiError err@UserNotFound{}            = ApiError
+    { code    = ErrNotFound
+    , message = toText err
+    , field   = Nothing
+    }
+storageErrorToApiError err@SessionNotFound           = ApiError
+    { code    = ErrUnauthorized
     , message = toText err
     , field   = Nothing
     }

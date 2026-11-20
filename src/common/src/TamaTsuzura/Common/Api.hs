@@ -448,10 +448,14 @@ instance FromJSON FolderListResponse where
 data ApiErrorCode
     = ErrValidation
       -- ^ リクエスト形式またはドメイン制約の検証エラー (HTTP 400)
+    | ErrUnauthorized
+      -- ^ 未認証、セッション期限切れ、または認証情報不一致 (HTTP 401)
+    | ErrForbidden
+      -- ^ 認可拒否、CSRF 検証失敗、または新規登録無効化などの操作禁止 (HTTP 403)
     | ErrNotFound
       -- ^ 対象リソースまたはエンドポイントが存在しない (HTTP 404)
     | ErrConflict
-      -- ^ リソース状態との競合 (ゴミ箱内文書の編集、稼働中文書の完全削除など、HTTP 409)
+      -- ^ リソース状態との競合 (ゴミ箱内文書の編集、稼働中文書の完全削除、ユーザー名重複など、HTTP 409)
     | ErrPayloadTooLarge
       -- ^ 本文またはリクエストサイズが上限を超過 (HTTP 413)
     | ErrMethodNotAllowed
@@ -462,6 +466,8 @@ data ApiErrorCode
 
 instance ToText ApiErrorCode where
     toText ErrValidation       = "validation_error"
+    toText ErrUnauthorized     = "unauthorized"
+    toText ErrForbidden        = "forbidden"
     toText ErrNotFound         = "not_found"
     toText ErrConflict         = "conflict"
     toText ErrPayloadTooLarge  = "payload_too_large"
@@ -482,6 +488,8 @@ instance FromJSON ApiErrorCode where
 -- | 文字列表現から 'ApiErrorCode' を復元する。
 parseApiErrorCode :: Text -> Either Text ApiErrorCode
 parseApiErrorCode "validation_error"   = Right ErrValidation
+parseApiErrorCode "unauthorized"       = Right ErrUnauthorized
+parseApiErrorCode "forbidden"          = Right ErrForbidden
 parseApiErrorCode "not_found"          = Right ErrNotFound
 parseApiErrorCode "conflict"           = Right ErrConflict
 parseApiErrorCode "payload_too_large"  = Right ErrPayloadTooLarge

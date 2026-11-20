@@ -2,16 +2,18 @@ openapi: 3.0.3
 info:
   title: TamaTsuzura API
   description: |
-    TamaTsuzura Web API specification (M1 Document CRUD, Trash / Restore, Tags & Folders).
+    TamaTsuzura Web API specification (M1 Document CRUD + M3 CGI-Compatible SQLite Cookie Authentication and User Isolation).
     Designed to run identically on both shared-hosting CGI (wai-extra) and standalone Warp servers.
-  version: 0.2.0
+  version: 0.3.0
 tags:
   - name: health
     description: Server health check
+  - name: auth
+    description: User registration, login, logout, and current session inspection
   - name: documents
-    description: Document CRUD, search/filtering, and soft-delete (trash) lifecycle
+    description: Document CRUD, search/filtering, and soft-delete (trash) lifecycle (scoped to authenticated owner)
   - name: metadata
-    description: Organization metadata listing (tags and folders)
+    description: Organization metadata listing (tags and folders scoped to authenticated owner)
 
 paths:
   /api/health:
@@ -28,15 +30,132 @@ paths:
               schema:
                 $ref: '#/components/schemas/HealthStatus'
 
+  /api/auth/register:
+    post:
+      tags:
+        - auth
+      summary: Register a new user account and start a session
+      description: |
+        Creates a new user account with a normalized lowercase ASCII username, optional display name, and Argon2id-hashed password.
+        On success, issues a persistent SQLite session stored in an `HttpOnly; SameSite=Lax; Path=/` cookie (`Secure` over HTTPS)
+        and returns the user profile alongside a session-bound `csrf_token`.
+      operationId: registerUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User registered and authenticated
+          headers:
+            Set-Cookie:
+              description: Session cookie (`tamatsuzura_session=<token>; HttpOnly; SameSite=Lax; Path=/`)
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSessionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/auth/login:
+    post:
+      tags:
+        - auth
+      summary: Authenticate an existing user and start a session
+      description: |
+        Verifies username and password against the stored Argon2id PHC hash, issues a new SQLite session cookie,
+        and returns the user profile alongside a session-bound `csrf_token`.
+      operationId: loginUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Authentication succeeded
+          headers:
+            Set-Cookie:
+              description: Session cookie (`tamatsuzura_session=<token>; HttpOnly; SameSite=Lax; Path=/`)
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSessionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/auth/logout:
+    post:
+      tags:
+        - auth
+      summary: Invalidate the current session and clear the session cookie
+      description: |
+        Deletes the active session row from SQLite and clears the `tamatsuzura_session` cookie (`Max-Age=0`).
+        Requires both a valid session cookie and matching `X-CSRF-Token` header.
+      operationId: logoutUser
+      security:
+        - SessionCookie: []
+          CsrfHeader: []
+      responses:
+        '204':
+          description: Session invalidated and cookie cleared
+          headers:
+            Set-Cookie:
+              description: Expired session cookie clearing `tamatsuzura_session`
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/auth/me:
+    get:
+      tags:
+        - auth
+      summary: Get the currently authenticated user profile and CSRF token
+      description: |
+        Inspects the `tamatsuzura_session` cookie against SQLite without acquiring a write lock.
+        Returns the authenticated user's profile and session-bound `csrf_token` for client state bootstrap.
+      operationId: getCurrentUser
+      security:
+        - SessionCookie: []
+      responses:
+        '200':
+          description: Active authenticated session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSessionResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
   /api/documents:
     get:
       tags:
         - documents
       summary: List documents (metadata summaries)
       description: |
-        Returns lightweight document summaries (excluding body) sorted by `updated_at` descending.
+        Returns lightweight document summaries (excluding body) owned by the authenticated user, sorted by `updated_at` descending.
         By default returns active (non-trashed) documents only.
       operationId: listDocuments
+      security:
+        - SessionCookie: []
       parameters:
         - name: status
           in: query
@@ -98,15 +217,20 @@ paths:
                 $ref: '#/components/schemas/DocumentListResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
     post:
       tags:
         - documents
       summary: Create a new document
       description: |
-        Creates a new document and returns the persisted entity.
+        Creates a new document owned by the authenticated user and returns the persisted entity.
         All request fields are optional so mobile clients can create a blank Markdown note immediately with `{}`.
       operationId: createDocument
+      security:
+        - SessionCookie: []
+          CsrfHeader: []
       requestBody:
         required: true
         content:
@@ -122,6 +246,10 @@ paths:
                 $ref: '#/components/schemas/Document'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
 
@@ -134,9 +262,12 @@ paths:
         - documents
       summary: Get a document by ID
       description: |
-        Returns the full document including body.
+        Returns the full document including body when owned by the authenticated user.
+        Accessing another user's document returns `404 Not Found` to avoid disclosing document existence.
         Trashed documents are also retrievable so users can preview them before restoring or permanently deleting.
       operationId: getDocument
+      security:
+        - SessionCookie: []
       responses:
         '200':
           description: Full document
@@ -146,6 +277,8 @@ paths:
                 $ref: '#/components/schemas/Document'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -154,9 +287,12 @@ paths:
         - documents
       summary: Replace/update an active document
       description: |
-        Replaces title, body, format, folder, and tags of an active document.
+        Replaces title, body, format, folder, and tags of an active document owned by the authenticated user.
         Returns `409 Conflict` if the document is currently in the trash (restore it before editing).
       operationId: updateDocument
+      security:
+        - SessionCookie: []
+          CsrfHeader: []
       requestBody:
         required: true
         content:
@@ -172,6 +308,10 @@ paths:
                 $ref: '#/components/schemas/Document'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -187,6 +327,9 @@ paths:
         Sets `deleted_at` to the current UTC timestamp and returns the trashed document.
         Idempotent: if the document is already in the trash, preserves the existing `deleted_at` and returns `200 OK`.
       operationId: softDeleteDocument
+      security:
+        - SessionCookie: []
+          CsrfHeader: []
       responses:
         '200':
           description: Document moved to trash
@@ -196,6 +339,10 @@ paths:
                 $ref: '#/components/schemas/Document'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -211,6 +358,9 @@ paths:
         Clears `deleted_at` (`null`) and returns the active document.
         Idempotent: if the document is already active, returns `200 OK`.
       operationId: restoreDocument
+      security:
+        - SessionCookie: []
+          CsrfHeader: []
       responses:
         '200':
           description: Document restored
@@ -220,6 +370,10 @@ paths:
                 $ref: '#/components/schemas/Document'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -236,11 +390,18 @@ paths:
         To prevent accidental data loss, the document must already be in the trash (`deleted_at != null`);
         attempting to permanently delete an active document returns `409 Conflict`.
       operationId: permanentDeleteDocument
+      security:
+        - SessionCookie: []
+          CsrfHeader: []
       responses:
         '204':
           description: Document permanently deleted
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -250,31 +411,53 @@ paths:
     get:
       tags:
         - metadata
-      summary: List distinct tags across active documents
+      summary: List distinct tags across the authenticated user's active documents
       operationId: listTags
+      security:
+        - SessionCookie: []
       responses:
         '200':
-          description: Sorted list of distinct tags used by active documents
+          description: Sorted list of distinct tags used by the authenticated user's active documents
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TagListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
   /api/folders:
     get:
       tags:
         - metadata
-      summary: List distinct folders across active documents
+      summary: List distinct folders across the authenticated user's active documents
       operationId: listFolders
+      security:
+        - SessionCookie: []
       responses:
         '200':
-          description: Sorted list of distinct folder paths used by active documents
+          description: Sorted list of distinct folder paths used by the authenticated user's active documents
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/FolderListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
 components:
+  securitySchemes:
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: tamatsuzura_session
+      description: |
+        HttpOnly, SameSite=Lax (and Secure on HTTPS) session cookie carrying an opaque 256-bit token.
+        The server persists only the SHA-256 hash of the token in SQLite for full CGI stateless compatibility.
+    CsrfHeader:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: Session-bound CSRF token returned by `/api/auth/register`, `/api/auth/login`, and `/api/auth/me`.
+
   parameters:
     DocumentIdPath:
       name: id
@@ -291,14 +474,26 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ApiError'
+    Unauthorized:
+      description: Missing/expired session or invalid authentication credentials
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    Forbidden:
+      description: CSRF validation failure, invalid Origin, or operation disabled by server policy (e.g. closed signup)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
     NotFound:
-      description: Requested document or endpoint not found
+      description: Requested resource or endpoint not found
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ApiError'
     Conflict:
-      description: Resource state conflict (e.g. updating a trashed document or permanently deleting an active document)
+      description: Resource state conflict (e.g. duplicate username, updating a trashed document, or permanently deleting an active document)
       content:
         application/json:
           schema:
@@ -319,6 +514,117 @@ components:
         status:
           type: string
           example: ok
+
+    UserId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[A-Za-z0-9_-]+$'
+      example: 8f14e45f-ea9a-4f3b-8a6d-123456789abc
+
+    Username:
+      type: string
+      minLength: 3
+      maxLength: 32
+      pattern: '^[a-z0-9][a-z0-9_-]{2,31}$'
+      description: |
+        Canonical normalized lowercase ASCII login identifier returned by the server
+        (3..32 chars, starting with an ASCII lowercase letter or digit, followed by ASCII lowercase letters, digits, `_`, or `-`).
+      example: alice_01
+
+    UsernameInput:
+      type: string
+      minLength: 3
+      pattern: '^ *[A-Za-z0-9][A-Za-z0-9_-]{2,31} *$'
+      description: |
+        Raw username input accepted on registration and login.
+        Control characters (including tabs/newlines) are rejected; leading/trailing spaces are trimmed and ASCII uppercase letters are normalized to lowercase (3..32 chars after trimming).
+      example: Alice_01
+
+    DisplayName:
+      type: string
+      minLength: 1
+      maxLength: 64
+      description: Optional human-friendly display name (trimmed non-empty UTF-8 text without control characters)
+      example: アリス
+
+    NullableDisplayName:
+      type: string
+      nullable: true
+      minLength: 1
+      maxLength: 64
+      description: Optional human-friendly display name, or `null` when unset
+      example: アリス
+
+    CsrfToken:
+      type: string
+      minLength: 32
+      maxLength: 128
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: Session-bound URL-safe CSRF synchronizer token (256-bit Base64URL)
+      example: 47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU
+
+    UserProfile:
+      type: object
+      required:
+        - id
+        - username
+        - display_name
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/UserId'
+        username:
+          $ref: '#/components/schemas/Username'
+        display_name:
+          $ref: '#/components/schemas/NullableDisplayName'
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-11-20T05:00:00Z'
+
+    RegisterRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          $ref: '#/components/schemas/UsernameInput'
+        display_name:
+          $ref: '#/components/schemas/NullableDisplayName'
+        password:
+          type: string
+          format: password
+          minLength: 8
+          description: Plaintext password (min 8 chars, max 128 UTF-8 bytes, no NUL characters; whitespace preserved)
+          example: correct-horse-battery-staple
+
+    LoginRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          $ref: '#/components/schemas/UsernameInput'
+        password:
+          type: string
+          format: password
+          minLength: 1
+          description: Plaintext password (non-empty, max 128 UTF-8 bytes, no NUL characters)
+          example: correct-horse-battery-staple
+
+    AuthSessionResponse:
+      type: object
+      required:
+        - user
+        - csrf_token
+      properties:
+        user:
+          $ref: '#/components/schemas/UserProfile'
+        csrf_token:
+          $ref: '#/components/schemas/CsrfToken'
 
     DocumentId:
       type: string
@@ -545,6 +851,8 @@ components:
       type: string
       enum:
         - validation_error
+        - unauthorized
+        - forbidden
         - not_found
         - conflict
         - payload_too_large

@@ -230,6 +230,10 @@ data UiMessages = UiMessages
       -- ^ ネットワークエラーの日本語説明接頭辞
     , errValidationPrefix        :: !Text
       -- ^ 入力検証エラーの日本語説明接頭辞
+    , errUnauthorizedMessage     :: !Text
+      -- ^ 401 未認証エラーの日本語説明
+    , errForbiddenMessage        :: !Text
+      -- ^ 403 認可・CSRF エラーの日本語説明
     , errNotFoundMessage         :: !Text
       -- ^ 404 エラーの日本語説明
     , errConflictMessage         :: !Text
@@ -380,6 +384,8 @@ jaMessages = UiMessages
     , confirmPermanentDelBody   = "この操作は取り消せません。対象文書はサーバから完全に削除されます。"
     , errNetworkPrefix          = "サーバへ接続できませんでした"
     , errValidationPrefix       = "入力内容に誤りがあります"
+    , errUnauthorizedMessage    = "ログインが必要です。再度ログインしてください。"
+    , errForbiddenMessage       = "この操作は許可されていません。画面を再読込して再度お試しください。"
     , errNotFoundMessage        = "対象の文書または API が見つかりませんでした。"
     , errConflictMessage        = "文書の現在状態と競合しました。一覧を再読込してください。"
     , errPayloadTooLarge        = "文書サイズが上限 (5 MiB) を超えています。"
@@ -454,6 +460,8 @@ formatApiClientError msgs (ClientValidationError vErr) =
 formatApiClientError msgs (ClientNetworkError detail) =
     msgs.errNetworkPrefix <> " (" <> detail <> ")"
 formatApiClientError msgs (ClientApiError _status apiErr) = case apiErr.code of
+    ErrUnauthorized     -> msgs.errUnauthorizedMessage
+    ErrForbidden        -> msgs.errForbiddenMessage
     ErrNotFound         -> msgs.errNotFoundMessage
     ErrConflict         -> msgs.errConflictMessage
     ErrPayloadTooLarge  -> msgs.errPayloadTooLarge

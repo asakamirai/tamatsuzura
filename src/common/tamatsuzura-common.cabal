@@ -22,6 +22,7 @@ library
   hs-source-dirs:  src
   exposed-modules:
     TamaTsuzura.Common.Api
+    TamaTsuzura.Common.Auth
     TamaTsuzura.Common.Document
     TamaTsuzura.Common.Text
     TamaTsuzura.Common.Validation
