@@ -41,7 +41,33 @@ bundle_wasm_assets() {
 
   if [ -d "src/client/web" ]; then
     cp src/client/web/index.html src/client/web/index.js src/client/web/wasi-shim.js src/client/web/styles.css "${dist_dir}/"
+    if [ -f "src/client/web/package.json" ]; then
+      local need_install=0
+      if [ ! -d "src/client/web/node_modules" ] || [ ! -x "src/client/web/node_modules/.bin/esbuild" ]; then
+        need_install=1
+      elif [ -f "src/client/web/pnpm-lock.yaml" ] && [ ! -f "src/client/web/node_modules/.modules.yaml" ]; then
+        need_install=1
+      elif [ -f "src/client/web/pnpm-lock.yaml" ] && [ "src/client/web/pnpm-lock.yaml" -nt "src/client/web/node_modules/.modules.yaml" ]; then
+        need_install=1
+      elif [ "src/client/web/package.json" -nt "src/client/web/node_modules/.modules.yaml" ]; then
+        need_install=1
+      fi
+      if [ "${need_install}" = "1" ]; then
+        if [ -f "src/client/web/pnpm-lock.yaml" ]; then
+          pnpm --dir src/client/web install --frozen-lockfile --prefer-offline
+        else
+          pnpm --dir src/client/web install --prefer-offline
+        fi
+      fi
+      pnpm --dir src/client/web run build
+    fi
   fi
+
+  if [ ! -s "${dist_dir}/editor-bridge.js" ]; then
+    echo "Error: Built CodeMirror 6 bundle not found: ${dist_dir}/editor-bridge.js" >&2
+    exit 1
+  fi
+  node --check "${dist_dir}/editor-bridge.js"
 
   # Verify that every import required by tamatsuzura-client.wasm is satisfied by wasi-shim.js and ghc_wasm_jsffi.js
   node --input-type=module -e '

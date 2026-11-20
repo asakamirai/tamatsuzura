@@ -1,3 +1,4 @@
+import "./editor-bridge.js";
 import { BrowserWasiShim } from "./wasi-shim.js";
 import ghcWasmJsffi from "./ghc_wasm_jsffi.js";
 

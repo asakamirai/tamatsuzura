@@ -7,6 +7,8 @@ services:
       - ..:/workspace
       - stack-root:/root/.stack
       - ghc-wasm-cabal:/root/.ghc-wasm/.cabal
+      - pnpm-store:/root/.pnpm-store
+      - web-node-modules:/workspace/src/client/web/node_modules
     working_dir: /workspace
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
@@ -14,7 +16,10 @@ services:
       - LANG=C.UTF-8
       - LC_ALL=C.UTF-8
       - STACK_WORK=.stack-work-docker
+      - npm_config_store_dir=/root/.pnpm-store
 
 volumes:
   stack-root:
   ghc-wasm-cabal:
+  pnpm-store:
+  web-node-modules:

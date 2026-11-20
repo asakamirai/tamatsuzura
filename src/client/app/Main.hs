@@ -8,7 +8,7 @@ module Main
 import           Miso                                 (defaultEvents, startApp)
 #endif
 import           TamaTsuzura.Client.Api               (defaultApiClient, mkApiBaseUrl)
-import           TamaTsuzura.Client.App               (ClientEnv(..), mkClientComponent)
+import           TamaTsuzura.Client.App               (ClientEnv, defaultClientEnv, mkClientComponent)
 import           TamaTsuzura.Client.ExtensionRegistry (bundledExtensions)
 import           TamaTsuzura.Client.Ffi               (readConfiguredApiBaseUrl)
 import           TamaTsuzura.Client.I18n              (jaMessages)
@@ -25,11 +25,10 @@ main :: IO ()
 main = do
     rawBaseUrl <- readConfiguredApiBaseUrl
     let env :: ClientEnv
-        env = ClientEnv
-            { apiClient  = defaultApiClient (mkApiBaseUrl rawBaseUrl)
-            , extensions = bundledExtensions
-            , messages   = jaMessages
-            }
+        env = defaultClientEnv
+            (defaultApiClient (mkApiBaseUrl rawBaseUrl))
+            bundledExtensions
+            jaMessages
 #ifdef WASM
     startApp defaultEvents (mkClientComponent env viewClient)
 #else

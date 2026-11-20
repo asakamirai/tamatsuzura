@@ -25,14 +25,17 @@ library client-core
   exposed-modules:
     TamaTsuzura.Client.Api
     TamaTsuzura.Client.App
+    TamaTsuzura.Client.EditorBridge
     TamaTsuzura.Client.Ffi
     TamaTsuzura.Client.I18n
+    TamaTsuzura.Client.Markdown
     TamaTsuzura.Client.View
   build-depends:
       aeson                     >= 2.1  && < 2.3
     , base                      >= 4.18 && < 5
     , bytestring                >= 0.11 && < 0.13
     , miso                      >= 1.15 && < 1.16
+    , mtl                       >= 2.2  && < 2.4
     , tamatsuzura-common
     , tamatsuzura-extension-api
     , text                      >= 2.0  && < 2.2
@@ -51,8 +54,10 @@ library
   reexported-modules:
       TamaTsuzura.Client.Api
     , TamaTsuzura.Client.App
+    , TamaTsuzura.Client.EditorBridge
     , TamaTsuzura.Client.Ffi
     , TamaTsuzura.Client.I18n
+    , TamaTsuzura.Client.Markdown
     , TamaTsuzura.Client.View
   build-depends:
       base                      >= 4.18 && < 5

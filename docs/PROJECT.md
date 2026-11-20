@@ -10,7 +10,7 @@
 
 ## 現在地
 
-**M2（MVP クライアント: モバイルファースト Miso/Wasm UI）Phase 1 完了。次は M2 Phase 2（CodeMirror 6 統合とモバイルファースト日本語 UI）へ着手予定。**
+**M2（MVP クライアント: モバイルファースト Miso/Wasm UI）Phase 2 完了。次は M2 Phase 3（IndexedDB 未保存ドラフト自動退避・復元およびエクスポート/インポート実装と疎通検証）へ着手予定。**
 
 | マイルストーン | 内容 | 状態 | 完了記録 |
 | --- | --- | --- | --- |
@@ -32,7 +32,7 @@
 **M2: MVP クライアント (モバイルファースト最小エディタ UI)**
 
 - [x] Phase 1: Miso + GHC Wasm クライアント骨格・最小 JSFFI グルーおよび M1 REST API 通信クライアント基盤の実装
-- [ ] Phase 2: CodeMirror 6 統合とモバイルファースト日本語 UI（文書一覧・整理・編集・明示的保存・Markdown プレビュー・検索/置換・ゴミ箱）の実装
+- [x] Phase 2: CodeMirror 6 統合とモバイルファースト日本語 UI（文書一覧・整理・編集・明示的保存・Markdown プレビュー・検索/置換・ゴミ箱）の実装
 - [ ] Phase 3: IndexedDB 未保存ドラフト自動退避・復元および Markdown/テキストのエクスポート/インポート実装と疎通検証
 
 ※ マイルストーンの新規追加や調整は Antigravity スキル `add-milestone` を利用してください。
