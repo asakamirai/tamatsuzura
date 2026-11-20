@@ -8,6 +8,8 @@ module TamaTsuzura.Client.I18n
     , jaMessages
     , formatDocumentFormat
     , formatApiClientError
+    , formatLoginApiError
+    , formatRegisterApiError
     , formatValidationError
     , formatFileImportError
     ) where
@@ -84,6 +86,90 @@ data UiMessages = UiMessages
       -- ^ 更新前ローカルドラフト適用ボタンラベル
     , actionRecoverOrphanDraft   :: !Text
       -- ^ 孤立ドラフトを新規文書として復元するボタンラベル
+    , actionLogin                :: !Text
+      -- ^ ログイン送信ボタンラベル
+    , actionLoggingIn            :: !Text
+      -- ^ ログイン処理中のボタンラベル
+    , actionRegister             :: !Text
+      -- ^ 新規ユーザー登録送信ボタンラベル
+    , actionRegistering          :: !Text
+      -- ^ 新規ユーザー登録処理中のボタンラベル
+    , actionLogout               :: !Text
+      -- ^ ログアウトボタンラベル
+    , actionLoggingOut           :: !Text
+      -- ^ ログアウト処理中のボタンラベル
+    , actionDiscardAndLogout     :: !Text
+      -- ^ 未保存変更を破棄してログアウトするボタンラベル
+    , authCheckingMessage        :: !Text
+      -- ^ 起動時のセッション確認中メッセージ
+    , authTabLogin               :: !Text
+      -- ^ 認証画面のログインタブラベル
+    , authTabRegister            :: !Text
+      -- ^ 認証画面の新規登録タブラベル
+    , authLoginHeading           :: !Text
+      -- ^ ログインフォーム見出し
+    , authRegisterHeading        :: !Text
+      -- ^ 新規登録フォーム見出し
+    , authLoginLead              :: !Text
+      -- ^ ログインフォーム案内文
+    , authRegisterLead           :: !Text
+      -- ^ 新規登録フォーム案内文
+    , authUsernameLabel          :: !Text
+      -- ^ ユーザー名入力欄ラベル
+    , authUsernamePlaceholder    :: !Text
+      -- ^ ユーザー名入力欄プレースホルダー
+    , authUsernameHint           :: !Text
+      -- ^ ユーザー名書式ヒント
+    , authDisplayNameLabel       :: !Text
+      -- ^ 表示名入力欄ラベル
+    , authDisplayNamePlaceholder :: !Text
+      -- ^ 表示名入力欄プレースホルダー
+    , authPasswordLabel          :: !Text
+      -- ^ パスワード入力欄ラベル
+    , authPasswordPlaceholder    :: !Text
+      -- ^ パスワード入力欄プレースホルダー
+    , authPasswordHint           :: !Text
+      -- ^ 新規登録時パスワード要件ヒント
+    , authPasswordConfirmLabel   :: !Text
+      -- ^ 確認用パスワード入力欄ラベル
+    , authPasswordConfirmPh      :: !Text
+      -- ^ 確認用パスワード入力欄プレースホルダー
+    , noticeLoggedIn             :: !Text
+      -- ^ ログイン完了通知
+    , noticeRegistered           :: !Text
+      -- ^ 新規ユーザー登録完了通知
+    , noticeLoggedOut            :: !Text
+      -- ^ ログアウト完了通知
+    , confirmUnsavedLogoutBody   :: !Text
+      -- ^ 未保存変更がある状態でログアウトする際の確認ダイアログ本文
+    , errInvalidCredentials      :: !Text
+      -- ^ ログイン時のユーザー名・パスワード不一致エラー
+    , errUsernameAlreadyExists   :: !Text
+      -- ^ 新規登録時のユーザー名重複エラー
+    , errRegistrationDisabled    :: !Text
+      -- ^ 新規登録停止・拒否エラー (HTTP 403)
+    , errSessionExpired          :: !Text
+      -- ^ 認証済み操作中に HTTP 401 を受信した際のセッション期限切れ案内
+    , valUsernameTooShort        :: !Text
+      -- ^ ユーザー名最小文字数不足の説明
+    , valUsernameTooLong         :: !Text
+      -- ^ ユーザー名最大文字数超過の説明
+    , valUsernameInvalidFormat   :: !Text
+      -- ^ ユーザー名書式違反の説明
+    , valDisplayNameTooLong      :: !Text
+      -- ^ 表示名最大文字数超過の説明
+    , valDisplayNameControlChar  :: !Text
+      -- ^ 表示名制御文字エラーの説明
+    , valEmptyPassword           :: !Text
+      -- ^ パスワード未入力エラーの説明
+    , valPasswordTooShort        :: !Text
+      -- ^ パスワード最小文字数不足の説明
+    , valPasswordTooLong         :: !Text
+      -- ^ パスワード最大バイト長超過の説明
+    , valPasswordNullChar        :: !Text
+      -- ^ パスワード NUL 文字混入エラーの説明
+    , valPasswordMismatch        :: !Text
+      -- ^ 確認用パスワード不一致の説明
     , badgeHasDraft              :: !Text
       -- ^ 文書一覧に表示する未保存ドラフト保有バッジ文言
     , draftStatePending          :: !Text
@@ -281,132 +367,174 @@ data UiMessages = UiMessages
 -- | 既定の日本語 UI メッセージカタログ。
 jaMessages :: UiMessages
 jaMessages = UiMessages
-    { appTitle                  = "TamaTsuzura"
-    , appSubtitle               = "モバイルファースト・テキストエディタ"
-    , statusChecking            = "接続確認中..."
-    , statusOnline              = "サーバ接続済み"
-    , statusError               = "接続エラー"
-    , actionReload              = "再読込"
-    , actionNewDocument         = "新規作成"
-    , actionCreating            = "作成中..."
-    , actionDismissError        = "閉じる"
-    , actionBackToList          = "一覧へ"
-    , actionSave                = "保存"
-    , actionSaving              = "保存中..."
-    , actionUndo                = "戻す"
-    , actionRedo                = "やり直す"
-    , actionSearchToggle        = "検索・置換"
-    , actionMetadataToggle      = "整理"
-    , actionMoveToTrash         = "ゴミ箱へ"
-    , actionRestore             = "復元"
-    , actionPermanentDelete     = "完全削除"
-    , actionCancel              = "キャンセル"
-    , actionClearFilters        = "解除"
-    , actionSearchRun           = "検索"
-    , actionDiscardAndContinue  = "変更を破棄して移動"
-    , actionConfirmPermanentDel = "完全に削除する"
-    , actionImport              = "インポート"
-    , actionImporting           = "インポート中..."
-    , actionExport              = "エクスポート"
-    , actionDiscardDraft        = "ドラフトを破棄"
-    , actionApplyDraft          = "ドラフトを適用"
-    , actionRecoverOrphanDraft  = "新規文書として復元"
-    , badgeHasDraft             = "ドラフトあり"
-    , draftStatePending         = "ドラフト退避中..."
-    , draftStateSaved           = "ドラフト退避済み"
-    , draftStateFailed          = "ドラフト退避失敗"
-    , draftRestoredBanner       = "ローカルに退避されていた未保存ドラフトを復元しました。"
-    , draftStaleBanner          = "この文書はサーバ側で更新されていますが、更新前のローカル未保存ドラフトが残っています。"
-    , draftTrashedBanner        = "この文書にはゴミ箱移動前のローカル未保存ドラフトが残っています。"
-    , draftOrphanedBanner       = "元の文書がサーバ上に見つかりませんでした。ローカルの未保存ドラフトを新規文書として復元するか、破棄できます。"
-    , tabActiveDocuments        = "文書"
-    , tabTrashDocuments         = "ゴミ箱"
-    , modeEditLabel             = "編集"
-    , modeSplitLabel            = "分割"
-    , modePreviewLabel          = "プレビュー"
-    , documentsHeading          = "文書一覧"
-    , documentsCountUnit        = "件"
-    , loadingDocuments          = "文書一覧を読み込んでいます..."
-    , loadingDocumentBody       = "文書を読み込んでいます..."
-    , emptyDocuments            = "文書はまだありません。「新規作成」から最初のメモを作成できます。"
-    , emptyTrashDocuments       = "ゴミ箱は空です。"
-    , emptyFilteredDocuments    = "条件に一致する文書が見つかりませんでした。"
-    , emptyEditorPrompt         = "左の一覧から文書を選ぶか、「新規作成」から執筆を始めてください。"
-    , untitledDocument          = "無題"
-    , formatMarkdownLabel       = "Markdown"
-    , formatPlainTextLabel      = "テキスト"
-    , listSearchPlaceholder     = "タイトル・本文を検索"
-    , filterAllFolders          = "すべてのフォルダ"
-    , filterAllTags             = "すべてのタグ"
-    , filterIncludeSubfolders   = "配下フォルダも含む"
-    , filterFolderLabel         = "フォルダ"
-    , filterTagLabel            = "タグ"
-    , fieldTitleLabel           = "タイトル"
-    , fieldTitlePlaceholder     = "タイトルを入力（省略可）"
-    , fieldFormatLabel          = "形式"
-    , fieldFolderLabel          = "フォルダ"
-    , fieldFolderPlaceholder    = "例: work/notes（空欄でルート）"
-    , fieldTagsLabel            = "タグ"
-    , fieldTagsPlaceholder      = "例: メモ, アイデア（カンマ区切り）"
-    , editorBodyPlaceholder     = "ここに本文を入力してください（Ctrl+S で保存 / Ctrl+F で検索）"
-    , stateSavedLabel           = "保存済み"
-    , stateUnsavedLabel         = "未保存"
-    , stateReadOnlyLabel        = "閲覧専用"
-    , trashReadOnlyBanner       = "ゴミ箱内の文書は閲覧専用です。編集するには「復元」を押してください。"
-    , previewEmptyHint          = "本文を入力すると、ここに Markdown プレビューが表示されます。"
-    , searchInputPlaceholder    = "検索語を入力"
-    , replaceInputPlaceholder   = "置換後の文字列"
-    , searchCaseSensitiveLabel  = "Aa"
-    , searchRegexLabel          = ".*"
-    , searchPrevLabel           = "前へ"
-    , searchNextLabel           = "次へ"
-    , searchReplaceLabel        = "置換"
-    , searchReplaceAllLabel     = "すべて置換"
-    , searchToggleReplaceLabel  = "置換欄"
-    , searchNoMatches           = "一致なし"
-    , searchInvalidRegex        = "正規表現の構文が正しくありません"
-    , statsLinesUnit            = "行"
-    , statsCharsUnit            = "文字"
-    , statsCursorPrefix         = "カーソル"
-    , extensionsHeading         = "拡張機能"
-    , noticeSaved               = "文書を保存しました。"
-    , noticeMovedToTrash        = "文書をゴミ箱へ移動しました。"
-    , noticeRestored            = "文書をゴミ箱から復元しました。"
-    , noticePermanentlyDeleted  = "文書を完全に削除しました。"
-    , noticeExtensionApplied    = "拡張機能を適用しました。"
-    , noticeDraftRestored       = "未保存ドラフトを復元しました。"
-    , noticeDraftDiscarded      = "ローカルの未保存ドラフトを破棄しました。"
-    , noticeExportedPrefix      = "ファイルをエクスポートしました: "
-    , noticeImportedPrefix      = "ファイルをインポートしました: "
-    , confirmUnsavedTitle       = "未保存の変更があります"
-    , confirmUnsavedBody        = "現在の文書に未保存の変更があります。保存せずに移動すると変更は失われます。"
-    , confirmPermanentDelTitle  = "文書を完全に削除しますか？"
-    , confirmPermanentDelBody   = "この操作は取り消せません。対象文書はサーバから完全に削除されます。"
-    , errNetworkPrefix          = "サーバへ接続できませんでした"
-    , errValidationPrefix       = "入力内容に誤りがあります"
-    , errUnauthorizedMessage    = "ログインが必要です。再度ログインしてください。"
-    , errForbiddenMessage       = "この操作は許可されていません。画面を再読込して再度お試しください。"
-    , errNotFoundMessage        = "対象の文書または API が見つかりませんでした。"
-    , errConflictMessage        = "文書の現在状態と競合しました。一覧を再読込してください。"
-    , errPayloadTooLarge        = "文書サイズが上限 (5 MiB) を超えています。"
-    , errServerPrefix           = "サーバエラーが発生しました"
-    , errDecodeMessage          = "サーバ応答の読み取りに失敗しました。"
-    , errDraftStoragePrefix     = "ローカルドラフトの保存に失敗しました"
-    , errExportFailedPrefix     = "ファイルのエクスポートに失敗しました"
-    , errImportInvalidUtf8      = "UTF-8 テキストとして読み込めないファイルのためインポートできません。"
-    , errImportFailedPrefix     = "ファイルのインポートに失敗しました"
-    , valTitleTooLong           = "タイトルが文字数上限を超えています"
-    , valTitleControlChar       = "タイトルに改行や制御文字は使用できません"
-    , valEmptyTag               = "空のタグは指定できません"
-    , valTagTooLong             = "タグが文字数上限を超えています"
-    , valTagControlChar         = "タグに制御文字は使用できません"
-    , valTooManyTags            = "タグの最大個数を超えています"
-    , valEmptyFolder            = "フォルダパスが不正です"
-    , valFolderTooLong          = "フォルダパスが文字数上限を超えています"
-    , valFolderTooDeep          = "フォルダ階層の最大深さを超えています"
-    , valFolderInvalidSegment   = "フォルダパスに空セグメント・'.'・'..'・バックスラッシュは使用できません"
-    , valSearchTooLong          = "検索語が文字数上限を超えています"
-    , valSearchControlChar      = "検索語に制御文字は使用できません"
+    { appTitle                   = "TamaTsuzura"
+    , appSubtitle                = "モバイルファースト・テキストエディタ"
+    , statusChecking             = "接続確認中..."
+    , statusOnline               = "サーバ接続済み"
+    , statusError                = "接続エラー"
+    , actionReload               = "再読込"
+    , actionNewDocument          = "新規作成"
+    , actionCreating             = "作成中..."
+    , actionDismissError         = "閉じる"
+    , actionBackToList           = "一覧へ"
+    , actionSave                 = "保存"
+    , actionSaving               = "保存中..."
+    , actionUndo                 = "戻す"
+    , actionRedo                 = "やり直す"
+    , actionSearchToggle         = "検索・置換"
+    , actionMetadataToggle       = "整理"
+    , actionMoveToTrash          = "ゴミ箱へ"
+    , actionRestore              = "復元"
+    , actionPermanentDelete      = "完全削除"
+    , actionCancel               = "キャンセル"
+    , actionClearFilters         = "解除"
+    , actionSearchRun            = "検索"
+    , actionDiscardAndContinue   = "変更を破棄して移動"
+    , actionConfirmPermanentDel  = "完全に削除する"
+    , actionImport               = "インポート"
+    , actionImporting            = "インポート中..."
+    , actionExport               = "エクスポート"
+    , actionDiscardDraft         = "ドラフトを破棄"
+    , actionApplyDraft           = "ドラフトを適用"
+    , actionRecoverOrphanDraft   = "新規文書として復元"
+    , actionLogin                = "ログイン"
+    , actionLoggingIn            = "ログイン中..."
+    , actionRegister             = "アカウント作成"
+    , actionRegistering          = "登録中..."
+    , actionLogout               = "ログアウト"
+    , actionLoggingOut           = "ログアウト中..."
+    , actionDiscardAndLogout     = "変更を破棄してログアウト"
+    , authCheckingMessage        = "ログイン状態を確認しています..."
+    , authTabLogin               = "ログイン"
+    , authTabRegister            = "新規登録"
+    , authLoginHeading           = "TamaTsuzura へログイン"
+    , authRegisterHeading        = "新規アカウント登録"
+    , authLoginLead              = "ユーザー名とパスワードを入力して文書ワークスペースを開きます。"
+    , authRegisterLead           = "新しいアカウントを作成し、専用の文書空間を開始します。"
+    , authUsernameLabel          = "ユーザー名"
+    , authUsernamePlaceholder    = "例: alice_01"
+    , authUsernameHint           = "半角英数字で始まる 3〜32 文字（英数字・_・-、大文字は小文字に統一）"
+    , authDisplayNameLabel       = "表示名（任意）"
+    , authDisplayNamePlaceholder = "例: アリス（省略可）"
+    , authPasswordLabel          = "パスワード"
+    , authPasswordPlaceholder    = "パスワードを入力"
+    , authPasswordHint           = "8 文字以上（UTF-8 で最大 128 バイト）"
+    , authPasswordConfirmLabel   = "パスワード（確認）"
+    , authPasswordConfirmPh      = "もう一度パスワードを入力"
+    , noticeLoggedIn             = "ログインしました。"
+    , noticeRegistered           = "アカウントを作成してログインしました。"
+    , noticeLoggedOut            = "ログアウトしました。"
+    , confirmUnsavedLogoutBody   = "現在の文書に未保存の変更があります。保存せずにログアウトすると現在の未保存ドラフトは破棄されます。"
+    , errInvalidCredentials      = "ユーザー名またはパスワードが正しくありません。"
+    , errUsernameAlreadyExists   = "このユーザー名はすでに使用されています。別のユーザー名をお試しください。"
+    , errRegistrationDisabled    = "現在、新規ユーザー登録は利用できません。"
+    , errSessionExpired          = "セッションの有効期限が切れたため、再ログインが必要です。"
+    , valUsernameTooShort        = "ユーザー名は 3 文字以上で入力してください"
+    , valUsernameTooLong         = "ユーザー名が文字数上限を超えています"
+    , valUsernameInvalidFormat   = "ユーザー名は半角英数字で始まり、半角英数字・_・- のみ使用できます"
+    , valDisplayNameTooLong      = "表示名が文字数上限を超えています"
+    , valDisplayNameControlChar  = "表示名に改行や制御文字は使用できません"
+    , valEmptyPassword           = "パスワードを入力してください"
+    , valPasswordTooShort        = "パスワードは 8 文字以上で入力してください"
+    , valPasswordTooLong         = "パスワードが最大バイト数上限を超えています"
+    , valPasswordNullChar        = "パスワードに NUL 文字は使用できません"
+    , valPasswordMismatch        = "確認用パスワードが一致しません"
+    , badgeHasDraft              = "ドラフトあり"
+    , draftStatePending          = "ドラフト退避中..."
+    , draftStateSaved            = "ドラフト退避済み"
+    , draftStateFailed           = "ドラフト退避失敗"
+    , draftRestoredBanner        = "ローカルに退避されていた未保存ドラフトを復元しました。"
+    , draftStaleBanner           = "この文書はサーバ側で更新されていますが、更新前のローカル未保存ドラフトが残っています。"
+    , draftTrashedBanner         = "この文書にはゴミ箱移動前のローカル未保存ドラフトが残っています。"
+    , draftOrphanedBanner        = "元の文書がサーバ上に見つかりませんでした。ローカルの未保存ドラフトを新規文書として復元するか、破棄できます。"
+    , tabActiveDocuments         = "文書"
+    , tabTrashDocuments          = "ゴミ箱"
+    , modeEditLabel              = "編集"
+    , modeSplitLabel             = "分割"
+    , modePreviewLabel           = "プレビュー"
+    , documentsHeading           = "文書一覧"
+    , documentsCountUnit         = "件"
+    , loadingDocuments           = "文書一覧を読み込んでいます..."
+    , loadingDocumentBody        = "文書を読み込んでいます..."
+    , emptyDocuments             = "文書はまだありません。「新規作成」から最初のメモを作成できます。"
+    , emptyTrashDocuments        = "ゴミ箱は空です。"
+    , emptyFilteredDocuments     = "条件に一致する文書が見つかりませんでした。"
+    , emptyEditorPrompt          = "左の一覧から文書を選ぶか、「新規作成」から執筆を始めてください。"
+    , untitledDocument           = "無題"
+    , formatMarkdownLabel        = "Markdown"
+    , formatPlainTextLabel       = "テキスト"
+    , listSearchPlaceholder      = "タイトル・本文を検索"
+    , filterAllFolders           = "すべてのフォルダ"
+    , filterAllTags              = "すべてのタグ"
+    , filterIncludeSubfolders    = "配下フォルダも含む"
+    , filterFolderLabel          = "フォルダ"
+    , filterTagLabel             = "タグ"
+    , fieldTitleLabel            = "タイトル"
+    , fieldTitlePlaceholder      = "タイトルを入力（省略可）"
+    , fieldFormatLabel           = "形式"
+    , fieldFolderLabel           = "フォルダ"
+    , fieldFolderPlaceholder     = "例: work/notes（空欄でルート）"
+    , fieldTagsLabel             = "タグ"
+    , fieldTagsPlaceholder       = "例: メモ, アイデア（カンマ区切り）"
+    , editorBodyPlaceholder      = "ここに本文を入力してください（Ctrl+S で保存 / Ctrl+F で検索）"
+    , stateSavedLabel            = "保存済み"
+    , stateUnsavedLabel          = "未保存"
+    , stateReadOnlyLabel         = "閲覧専用"
+    , trashReadOnlyBanner        = "ゴミ箱内の文書は閲覧専用です。編集するには「復元」を押してください。"
+    , previewEmptyHint           = "本文を入力すると、ここに Markdown プレビューが表示されます。"
+    , searchInputPlaceholder     = "検索語を入力"
+    , replaceInputPlaceholder    = "置換後の文字列"
+    , searchCaseSensitiveLabel   = "Aa"
+    , searchRegexLabel           = ".*"
+    , searchPrevLabel            = "前へ"
+    , searchNextLabel            = "次へ"
+    , searchReplaceLabel         = "置換"
+    , searchReplaceAllLabel      = "すべて置換"
+    , searchToggleReplaceLabel   = "置換欄"
+    , searchNoMatches            = "一致なし"
+    , searchInvalidRegex         = "正規表現の構文が正しくありません"
+    , statsLinesUnit             = "行"
+    , statsCharsUnit             = "文字"
+    , statsCursorPrefix          = "カーソル"
+    , extensionsHeading          = "拡張機能"
+    , noticeSaved                = "文書を保存しました。"
+    , noticeMovedToTrash         = "文書をゴミ箱へ移動しました。"
+    , noticeRestored             = "文書をゴミ箱から復元しました。"
+    , noticePermanentlyDeleted   = "文書を完全に削除しました。"
+    , noticeExtensionApplied     = "拡張機能を適用しました。"
+    , noticeDraftRestored        = "未保存ドラフトを復元しました。"
+    , noticeDraftDiscarded       = "ローカルの未保存ドラフトを破棄しました。"
+    , noticeExportedPrefix       = "ファイルをエクスポートしました: "
+    , noticeImportedPrefix       = "ファイルをインポートしました: "
+    , confirmUnsavedTitle        = "未保存の変更があります"
+    , confirmUnsavedBody         = "現在の文書に未保存の変更があります。保存せずに移動すると変更は失われます。"
+    , confirmPermanentDelTitle   = "文書を完全に削除しますか？"
+    , confirmPermanentDelBody    = "この操作は取り消せません。対象文書はサーバから完全に削除されます。"
+    , errNetworkPrefix           = "サーバへ接続できませんでした"
+    , errValidationPrefix        = "入力内容に誤りがあります"
+    , errUnauthorizedMessage     = "ログインが必要です。再度ログインしてください。"
+    , errForbiddenMessage        = "この操作は許可されていません。画面を再読込して再度お試しください。"
+    , errNotFoundMessage         = "対象の文書または API が見つかりませんでした。"
+    , errConflictMessage         = "文書の現在状態と競合しました。一覧を再読込してください。"
+    , errPayloadTooLarge         = "文書サイズが上限 (5 MiB) を超えています。"
+    , errServerPrefix            = "サーバエラーが発生しました"
+    , errDecodeMessage           = "サーバ応答の読み取りに失敗しました。"
+    , errDraftStoragePrefix      = "ローカルドラフトの保存に失敗しました"
+    , errExportFailedPrefix      = "ファイルのエクスポートに失敗しました"
+    , errImportInvalidUtf8       = "UTF-8 テキストとして読み込めないファイルのためインポートできません。"
+    , errImportFailedPrefix      = "ファイルのインポートに失敗しました"
+    , valTitleTooLong            = "タイトルが文字数上限を超えています"
+    , valTitleControlChar        = "タイトルに改行や制御文字は使用できません"
+    , valEmptyTag                = "空のタグは指定できません"
+    , valTagTooLong              = "タグが文字数上限を超えています"
+    , valTagControlChar          = "タグに制御文字は使用できません"
+    , valTooManyTags             = "タグの最大個数を超えています"
+    , valEmptyFolder             = "フォルダパスが不正です"
+    , valFolderTooLong           = "フォルダパスが文字数上限を超えています"
+    , valFolderTooDeep           = "フォルダ階層の最大深さを超えています"
+    , valFolderInvalidSegment    = "フォルダパスに空セグメント・'.'・'..'・バックスラッシュは使用できません"
+    , valSearchTooLong           = "検索語が文字数上限を超えています"
+    , valSearchControlChar       = "検索語に制御文字は使用できません"
     }
 
 -- | 文書フォーマットをユーザー向け表示文字列へ変換する。
@@ -443,6 +571,24 @@ formatValidationError msgs err = case err of
         withLimit msgs.valSearchTooLong actual limit
     SearchQueryContainsControlChar ->
         withDetail msgs.valSearchControlChar
+    UsernameTooShort actual minLen ->
+        withMinLimit msgs.valUsernameTooShort actual minLen
+    UsernameTooLong actual maxLen ->
+        withLimit msgs.valUsernameTooLong actual maxLen
+    InvalidUsernameFormat{} ->
+        withDetail msgs.valUsernameInvalidFormat
+    DisplayNameTooLong actual maxLen ->
+        withLimit msgs.valDisplayNameTooLong actual maxLen
+    DisplayNameContainsControlChar ->
+        withDetail msgs.valDisplayNameControlChar
+    EmptyPassword ->
+        withDetail msgs.valEmptyPassword
+    PasswordTooShort actual minLen ->
+        withMinLimit msgs.valPasswordTooShort actual minLen
+    PasswordTooLong actual maxBytes ->
+        withLimit msgs.valPasswordTooLong actual maxBytes
+    PasswordContainsNullChar ->
+        withDetail msgs.valPasswordNullChar
     _ ->
         withDetail (Txt.pack (show err))
   where
@@ -452,6 +598,10 @@ formatValidationError msgs err = case err of
     withLimit :: Text -> Int -> Int -> Text
     withLimit label actual limit =
         withDetail (label <> ": " <> Txt.pack (show actual) <> "/" <> Txt.pack (show limit))
+
+    withMinLimit :: Text -> Int -> Int -> Text
+    withMinLimit label actual minLen =
+        withDetail (label <> ": " <> Txt.pack (show actual) <> "/" <> Txt.pack (show minLen))
 
 -- | 'ApiClientError' をユーザー向けの分かりやすい表示文言へ整形する。
 formatApiClientError :: UiMessages -> ApiClientError -> Text
@@ -473,6 +623,29 @@ formatApiClientError msgs (ClientHttpError status detail)
     | otherwise       = msgs.errServerPrefix <> " (HTTP " <> Txt.pack (show status) <> ": " <> detail <> ")"
 formatApiClientError msgs ClientDecodeError{} =
     msgs.errDecodeMessage
+
+-- | ログイン API (@POST /api/auth/login@) のエラーをログイン画面向けの日本語文言へ整形する。
+-- HTTP 401 を「セッション切れ」ではなく「ユーザー名またはパスワード不一致」として案内する。
+formatLoginApiError :: UiMessages -> ApiClientError -> Text
+formatLoginApiError msgs (ClientApiError status apiErr)
+    | status == 401 || apiErr.code == ErrUnauthorized = msgs.errInvalidCredentials
+formatLoginApiError msgs (ClientHttpError 401 _) =
+    msgs.errInvalidCredentials
+formatLoginApiError msgs err =
+    formatApiClientError msgs err
+
+-- | 新規ユーザー登録 API (@POST /api/auth/register@) のエラーを登録画面向けの日本語文言へ整形する。
+-- HTTP 409 をユーザー名重複、HTTP 403 を登録不可・拒否として分かりやすく案内する。
+formatRegisterApiError :: UiMessages -> ApiClientError -> Text
+formatRegisterApiError msgs (ClientApiError status apiErr)
+    | status == 409 || apiErr.code == ErrConflict  = msgs.errUsernameAlreadyExists
+    | status == 403 || apiErr.code == ErrForbidden = msgs.errRegistrationDisabled
+formatRegisterApiError msgs (ClientHttpError 409 _) =
+    msgs.errUsernameAlreadyExists
+formatRegisterApiError msgs (ClientHttpError 403 _) =
+    msgs.errRegistrationDisabled
+formatRegisterApiError msgs err =
+    formatApiClientError msgs err
 
 -- | 'FileImportError' をユーザー向けの表示文言へ整形する。
 formatFileImportError :: UiMessages -> FileImportError -> Text

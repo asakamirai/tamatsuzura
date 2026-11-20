@@ -6,6 +6,7 @@
 module TamaTsuzura.Client.View
     ( viewClient
     , displayTitle
+    , displayUserLabel
     , formatUtcTimestamp
     , formatSearchMatchCounter
     ) where
@@ -17,19 +18,23 @@ import           Data.Text                       (Text)
 import qualified Data.Text                       as Txt
 import           Data.Time.Clock                 (UTCTime)
 import           Data.Time.Format                (defaultTimeLocale, formatTime)
-import           Miso                            (Attribute, Checked(..), View, text)
+import           Miso                            (Attribute, Checked(..), View, boolProp, text, textProp)
 import qualified Miso.Html.Element               as H
 import qualified Miso.Html.Event                 as HE
 import qualified Miso.Html.Property              as HP
 import           Miso.String                     (MisoString, fromMisoString, ms)
 import           TamaTsuzura.Client.App
-    ( ClientAction(..)
+    ( AuthFormMode(..)
+    , AuthFormState(..)
+    , AuthState(..)
+    , ClientAction(..)
     , ClientState(..)
     , ConnectionStatus(..)
     , EditorDraft(..)
     , EditorViewMode(..)
     , FilterState(..)
     , MobilePane(..)
+    , PendingNavigation(..)
     , SearchPanelState(..)
     , hasActiveFilters
     , isCurrentDocumentDirty
@@ -39,6 +44,7 @@ import           TamaTsuzura.Client.EditorBridge (EditorStats(..))
 import           TamaTsuzura.Client.I18n         (UiMessages(..), formatDocumentFormat)
 import           TamaTsuzura.Client.Markdown     (renderMarkdownView)
 import           TamaTsuzura.Common.Api          (DocumentStatusFilter(..))
+import           TamaTsuzura.Common.Auth         (AuthSessionResponse(..), UserProfile(..))
 import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentFormat(..)
@@ -57,26 +63,183 @@ import           TamaTsuzura.Common.Document
 import           TamaTsuzura.Common.Text         (ToText(..))
 import           TamaTsuzura.ExtensionApi        (ExtensionMetadata(..))
 
--- | M2 Phase 2 のモバイルファースト日本語 UI をレンダリングする純粋ビュー関数。
--- スマートフォン幅では一覧ペインとエディタペインを切り替え、
--- PC / タブレット広幅では左サイドバー (一覧・整理) + 右ワークスペース (CodeMirror 6 / プレビュー) の
--- 2 ペイン構成で表示する。
+-- | モバイルファースト日本語 UI をレンダリングする純粋ビュー関数。
+-- 未認証時は中央配置のログイン・新規登録画面を表示し、認証済み時は
+-- スマートフォン幅で一覧/エディタ切替、PC 広幅で 2 ペインワークスペースを表示する。
 viewClient :: UiMessages -> ClientState -> View () () ClientState ClientAction
 viewClient msgs state =
     H.div_ [ HP.class_ (ms appClass) ]
         [ viewHeader msgs state
         , viewNotifications msgs state
-        , H.div_ [ HP.class_ "tt-shell" ]
-            [ viewListPane msgs state
-            , viewEditorPane msgs state
-            ]
+        , viewMainBody msgs state
         , viewModals msgs state
         ]
   where
     appClass :: Text
-    appClass = case state.mobilePane of
-        PaneList   -> "tt-app tt-pane-list"
-        PaneEditor -> "tt-app tt-pane-editor"
+    appClass = case state.authState of
+        AuthAuthenticated{} -> case state.mobilePane of
+            PaneList   -> "tt-app tt-pane-list"
+            PaneEditor -> "tt-app tt-pane-editor"
+        _ -> "tt-app tt-app-auth"
+
+viewMainBody :: UiMessages -> ClientState -> View () () ClientState ClientAction
+viewMainBody msgs state = case state.authState of
+    AuthChecking ->
+        H.main_ [ HP.class_ "tt-auth-shell" ]
+            [ H.div_ [ HP.class_ "tt-auth-card tt-auth-checking", HP.role_ "status" ]
+                [ H.p_ [] [ text (ms msgs.authCheckingMessage) ] ]
+            ]
+    AuthUnauthenticated form ->
+        viewAuthScreen msgs form
+    AuthAuthenticated{} ->
+        H.div_ [ HP.class_ "tt-shell" ]
+            [ viewListPane msgs state
+            , viewEditorPane msgs state
+            ]
+
+viewAuthScreen :: UiMessages -> AuthFormState -> View () () ClientState ClientAction
+viewAuthScreen msgs form =
+    H.main_ [ HP.class_ "tt-auth-shell" ]
+        [ H.section_ [ HP.class_ "tt-auth-card", HP.aria_ "label" (ms headingText) ]
+            [ H.div_ [ HP.class_ "tt-segmented", HP.role_ "tablist" ]
+                [ modeTab AuthModeLogin    msgs.authTabLogin
+                , modeTab AuthModeRegister msgs.authTabRegister
+                ]
+            , H.h2_ [ HP.class_ "tt-auth-heading" ] [ text (ms headingText) ]
+            , H.p_ [ HP.class_ "tt-auth-lead" ] [ text (ms leadText) ]
+            , viewFormError form.formError
+            , H.form_
+                [ HP.class_ "tt-auth-form"
+                , boolProp "noValidate" True
+                , HE.onSubmit SubmitAuthForm
+                ]
+                ( [ H.label_ [ HP.class_ "tt-field" ]
+                        [ H.span_ [ HP.class_ "tt-field-label" ] [ text (ms msgs.authUsernameLabel) ]
+                        , H.input_
+                            ( [ HP.type_ "text"
+                              , HP.name_ "username"
+                              , HP.class_ "tt-input"
+                              , HP.value_ (ms form.usernameInput)
+                              , HP.placeholder_ (ms msgs.authUsernamePlaceholder)
+                              , textProp "autocomplete" "username"
+                              , textProp "autocapitalize" "none"
+                              , boolProp "spellcheck" False
+                              , HE.onInput (UpdateAuthUsername . toTextFromMiso)
+                              ] <> disabledAttr form.isSubmitting
+                            )
+                        , H.span_ [ HP.class_ "tt-auth-hint" ] [ text (ms msgs.authUsernameHint) ]
+                        ]
+                  ]
+                    <> displayNameField
+                    <> [ H.label_ [ HP.class_ "tt-field" ]
+                            [ H.span_ [ HP.class_ "tt-field-label" ] [ text (ms msgs.authPasswordLabel) ]
+                            , H.input_
+                                ( [ HP.type_ "password"
+                                  , HP.name_ "password"
+                                  , HP.class_ "tt-input"
+                                  , HP.value_ (ms form.passwordInput)
+                                  , HP.placeholder_ (ms msgs.authPasswordPlaceholder)
+                                  , textProp "autocomplete" passwordAutoComplete
+                                  , HE.onInput (UpdateAuthPassword . toTextFromMiso)
+                                  ] <> disabledAttr form.isSubmitting
+                                )
+                            ]
+                       ]
+                    <> passwordRegisterFields
+                    <> [ H.button_
+                            ( [ HP.type_ "submit"
+                              , HP.class_ "tt-btn tt-btn-primary tt-auth-submit"
+                              ] <> disabledAttr form.isSubmitting
+                            )
+                            [ text (ms submitLabel) ]
+                       ]
+                )
+            ]
+        ]
+  where
+    isRegister :: Bool
+    isRegister = form.mode == AuthModeRegister
+
+    headingText :: Text
+    headingText =
+        if isRegister then msgs.authRegisterHeading else msgs.authLoginHeading
+
+    leadText :: Text
+    leadText =
+        if isRegister then msgs.authRegisterLead else msgs.authLoginLead
+
+    passwordAutoComplete :: MisoString
+    passwordAutoComplete =
+        if isRegister then "new-password" else "current-password"
+
+    submitLabel :: Text
+    submitLabel = case (form.mode, form.isSubmitting) of
+        (AuthModeLogin,    False) -> msgs.actionLogin
+        (AuthModeLogin,    True)  -> msgs.actionLoggingIn
+        (AuthModeRegister, False) -> msgs.actionRegister
+        (AuthModeRegister, True)  -> msgs.actionRegistering
+
+    modeTab :: AuthFormMode -> Text -> View () () ClientState ClientAction
+    modeTab target labelText =
+        let isActive :: Bool
+            isActive = form.mode == target
+
+            btnClass :: Text
+            btnClass = if isActive then "tt-seg-btn tt-seg-btn-active" else "tt-seg-btn"
+        in  H.button_
+                ( [ HP.type_ "button"
+                  , HP.class_ (ms btnClass)
+                  , HP.role_ "tab"
+                  , HP.aria_ "selected" (if isActive then "true" else "false")
+                  , HE.onClick (SwitchAuthMode target)
+                  ] <> disabledAttr form.isSubmitting
+                )
+                [ text (ms labelText) ]
+
+    viewFormError :: Maybe Text -> View () () ClientState ClientAction
+    viewFormError Nothing = H.div_ [ HP.class_ "tt-slot-empty" ] []
+    viewFormError (Just errMsg) =
+        H.div_ [ HP.class_ "tt-banner tt-banner-error tt-auth-error", HP.role_ "alert" ]
+            [ H.span_ [ HP.class_ "tt-banner-text" ] [ text (ms errMsg) ] ]
+
+    displayNameField :: [View () () ClientState ClientAction]
+    displayNameField
+        | not isRegister = []
+        | otherwise =
+            [ H.label_ [ HP.class_ "tt-field" ]
+                [ H.span_ [ HP.class_ "tt-field-label" ] [ text (ms msgs.authDisplayNameLabel) ]
+                , H.input_
+                    ( [ HP.type_ "text"
+                      , HP.name_ "display_name"
+                      , HP.class_ "tt-input"
+                      , HP.value_ (ms form.displayNameInput)
+                      , HP.placeholder_ (ms msgs.authDisplayNamePlaceholder)
+                      , textProp "autocomplete" "nickname"
+                      , HE.onInput (UpdateAuthDisplayName . toTextFromMiso)
+                      ] <> disabledAttr form.isSubmitting
+                    )
+                ]
+            ]
+
+    passwordRegisterFields :: [View () () ClientState ClientAction]
+    passwordRegisterFields
+        | not isRegister = []
+        | otherwise =
+            [ H.span_ [ HP.class_ "tt-auth-hint" ] [ text (ms msgs.authPasswordHint) ]
+            , H.label_ [ HP.class_ "tt-field" ]
+                [ H.span_ [ HP.class_ "tt-field-label" ] [ text (ms msgs.authPasswordConfirmLabel) ]
+                , H.input_
+                    ( [ HP.type_ "password"
+                      , HP.name_ "password_confirm"
+                      , HP.class_ "tt-input"
+                      , HP.value_ (ms form.passwordConfirmInput)
+                      , HP.placeholder_ (ms msgs.authPasswordConfirmPh)
+                      , textProp "autocomplete" "new-password"
+                      , HE.onInput (UpdateAuthPasswordConfirm . toTextFromMiso)
+                      ] <> disabledAttr form.isSubmitting
+                    )
+                ]
+            ]
 
 viewHeader :: UiMessages -> ClientState -> View () () ClientState ClientAction
 viewHeader msgs state =
@@ -86,7 +249,19 @@ viewHeader msgs state =
             , H.p_ [ HP.class_ "tt-subtitle" ] [ text (ms msgs.appSubtitle) ]
             ]
         , H.div_ [ HP.class_ "tt-header-actions" ]
-            [ viewConnectionBadge msgs state.connectionStatus
+            ( viewConnectionBadge msgs state.connectionStatus
+            : headerAuthActions
+            )
+        ]
+  where
+    headerAuthActions :: [View () () ClientState ClientAction]
+    headerAuthActions = case state.authState of
+        AuthAuthenticated session ->
+            [ H.span_
+                [ HP.class_ "tt-user-pill"
+                , HP.title_ (ms (toText session.user))
+                ]
+                [ text (ms (displayUserLabel session.user)) ]
             , H.button_
                 ( [ HP.type_ "button"
                   , HP.class_ "tt-btn tt-btn-primary tt-btn-compact"
@@ -108,9 +283,29 @@ viewHeader msgs state =
                   ] <> disabledAttr isRefreshing
                 )
                 [ text (ms msgs.actionReload) ]
+            , H.button_
+                ( [ HP.type_ "button"
+                  , HP.class_ "tt-btn tt-btn-secondary tt-btn-compact"
+                  , HE.onClick RequestLogout
+                  ] <> disabledAttr state.isLoggingOut
+                )
+                [ text (ms logoutLabel) ]
             ]
-        ]
-  where
+        AuthChecking ->
+            [ reloadOnlyButton True ]
+        AuthUnauthenticated form ->
+            [ reloadOnlyButton form.isSubmitting ]
+
+    reloadOnlyButton :: Bool -> View () () ClientState ClientAction
+    reloadOnlyButton isDisabled =
+        H.button_
+            ( [ HP.type_ "button"
+              , HP.class_ "tt-btn tt-btn-secondary tt-btn-compact"
+              , HE.onClick RefreshAll
+              ] <> disabledAttr isDisabled
+            )
+            [ text (ms msgs.actionReload) ]
+
     createLabel :: Text
     createLabel =
         if state.isCreatingDocument
@@ -123,11 +318,17 @@ viewHeader msgs state =
             then msgs.actionImporting
             else msgs.actionImport
 
+    logoutLabel :: Text
+    logoutLabel =
+        if state.isLoggingOut
+            then msgs.actionLoggingOut
+            else msgs.actionLogout
+
     isCreatingOrImporting :: Bool
-    isCreatingOrImporting = state.isCreatingDocument || state.isImportingDocument
+    isCreatingOrImporting = state.isCreatingDocument || state.isImportingDocument || state.isLoggingOut
 
     isRefreshing :: Bool
-    isRefreshing = state.isLoadingDocuments || state.connectionStatus == ConnChecking
+    isRefreshing = state.isLoadingDocuments || state.connectionStatus == ConnChecking || state.isLoggingOut
 
 viewConnectionBadge :: UiMessages -> ConnectionStatus -> View () () ClientState ClientAction
 viewConnectionBadge msgs status =
@@ -143,7 +344,9 @@ viewNotifications msgs state =
     H.div_ [ HP.class_ "tt-notifications" ]
         [ viewErrorBanner msgs state.lastError
         , viewNoticeBanner msgs state.statusNotice
-        , viewOrphanedDraftBanner msgs state state.orphanedDraft
+        , case state.authState of
+            AuthAuthenticated{} -> viewOrphanedDraftBanner msgs state state.orphanedDraft
+            _                   -> H.div_ [ HP.class_ "tt-slot-empty" ] []
         ]
 
 viewOrphanedDraftBanner ::
@@ -953,31 +1156,42 @@ viewExtensionQuickActions msgs metas readOnly =
             [ text (ms (toText meta.name)) ]
 
 viewModals :: UiMessages -> ClientState -> View () () ClientState ClientAction
-viewModals msgs state =
-    H.div_ [ HP.class_ "tt-modals" ]
-        [ case state.pendingNavigation of
-            Nothing -> H.div_ [ HP.class_ "tt-slot-empty" ] []
-            Just _  ->
-                viewConfirmModal
-                    msgs.confirmUnsavedTitle
-                    msgs.confirmUnsavedBody
-                    msgs.actionDiscardAndContinue
-                    msgs.actionCancel
-                    ConfirmDiscardNavigation
-                    CancelPendingNavigation
-                    "tt-btn tt-btn-danger"
-        , case state.confirmPermanentDelete of
-            Nothing    -> H.div_ [ HP.class_ "tt-slot-empty" ] []
-            Just docId ->
-                viewConfirmModal
-                    msgs.confirmPermanentDelTitle
-                    msgs.confirmPermanentDelBody
-                    msgs.actionConfirmPermanentDel
-                    msgs.actionCancel
-                    (ConfirmPermanentDelete docId)
-                    CancelPermanentDelete
-                    "tt-btn tt-btn-danger"
-        ]
+viewModals msgs state = case state.authState of
+    AuthAuthenticated{} ->
+        H.div_ [ HP.class_ "tt-modals" ]
+            [ case state.pendingNavigation of
+                Nothing -> H.div_ [ HP.class_ "tt-slot-empty" ] []
+                Just NavLogout ->
+                    viewConfirmModal
+                        msgs.confirmUnsavedTitle
+                        msgs.confirmUnsavedLogoutBody
+                        msgs.actionDiscardAndLogout
+                        msgs.actionCancel
+                        ConfirmDiscardNavigation
+                        CancelPendingNavigation
+                        "tt-btn tt-btn-danger"
+                Just _ ->
+                    viewConfirmModal
+                        msgs.confirmUnsavedTitle
+                        msgs.confirmUnsavedBody
+                        msgs.actionDiscardAndContinue
+                        msgs.actionCancel
+                        ConfirmDiscardNavigation
+                        CancelPendingNavigation
+                        "tt-btn tt-btn-danger"
+            , case state.confirmPermanentDelete of
+                Nothing    -> H.div_ [ HP.class_ "tt-slot-empty" ] []
+                Just docId ->
+                    viewConfirmModal
+                        msgs.confirmPermanentDelTitle
+                        msgs.confirmPermanentDelBody
+                        msgs.actionConfirmPermanentDel
+                        msgs.actionCancel
+                        (ConfirmPermanentDelete docId)
+                        CancelPermanentDelete
+                        "tt-btn tt-btn-danger"
+            ]
+    _ -> H.div_ [ HP.class_ "tt-slot-empty" ] []
 
 viewConfirmModal ::
        Text
@@ -1023,6 +1237,13 @@ displayTitle msgs docTitle =
     let raw :: Text
         raw = toText docTitle
     in  if Txt.null raw then msgs.untitledDocument else raw
+
+-- | ヘッダ等へ表示する簡潔なユーザーラベルを返す。
+-- 表示名が設定されていれば表示名、未設定であれば @\"@username\"@ を返す。
+displayUserLabel :: UserProfile -> Text
+displayUserLabel profile = case profile.displayName of
+    Just name -> toText name
+    Nothing   -> "@" <> toText profile.username
 
 -- | UTC タイムスタンプを一覧表示用の簡潔な日時文字列 (@YYYY-MM-DD HH:MM UTC@) へ整形する。
 formatUtcTimestamp :: UTCTime -> Text

@@ -4,10 +4,16 @@
 {-# LANGUAGE OverloadedStrings     #-}
 
 module TamaTsuzura.Client.App
-    ( -- * ランタイム環境・状態・アクション型
+    ( -- * ランタイム環境・認証・状態・アクション型
       ClientEnv(..)
     , defaultClientEnv
     , ConnectionStatus(..)
+    , AuthFormMode(..)
+    , AuthFormState(..)
+    , emptyAuthFormState
+    , AuthState(..)
+    , currentAuthSession
+    , currentUserId
     , MobilePane(..)
     , EditorViewMode(..)
     , PendingNavigation(..)
@@ -26,6 +32,9 @@ module TamaTsuzura.Client.App
     , ClientState(..)
     , ClientAction(..)
       -- * 純粋な変換・検証・判定関数
+    , parseDisplayNameInput
+    , validateLoginForm
+    , validateRegisterForm
     , parseFolderInput
     , parseTagsInput
     , formatTagsInput
@@ -38,6 +47,10 @@ module TamaTsuzura.Client.App
     , buildEditorSyncPayload
       -- * 純粋な状態初期化・遷移関数
     , initialClientState
+    , resetWorkspaceForUnauthenticated
+    , applyAuthSessionChecked
+    , applyAuthSubmitted
+    , applySessionExpired
     , applyExtensionById
     , applyHealthResult
     , applyDocumentsResult
@@ -76,11 +89,16 @@ import           TamaTsuzura.Client.Api
     , ApiClientError(..)
     , createDocument
     , fetchHealth
+    , getCurrentUser
     , getDocument
+    , isUnauthorizedError
     , listDocuments
     , listFolders
     , listTags
+    , loginUser
+    , logoutUser
     , permanentDeleteDocument
+    , registerUser
     , restoreDocument
     , softDeleteDocument
     , updateDocument
@@ -119,6 +137,8 @@ import           TamaTsuzura.Client.I18n
     ( UiMessages(..)
     , formatApiClientError
     , formatFileImportError
+    , formatLoginApiError
+    , formatRegisterApiError
     , formatValidationError
     )
 import           TamaTsuzura.Common.Api
@@ -133,6 +153,19 @@ import           TamaTsuzura.Common.Api
     , defaultCreateDocumentRequest
     , defaultDocumentListQuery
     , mkSearchQuery
+    )
+import           TamaTsuzura.Common.Auth
+    ( AuthSessionResponse(..)
+    , DisplayName
+    , LoginRequest(..)
+    , RegisterRequest(..)
+    , UserId
+    , UserProfile(..)
+    , mkDisplayName
+    , mkPassword
+    , mkUsername
+    , validateNewPassword
+    , validateRegisterRequest
     )
 import           TamaTsuzura.Common.Document
     ( Document(..)
@@ -166,7 +199,7 @@ import           TamaTsuzura.ExtensionApi        (Extension(..), ExtensionId, Ex
 -- Model の純粋な同値比較 ('Eq') と単体テスト容易性を両立する。
 data ClientEnv = ClientEnv
     { apiClient         :: !ApiClient
-      -- ^ M1 REST API 通信クライアント
+      -- ^ REST API 通信クライアント
     , extensions        :: ![Extension]
       -- ^ 結線層から注入された同梱拡張一覧
     , messages          :: !UiMessages
@@ -203,6 +236,68 @@ data ConnectionStatus
       -- ^ 接続失敗 (ユーザー向け説明メッセージ)
     deriving (Eq, Show)
 
+-- | 未認証画面で表示する認証フォームのモード。
+data AuthFormMode
+    = AuthModeLogin
+      -- ^ 既存アカウントでのログインフォーム
+    | AuthModeRegister
+      -- ^ 新規アカウント作成フォーム
+    deriving (Eq, Show)
+
+-- | ログイン・新規登録フォームの入力状態。
+-- 認証成功時に 'AuthAuthenticated' へ置き換えることで、生パスワード文字列が
+-- 認証済みワークスペースのメモリ上に残留しない構造とする。
+data AuthFormState = AuthFormState
+    { mode                 :: !AuthFormMode
+      -- ^ 現在の表示タブ (ログイン / 新規登録)
+    , usernameInput        :: !Text
+      -- ^ ユーザー名入力値
+    , displayNameInput     :: !Text
+      -- ^ 任意の表示名入力値 (新規登録時のみ使用)
+    , passwordInput        :: !Text
+      -- ^ パスワード入力値
+    , passwordConfirmInput :: !Text
+      -- ^ 確認用パスワード入力値 (新規登録時のみ使用)
+    , isSubmitting         :: !Bool
+      -- ^ ログインまたは登録リクエスト送信中フラグ
+    , formError            :: !(Maybe Text)
+      -- ^ フォーム検証または認証 API 失敗時の日本語エラーメッセージ
+    } deriving (Eq, Show)
+
+-- | 既定の空ログインフォーム状態。
+emptyAuthFormState :: AuthFormState
+emptyAuthFormState = AuthFormState
+    { mode                 = AuthModeLogin
+    , usernameInput        = ""
+    , displayNameInput     = ""
+    , passwordInput        = ""
+    , passwordConfirmInput = ""
+    , isSubmitting         = False
+    , formError            = Nothing
+    }
+
+-- | クライアント全体の認証ライフサイクル状態。
+-- 'AuthAuthenticated' にのみ 'AuthSessionResponse' ('UserProfile' + 'CsrfToken') を保持させることで、
+-- 未認証状態で CSRF トークンやユーザー情報を誤参照できないことを型レベルで保証する。
+data AuthState
+    = AuthChecking
+      -- ^ 起動時または手動再確認時の @GET /api/auth/me@ 実行中
+    | AuthUnauthenticated !AuthFormState
+      -- ^ 未認証状態 (ログイン・新規登録画面を表示)
+    | AuthAuthenticated !AuthSessionResponse
+      -- ^ 認証済み状態 (公開プロフィールとセッション紐づき CSRF トークンを保持)
+    deriving (Eq, Show)
+
+-- | 現在のクライアント状態から認証済みセッション情報を取り出す。
+currentAuthSession :: ClientState -> Maybe AuthSessionResponse
+currentAuthSession state = case state.authState of
+    AuthAuthenticated session -> Just session
+    _                         -> Nothing
+
+-- | 現在のクライアント状態から認証済みユーザー ID を取り出す。
+currentUserId :: ClientState -> Maybe UserId
+currentUserId state = fmap (\ session -> session.user.id) (currentAuthSession state)
+
 -- | モバイル幅表示時のアクティブペイン。
 data MobilePane
     = PaneList
@@ -221,7 +316,7 @@ data EditorViewMode
       -- ^ Markdown プレビュー単体表示
     deriving (Eq, Show)
 
--- | 未保存変更がある状態で画面遷移を試みた際に確認待ちとする遷移先。
+-- | 未保存変更がある状態で画面遷移またはログアウトを試みた際に確認待ちとする遷移先。
 data PendingNavigation
     = NavOpenDocument !DocumentId
       -- ^ 別の文書を開く
@@ -235,6 +330,8 @@ data PendingNavigation
       -- ^ ローカルファイルから新規文書をインポートする
     | NavRecoverOrphanedDraft
       -- ^ 孤立ドラフトを新規文書として復元する
+    | NavLogout
+      -- ^ 未保存変更を破棄してログアウトする
     deriving (Eq, Show)
 
 -- | 文書一覧の検索・整理フィルタ状態。
@@ -307,10 +404,13 @@ editorDraftFromStored sd = EditorDraft
     , tagsInput   = sd.tagsInput
     }
 
--- | 現在の保存済み 'Document' と編集中 'EditorDraft' から IndexedDB 退避用 'StoredDraft' を構築する。
-toStoredDraft :: Document -> EditorDraft -> UTCTime -> StoredDraft
-toStoredDraft doc currentDraft now = StoredDraft
+-- | 現在の認証済みユーザー ID・保存済み 'Document'・編集中 'EditorDraft' から
+-- IndexedDB 退避用 'StoredDraft' を構築する。
+-- 所有者 ID を常に記録することで、同一ブラウザで別ユーザーへ切り替えた際のドラフト誤露出を防ぐ。
+toStoredDraft :: UserId -> Document -> EditorDraft -> UTCTime -> StoredDraft
+toStoredDraft ownerUid doc currentDraft now = StoredDraft
     { docId         = doc.id
+    , ownerId       = Just ownerUid
     , titleInput    = currentDraft.titleInput
     , body          = currentDraft.body
     , format        = currentDraft.format
@@ -404,6 +504,12 @@ emptySearchPanelState = SearchPanelState
 data ClientState = ClientState
     { connectionStatus             :: !ConnectionStatus
       -- ^ API サーバの疎通状態
+    , authState                    :: !AuthState
+      -- ^ 認証セッション状態 (確認中 / 未認証フォーム / 認証済み)
+    , authSessionSeq               :: !Int
+      -- ^ 認証セッション世代番号 (ログアウト・401 失効・再ログイン時の古い非同期応答を完全に無視する)
+    , isLoggingOut                 :: !Bool
+      -- ^ ログアウト API 実行中フラグ
     , mobilePane                   :: !MobilePane
       -- ^ モバイル画面での現在表示ペイン
     , editorViewMode               :: !EditorViewMode
@@ -443,7 +549,7 @@ data ClientState = ClientState
     , draft                        :: !EditorDraft
       -- ^ 現在編集中のドラフト内容
     , storedDrafts                 :: !(Map DocumentId StoredDraft)
-      -- ^ IndexedDB に退避されている全未保存ドラフト (文書 ID キー)
+      -- ^ IndexedDB に退避されている現在ログイン中ユーザーの未保存ドラフト (文書 ID キー)
     , draftSyncState               :: !DraftSyncState
       -- ^ 現在編集中文書のローカルドラフト退避ステータス
     , restoredDraftDocId           :: !(Maybe DocumentId)
@@ -479,17 +585,37 @@ data ClientState = ClientState
 -- | クライアント MVU ループで処理するアクション。
 data ClientAction
     = Initialize
-      -- ^ マウント時の初回疎通・一覧・タグ・フォルダ取得トリガ
+      -- ^ マウント時の初回ヘルスチェック・認証セッション確認 (@GET /api/auth/me@) トリガ
     | RefreshAll
-      -- ^ ヘルスチェック・一覧・タグ・フォルダの手動再取得
+      -- ^ 認証済み時は一覧・タグ・フォルダ再取得、未認証時は接続・セッション再確認
     | HealthChecked !(Either ApiClientError HealthStatus)
       -- ^ @GET /api/health@ の結果受信
-    | DocumentsLoaded !Int !(Either ApiClientError DocumentListResponse)
-      -- ^ @GET /api/documents@ の結果受信 (リクエスト世代番号, 結果)
-    | TagsLoaded !(Either ApiClientError TagListResponse)
-      -- ^ @GET /api/tags@ の結果受信
-    | FoldersLoaded !(Either ApiClientError FolderListResponse)
-      -- ^ @GET /api/folders@ の結果受信
+    | AuthSessionChecked !Int !(Either ApiClientError AuthSessionResponse)
+      -- ^ @GET /api/auth/me@ の結果受信 (認証セッション世代番号, 結果)
+    | SwitchAuthMode !AuthFormMode
+      -- ^ ログイン / 新規登録タブの切替
+    | UpdateAuthUsername !Text
+      -- ^ 認証フォームのユーザー名入力変更
+    | UpdateAuthDisplayName !Text
+      -- ^ 認証フォームの表示名入力変更
+    | UpdateAuthPassword !Text
+      -- ^ 認証フォームのパスワード入力変更
+    | UpdateAuthPasswordConfirm !Text
+      -- ^ 認証フォームの確認用パスワード入力変更
+    | SubmitAuthForm
+      -- ^ ログインまたは新規登録フォームの送信
+    | AuthSubmitted !Int !AuthFormMode !(Either ApiClientError AuthSessionResponse)
+      -- ^ @POST /api/auth/login@ または @POST /api/auth/register@ の結果受信
+    | RequestLogout
+      -- ^ ログアウト要求 (未保存変更があれば確認ダイアログ)
+    | LoggedOut !Int !(Either ApiClientError ())
+      -- ^ @POST /api/auth/logout@ の結果受信 (認証セッション世代番号, 結果)
+    | DocumentsLoaded !Int !Int !(Either ApiClientError DocumentListResponse)
+      -- ^ @GET /api/documents@ の結果受信 (認証セッション世代番号, リクエスト世代番号, 結果)
+    | TagsLoaded !Int !(Either ApiClientError TagListResponse)
+      -- ^ @GET /api/tags@ の結果受信 (認証セッション世代番号, 結果)
+    | FoldersLoaded !Int !(Either ApiClientError FolderListResponse)
+      -- ^ @GET /api/folders@ の結果受信 (認証セッション世代番号, 結果)
     | RequestStatusFilter !DocumentStatusFilter
       -- ^ 稼働中 / ゴミ箱タブの切替要求 (未保存変更があれば確認ダイアログ)
     | UpdateListSearchInput !Text
@@ -506,12 +632,12 @@ data ClientAction
       -- ^ 検索・タグ・フォルダフィルタの一括解除
     | RequestOpenDocument !DocumentId
       -- ^ 文書を開く要求 (未保存変更があれば確認ダイアログ)
-    | DocumentLoaded !DocumentId !(Either ApiClientError Document)
-      -- ^ @GET /api/documents/{id}@ の結果受信
+    | DocumentLoaded !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ @GET /api/documents/{id}@ の結果受信 (認証セッション世代番号, 文書 ID, 結果)
     | RequestCreateDocument
       -- ^ 新規文書作成要求 (未保存変更があれば確認ダイアログ)
-    | DocumentCreated !(Either ApiClientError Document)
-      -- ^ @POST /api/documents@ の結果受信
+    | DocumentCreated !Int !(Either ApiClientError Document)
+      -- ^ @POST /api/documents@ の結果受信 (認証セッション世代番号, 結果)
     | ReturnToList
       -- ^ モバイルで一覧画面へ戻る要求 (未保存変更があれば確認ダイアログ)
     | ConfirmDiscardNavigation
@@ -532,8 +658,8 @@ data ClientAction
       -- ^ 編集 / 分割 / プレビューモードの切替
     | SaveCurrentDocument
       -- ^ 現在文書の明示的保存 (@PUT /api/documents/{id}@)
-    | DocumentSaved !DocumentId !(Either ApiClientError Document)
-      -- ^ @PUT /api/documents/{id}@ の結果受信
+    | DocumentSaved !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ @PUT /api/documents/{id}@ の結果受信 (認証セッション世代番号, 文書 ID, 結果)
     | EditorUndoClicked
       -- ^ Undo ボタン押下
     | EditorRedoClicked
@@ -564,24 +690,24 @@ data ClientAction
       -- ^ すべて置換
     | SoftDeleteDocument !DocumentId
       -- ^ 文書をゴミ箱へ移動 (@DELETE /api/documents/{id}@)
-    | DocumentSoftDeleted !DocumentId !(Either ApiClientError Document)
-      -- ^ 論理削除の結果受信
+    | DocumentSoftDeleted !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ 論理削除の結果受信 (認証セッション世代番号, 文書 ID, 結果)
     | RestoreDocument !DocumentId
       -- ^ ゴミ箱内の文書を復元 (@POST /api/documents/{id}/restore@)
-    | DocumentRestored !DocumentId !(Either ApiClientError Document)
-      -- ^ 復元の結果受信
+    | DocumentRestored !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ 復元の結果受信 (認証セッション世代番号, 文書 ID, 結果)
     | RequestPermanentDelete !DocumentId
       -- ^ 完全削除の確認ダイアログを表示する
     | CancelPermanentDelete
       -- ^ 完全削除の確認ダイアログを閉じる
     | ConfirmPermanentDelete !DocumentId
       -- ^ 完全削除を確定実行する (@DELETE /api/documents/{id}/permanent@)
-    | DocumentPermanentlyDeleted !DocumentId !(Either ApiClientError ())
-      -- ^ 完全削除の結果受信
+    | DocumentPermanentlyDeleted !Int !DocumentId !(Either ApiClientError ())
+      -- ^ 完全削除の結果受信 (認証セッション世代番号, 文書 ID, 結果)
     | ApplyExtension !ExtensionId
       -- ^ 指定した拡張機能を現在の編集本文へ適用する
-    | DraftsLoaded !(Either Text [StoredDraft])
-      -- ^ 起動時の IndexedDB 未保存ドラフト一覧の読み込み結果
+    | DraftsLoaded !Int !(Either Text [StoredDraft])
+      -- ^ IndexedDB 未保存ドラフト一覧の読み込み結果 (認証セッション世代番号, 結果)
     | DraftStorageEventReceived !DraftStorageEvent
       -- ^ IndexedDB ドラフト自動退避の完了/失敗通知
     | ApplyStaleDraft
@@ -590,8 +716,8 @@ data ClientAction
       -- ^ 現在文書に紐づくローカル未保存ドラフトを破棄してサーバ版へ戻す
     | RecoverOrphanedDraft
       -- ^ サーバ削除済み文書の孤立ドラフトを新規文書として復元する
-    | OrphanDraftRecovered !DocumentId !(Either ApiClientError Document)
-      -- ^ 孤立ドラフトからの新規文書作成応答
+    | OrphanDraftRecovered !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ 孤立ドラフトからの新規文書作成応答 (認証セッション世代番号, 元文書 ID, 結果)
     | DiscardOrphanedDraft
       -- ^ 孤立ドラフトをローカルから破棄する
     | ExportCurrentDocument
@@ -602,8 +728,8 @@ data ClientAction
       -- ^ ローカルファイルからのインポート開始要求 (未保存変更があれば確認ダイアログ)
     | ImportFilePicked !FilePickResult
       -- ^ ファイル選択ダイアログからの読み込み結果受信
-    | DocumentImported !Text !(Either ApiClientError Document)
-      -- ^ インポートに伴う @POST /api/documents@ の結果受信 (元ファイル名, 結果)
+    | DocumentImported !Int !Text !(Either ApiClientError Document)
+      -- ^ インポートに伴う @POST /api/documents@ の結果受信 (認証セッション世代番号, 元ファイル名, 結果)
     | DismissError
       -- ^ 表示中のエラーバナーを閉じる
     | DismissNotice
@@ -614,6 +740,9 @@ data ClientAction
 initialClientState :: [Extension] -> ClientState
 initialClientState exts = ClientState
     { connectionStatus             = ConnChecking
+    , authState                    = AuthChecking
+    , authSessionSeq               = 0
+    , isLoggingOut                 = False
     , mobilePane                   = PaneList
     , editorViewMode               = ModeEdit
     , filterState                  = defaultFilterState
@@ -650,6 +779,175 @@ initialClientState exts = ClientState
     , statusNotice                 = Nothing
     , extensionMetadatas           = map (\ ext -> ext.metadata) exts
     }
+
+-- | ワークスペース上の全ユーザーデータを破棄し、未認証状態へ戻すための純粋リセット関数。
+-- 接続状態および拡張メタデータは保持しつつ、文書一覧・選択文書・編集ドラフト・フィルタ・
+-- 進行中リクエストフラグをすべて初期化し、@listRequestSeq@ と @authSessionSeq@ を進めて
+-- 旧セッションの遅延応答による状態汚染を構造的に遮断する。
+resetWorkspaceForUnauthenticated ::
+       AuthFormState
+    -> Maybe Text
+    -> Maybe Text
+    -> ClientState
+    -> ClientState
+resetWorkspaceForUnauthenticated nextForm mErr mNotice state = state
+    { authState                    = AuthUnauthenticated nextForm
+    , authSessionSeq               = state.authSessionSeq + 1
+    , isLoggingOut                 = False
+    , mobilePane                   = PaneList
+    , editorViewMode               = ModeEdit
+    , filterState                  = defaultFilterState
+    , availableTags                = []
+    , availableFolders             = []
+    , documentSummaries            = []
+    , totalDocuments               = 0
+    , listRequestSeq               = state.listRequestSeq + 1
+    , isLoadingDocuments           = False
+    , isCreatingDocument           = False
+    , isImportingDocument          = False
+    , pendingListReloadAfterCreate = False
+    , pendingListReloadAfterImport = False
+    , openingDocumentId            = Nothing
+    , autoOpeningDraftId           = Nothing
+    , savingDocument               = Nothing
+    , mutatingDocumentId           = Nothing
+    , selectedDocument             = Nothing
+    , draft                        = emptyEditorDraft
+    , storedDrafts                 = Map.empty
+    , draftSyncState               = DraftSyncIdle
+    , restoredDraftDocId           = Nothing
+    , staleDraftPrompt             = Nothing
+    , orphanedDraft                = Nothing
+    , editorSyncVersion            = state.editorSyncVersion + 1
+    , editorStats                  = emptyEditorStats
+    , canUndo                      = False
+    , canRedo                      = False
+    , metadataPanelOpen            = False
+    , searchPanel                  = emptySearchPanelState
+    , pendingNavigation            = Nothing
+    , confirmPermanentDelete       = Nothing
+    , lastError                    = mErr
+    , statusNotice                 = mNotice
+    }
+
+-- | 任意の表示名入力欄の生文字列を検証する。空白のみの入力は未設定 ('Nothing') とみなす。
+parseDisplayNameInput :: Text -> Either ValidationError (Maybe DisplayName)
+parseDisplayNameInput raw =
+    let trimmed :: Text
+        trimmed = Txt.strip raw
+    in  if Txt.null trimmed
+            then Right Nothing
+            else Just <$> mkDisplayName trimmed
+
+-- | ログインフォームの入力値を検証して 'LoginRequest' を構築する。
+validateLoginForm :: UiMessages -> AuthFormState -> Either Text LoginRequest
+validateLoginForm msgs form = do
+    validUser <- mapValErr (mkUsername form.usernameInput)
+    validPass <- mapValErr (mkPassword form.passwordInput)
+    Right LoginRequest
+        { username = validUser
+        , password = validPass
+        }
+  where
+    mapValErr :: Either ValidationError a -> Either Text a
+    mapValErr = either (Left . formatValidationError msgs) Right
+
+-- | 新規ユーザー登録フォームの入力値を検証して 'RegisterRequest' を構築する。
+-- パスワード確認欄の一致確認と 'validateRegisterRequest' の最小文字数検証を送信前に完了させる。
+validateRegisterForm :: UiMessages -> AuthFormState -> Either Text RegisterRequest
+validateRegisterForm msgs form = do
+    validUser    <- mapValErr (mkUsername form.usernameInput)
+    validDisplay <- mapValErr (parseDisplayNameInput form.displayNameInput)
+    rawPass      <- mapValErr (mkPassword form.passwordInput)
+    validPass    <- mapValErr (validateNewPassword rawPass)
+    when (form.passwordInput /= form.passwordConfirmInput) $
+        Left (msgs.errValidationPrefix <> " (" <> msgs.valPasswordMismatch <> ")")
+    let req :: RegisterRequest
+        req = RegisterRequest
+            { username    = validUser
+            , displayName = validDisplay
+            , password    = validPass
+            }
+    mapValErr (validateRegisterRequest req)
+  where
+    mapValErr :: Either ValidationError a -> Either Text a
+    mapValErr = either (Left . formatValidationError msgs) Right
+
+-- | 起動時・再読込時の @GET /api/auth/me@ 応答を状態へ純粋に反映する。
+-- 通常の未ログイン状態 (HTTP 401) ではエラーバナーを出さずにログイン画面へ遷移する。
+applyAuthSessionChecked ::
+       UiMessages
+    -> Int
+    -> Either ApiClientError AuthSessionResponse
+    -> ClientState
+    -> ClientState
+applyAuthSessionChecked msgs seqNo result state
+    | seqNo /= state.authSessionSeq = state
+    | otherwise = case result of
+        Right session ->
+            (resetWorkspaceForAuthenticated session Nothing state)
+                { connectionStatus = ConnOnline
+                }
+        Left err
+            | isUnauthorizedError err ->
+                resetWorkspaceForUnauthenticated emptyAuthFormState Nothing Nothing state
+            | otherwise ->
+                resetWorkspaceForUnauthenticated
+                    emptyAuthFormState
+                    (Just (formatApiClientError msgs err))
+                    Nothing
+                    state
+
+-- | ログインまたは新規登録 API 応答を状態へ純粋に反映する。
+applyAuthSubmitted ::
+       UiMessages
+    -> Int
+    -> AuthFormMode
+    -> Either ApiClientError AuthSessionResponse
+    -> ClientState
+    -> ClientState
+applyAuthSubmitted msgs seqNo submittedMode result state
+    | seqNo /= state.authSessionSeq = state
+    | otherwise = case result of
+        Right session ->
+            let noticeText :: Text
+                noticeText = case submittedMode of
+                    AuthModeLogin    -> msgs.noticeLoggedIn
+                    AuthModeRegister -> msgs.noticeRegistered
+            in  (resetWorkspaceForAuthenticated session (Just noticeText) state)
+                    { connectionStatus = ConnOnline
+                    }
+        Left err ->
+            let errText :: Text
+                errText = case submittedMode of
+                    AuthModeLogin    -> formatLoginApiError msgs err
+                    AuthModeRegister -> formatRegisterApiError msgs err
+
+                nextForm :: AuthFormState
+                nextForm = case state.authState of
+                    AuthUnauthenticated form -> form
+                        { isSubmitting = False
+                        , formError    = Just errText
+                        }
+                    _ -> emptyAuthFormState
+                        { mode      = submittedMode
+                        , formError = Just errText
+                        }
+            in  state
+                    { authState = AuthUnauthenticated nextForm
+                    }
+
+-- | 認証済みセッションの失効 (HTTP 401) を状態へ純粋に反映する。
+-- すでに未認証状態へ遷移済みの場合はログインフォームの入力内容を保護するため何もしない。
+applySessionExpired :: UiMessages -> ClientState -> ClientState
+applySessionExpired msgs state = case state.authState of
+    AuthAuthenticated{} ->
+        resetWorkspaceForUnauthenticated
+            emptyAuthFormState
+            (Just msgs.errSessionExpired)
+            Nothing
+            state
+    _ -> state
 
 -- | フォルダ入力欄の生文字列を検証する。空白のみの入力はルート ('Nothing') とみなす。
 parseFolderInput :: Text -> Either ValidationError (Maybe FolderPath)
@@ -845,66 +1143,73 @@ applyFoldersResult :: Either ApiClientError FolderListResponse -> ClientState ->
 applyFoldersResult (Right res) state = state { availableFolders = res.folders }
 applyFoldersResult (Left _)    state = state
 
--- | 起動時の IndexedDB ドラフト一覧読み込み結果をクライアント状態へ純粋に反映する。
--- すでにユーザーが編集開始した現在文書のドラフトは上書きせず保持し、
--- まだ未編集のまま開いている文書と一致するドラフトがあれば復元・警告判定を行う。
+-- | IndexedDB ドラフト一覧読み込み結果をクライアント状態へ純粋に反映する。
+-- マルチユーザー分離を保証するため、現在認証済みユーザー ('currentUserId') と 'ownerId' が
+-- 一致するドラフトのみを採用し、他ユーザーおよび所有者未記録のレガシードラフトは無視する。
 applyDraftsLoaded :: UiMessages -> Either Text [StoredDraft] -> ClientState -> ClientState
 applyDraftsLoaded _ (Left errMsg) state =
     state { draftSyncState = DraftSyncFailed errMsg }
-applyDraftsLoaded msgs (Right drafts) state =
-    let loadedMap :: Map DocumentId StoredDraft
-        loadedMap = Map.fromList [ (sd.docId, sd) | sd <- drafts ]
+applyDraftsLoaded msgs (Right drafts) state = case currentUserId state of
+    Nothing -> state
+    Just uid ->
+        let ownedDrafts :: [StoredDraft]
+            ownedDrafts = filterDraftsForOwner uid drafts
 
-        mergedMap :: Map DocumentId StoredDraft
-        mergedMap = Map.union state.storedDrafts loadedMap
+            loadedMap :: Map DocumentId StoredDraft
+            loadedMap = Map.fromList [ (sd.docId, sd) | sd <- ownedDrafts ]
 
-        baseState :: ClientState
-        baseState = state { storedDrafts = mergedMap }
-    in  case state.selectedDocument of
-            Just doc | not (isDraftDirty doc state.draft) ->
-                case reconcileDocumentWithDraft doc (Map.lookup doc.id mergedMap) of
-                    NoLocalDraft -> baseState
-                    RedundantLocalDraft ->
-                        baseState { storedDrafts = Map.delete doc.id mergedMap }
-                    RestoreLocalDraft sd ->
-                        baseState
-                            { draft              = editorDraftFromStored sd
-                            , editorSyncVersion  = baseState.editorSyncVersion + 1
-                            , editorStats        = computeTextStats (toText sd.body)
-                            , editorViewMode     = normalizeViewMode sd.format baseState.editorViewMode
-                            , draftSyncState     = DraftSyncSaved sd.savedAt
-                            , restoredDraftDocId = Just doc.id
-                            , staleDraftPrompt   = Nothing
-                            , statusNotice       = Just msgs.noticeDraftRestored
-                            }
-                    PromptStaleLocalDraft sd ->
-                        baseState { staleDraftPrompt = Just sd }
-            _ -> baseState
+            mergedMap :: Map DocumentId StoredDraft
+            mergedMap = Map.union state.storedDrafts loadedMap
+
+            baseState :: ClientState
+            baseState = state { storedDrafts = mergedMap }
+        in  case state.selectedDocument of
+                Just doc | not (isDraftDirty doc state.draft) ->
+                    case reconcileDocumentWithDraft doc (Map.lookup doc.id mergedMap) of
+                        NoLocalDraft -> baseState
+                        RedundantLocalDraft ->
+                            baseState { storedDrafts = Map.delete doc.id mergedMap }
+                        RestoreLocalDraft sd ->
+                            baseState
+                                { draft              = editorDraftFromStored sd
+                                , editorSyncVersion  = baseState.editorSyncVersion + 1
+                                , editorStats        = computeTextStats (toText sd.body)
+                                , editorViewMode     = normalizeViewMode sd.format baseState.editorViewMode
+                                , draftSyncState     = DraftSyncSaved sd.savedAt
+                                , restoredDraftDocId = Just doc.id
+                                , staleDraftPrompt   = Nothing
+                                , statusNotice       = Just msgs.noticeDraftRestored
+                                }
+                        PromptStaleLocalDraft sd ->
+                            baseState { staleDraftPrompt = Just sd }
+                _ -> baseState
 
 -- | IndexedDB ブリッジからの非同期退避イベントをクライアント状態へ反映する。
 applyDraftStorageEvent :: DraftStorageEvent -> ClientState -> ClientState
-applyDraftStorageEvent evt state = case evt of
-    DraftEvtSaved docId ts ->
-        let nextStored :: Map DocumentId StoredDraft
-            nextStored = Map.adjust (\ sd -> sd { savedAt = ts }) docId state.storedDrafts
+applyDraftStorageEvent evt state = case state.authState of
+    AuthAuthenticated{} -> case evt of
+        DraftEvtSaved docId ts ->
+            let nextStored :: Map DocumentId StoredDraft
+                nextStored = Map.adjust (\ sd -> sd { savedAt = ts }) docId state.storedDrafts
 
-            isSelectedDirty :: Bool
-            isSelectedDirty =
-                fmap (.id) state.selectedDocument == Just docId
-                    && isCurrentDocumentDirty state
-                    && state.draftSyncState /= DraftSyncIdle
-        in  state
-                { storedDrafts   = nextStored
-                , draftSyncState = if isSelectedDirty then DraftSyncSaved ts else state.draftSyncState
-                }
-    DraftEvtSaveFailed mDocId errMsg ->
-        let matchesSelected :: Bool
-            matchesSelected = case mDocId of
-                Nothing    -> isJust state.selectedDocument
-                Just docId -> fmap (.id) state.selectedDocument == Just docId
-        in  if matchesSelected
-                then state { draftSyncState = DraftSyncFailed errMsg }
-                else state
+                isSelectedDirty :: Bool
+                isSelectedDirty =
+                    fmap (.id) state.selectedDocument == Just docId
+                        && isCurrentDocumentDirty state
+                        && state.draftSyncState /= DraftSyncIdle
+            in  state
+                    { storedDrafts   = nextStored
+                    , draftSyncState = if isSelectedDirty then DraftSyncSaved ts else state.draftSyncState
+                    }
+        DraftEvtSaveFailed mDocId errMsg ->
+            let matchesSelected :: Bool
+                matchesSelected = case mDocId of
+                    Nothing    -> isJust state.selectedDocument
+                    Just docId -> fmap (.id) state.selectedDocument == Just docId
+            in  if matchesSelected
+                    then state { draftSyncState = DraftSyncFailed errMsg }
+                    else state
+    _ -> state
 
 -- | 単一文書取得応答を反映する。より新しい選択要求が発生済みの古い応答は無視する。
 -- ローカル IndexedDB に未保存ドラフトが存在する場合は 'reconcileDocumentWithDraft' に従って復元または警告提示する。
@@ -1308,24 +1613,132 @@ dismissError state = state { lastError = Nothing }
 dismissNotice :: ClientState -> ClientState
 dismissNotice state = state { statusNotice = Nothing }
 
--- | Miso の MVU 更新関数。純粋な状態更新・API 呼び出し・CodeMirror 6 コマンド送出を調停する。
+-- | Miso の MVU 更新関数。純粋な状態更新・認証状態管理・API 呼び出し・CodeMirror 6 コマンド送出を調停する。
 updateClient :: ClientEnv -> ClientAction -> Effect () () ClientState ClientAction
 updateClient env action = case action of
-    Initialize -> do
-        triggerRefreshAll
-        io (DraftsLoaded <$> env.draftStorage.listStoredDrafts)
-    RefreshAll -> triggerRefreshAll
+    Initialize ->
+        triggerSessionBootstrap
+    RefreshAll -> do
+        st <- get
+        case st.authState of
+            AuthAuthenticated{}
+                | not st.isLoggingOut -> triggerRefreshWorkspace
+                | otherwise           -> pure ()
+            AuthChecking ->
+                pure ()
+            AuthUnauthenticated form
+                | form.isSubmitting -> pure ()
+                | otherwise         -> triggerSessionBootstrap
     HealthChecked eHealth ->
         modify (applyHealthResult env.messages eHealth)
-    DocumentsLoaded reqSeq eDocs ->
-        modify (applyDocumentsResult env.messages reqSeq eDocs)
-    TagsLoaded eTags ->
-        modify (applyTagsResult eTags)
-    FoldersLoaded eFolders ->
-        modify (applyFoldersResult eFolders)
+    AuthSessionChecked seqNo eSession -> do
+        stBefore <- get
+        when (seqNo == stBefore.authSessionSeq) $ do
+            modify (applyAuthSessionChecked env.messages seqNo eSession)
+            case eSession of
+                Right _ -> loadAuthenticatedWorkspace
+                Left _  -> pure ()
+    SwitchAuthMode nextMode ->
+        modify $ \ st -> case st.authState of
+            AuthUnauthenticated form
+                | not form.isSubmitting ->
+                    st
+                        { authState = AuthUnauthenticated form
+                            { mode                 = nextMode
+                            , passwordConfirmInput = ""
+                            , formError            = Nothing
+                            }
+                        }
+            _ -> st
+    UpdateAuthUsername txt ->
+        updateAuthFormField (\ form -> form { usernameInput = txt, formError = Nothing })
+    UpdateAuthDisplayName txt ->
+        updateAuthFormField (\ form -> form { displayNameInput = txt, formError = Nothing })
+    UpdateAuthPassword txt ->
+        updateAuthFormField (\ form -> form { passwordInput = txt, formError = Nothing })
+    UpdateAuthPasswordConfirm txt ->
+        updateAuthFormField (\ form -> form { passwordConfirmInput = txt, formError = Nothing })
+    SubmitAuthForm -> do
+        st <- get
+        case st.authState of
+            AuthUnauthenticated form
+                | not form.isSubmitting -> case form.mode of
+                    AuthModeLogin ->
+                        case validateLoginForm env.messages form of
+                            Left errMsg ->
+                                updateAuthFormField (\ f -> f { formError = Just errMsg })
+                            Right loginReq -> do
+                                let seqNo :: Int
+                                    seqNo = st.authSessionSeq
+                                modify $ \ s -> s
+                                    { authState    = AuthUnauthenticated form
+                                        { isSubmitting = True
+                                        , formError    = Nothing
+                                        }
+                                    , lastError    = Nothing
+                                    , statusNotice = Nothing
+                                    }
+                                io (AuthSubmitted seqNo AuthModeLogin <$> loginUser env.apiClient loginReq)
+                    AuthModeRegister ->
+                        case validateRegisterForm env.messages form of
+                            Left errMsg ->
+                                updateAuthFormField (\ f -> f { formError = Just errMsg })
+                            Right regReq -> do
+                                let seqNo :: Int
+                                    seqNo = st.authSessionSeq
+                                modify $ \ s -> s
+                                    { authState    = AuthUnauthenticated form
+                                        { isSubmitting = True
+                                        , formError    = Nothing
+                                        }
+                                    , lastError    = Nothing
+                                    , statusNotice = Nothing
+                                    }
+                                io (AuthSubmitted seqNo AuthModeRegister <$> registerUser env.apiClient regReq)
+            _ -> pure ()
+    AuthSubmitted seqNo submittedMode eSession -> do
+        stBefore <- get
+        when (seqNo == stBefore.authSessionSeq) $ do
+            modify (applyAuthSubmitted env.messages seqNo submittedMode eSession)
+            case eSession of
+                Right _ -> loadAuthenticatedWorkspace
+                Left _  -> pure ()
+    RequestLogout -> do
+        st <- get
+        case st.authState of
+            AuthAuthenticated{}
+                | not st.isLoggingOut ->
+                    if isCurrentDocumentDirty st
+                        then modify (\ s -> s { pendingNavigation = Just NavLogout })
+                        else executeLogout
+            _ -> pure ()
+    LoggedOut seqNo eUnit -> do
+        st <- get
+        when (seqNo == st.authSessionSeq) $ case eUnit of
+            Right () -> do
+                modify (resetWorkspaceForUnauthenticated emptyAuthFormState Nothing (Just env.messages.noticeLoggedOut))
+                io_ (env.sendEditorCmd CmdResetEditor)
+            Left err
+                | isUnauthorizedError err -> do
+                    modify (resetWorkspaceForUnauthenticated emptyAuthFormState Nothing (Just env.messages.noticeLoggedOut))
+                    io_ (env.sendEditorCmd CmdResetEditor)
+                | otherwise ->
+                    modify $ \ s -> s
+                        { isLoggingOut = False
+                        , lastError    = Just (formatApiClientError env.messages err)
+                        }
+    DocumentsLoaded seqNo reqSeq eDocs ->
+        guardAuthResponse seqNo eDocs $
+            modify (applyDocumentsResult env.messages reqSeq eDocs)
+    TagsLoaded seqNo eTags ->
+        guardAuthResponse seqNo eTags $
+            modify (applyTagsResult eTags)
+    FoldersLoaded seqNo eFolders ->
+        guardAuthResponse seqNo eFolders $
+            modify (applyFoldersResult eFolders)
     RequestStatusFilter nextStatus -> do
         st <- get
-        if st.filterState.status == nextStatus
+        if isNothing (currentAuthSession st) || st.filterState.status == nextStatus
             then pure ()
             else if isCurrentDocumentDirty st
                 then modify (\ s -> s { pendingNavigation = Just (NavSwitchStatus nextStatus) })
@@ -1351,52 +1764,56 @@ updateClient env action = case action of
         reloadDocumentsForCurrentFilter
     RequestOpenDocument docId -> do
         st <- get
-        if fmap (.id) st.selectedDocument == Just docId
-            then modify $ \ s -> s
-                { openingDocumentId = Nothing
-                , mobilePane        = PaneEditor
-                }
-            else if isCurrentDocumentDirty st
-                then modify (\ s -> s { pendingNavigation = Just (NavOpenDocument docId) })
-                else executeNavigation (NavOpenDocument docId)
-    DocumentLoaded docId eDoc -> do
-        stBefore <- get
-        let shouldCleanRedundant :: Bool
-            shouldCleanRedundant = case eDoc of
-                Right doc
-                    | stBefore.openingDocumentId == Just docId ->
-                        reconcileDocumentWithDraft doc (Map.lookup doc.id stBefore.storedDrafts) == RedundantLocalDraft
-                _ -> False
-        modify (applyDocumentLoaded env.messages docId eDoc)
-        when shouldCleanRedundant (io_ (env.draftStorage.deleteStoredDraft docId))
-        syncEditorFromCurrentState False
+        if isNothing (currentAuthSession st)
+            then pure ()
+            else if fmap (.id) st.selectedDocument == Just docId
+                then modify $ \ s -> s
+                    { openingDocumentId = Nothing
+                    , mobilePane        = PaneEditor
+                    }
+                else if isCurrentDocumentDirty st
+                    then modify (\ s -> s { pendingNavigation = Just (NavOpenDocument docId) })
+                    else executeNavigation (NavOpenDocument docId)
+    DocumentLoaded seqNo docId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            let shouldCleanRedundant :: Bool
+                shouldCleanRedundant = case eDoc of
+                    Right doc
+                        | stBefore.openingDocumentId == Just docId ->
+                            reconcileDocumentWithDraft doc (Map.lookup doc.id stBefore.storedDrafts) == RedundantLocalDraft
+                    _ -> False
+            modify (applyDocumentLoaded env.messages docId eDoc)
+            when shouldCleanRedundant (io_ (env.draftStorage.deleteStoredDraft docId))
+            syncEditorFromCurrentState False
     RequestCreateDocument -> do
         st <- get
-        if st.isCreatingDocument || st.isImportingDocument
+        if isNothing (currentAuthSession st) || st.isCreatingDocument || st.isImportingDocument
             then pure ()
             else if isCurrentDocumentDirty st
                 then modify (\ s -> s { pendingNavigation = Just NavCreateDocument })
                 else executeNavigation NavCreateDocument
-    DocumentCreated eDoc -> do
-        stBefore <- get
-        let shouldReloadList :: Bool
-            shouldReloadList = stBefore.pendingListReloadAfterCreate
-        modify $ \ s ->
-            let base :: ClientState
-                base = (applyDocumentCreated env.messages eDoc s)
-                    { pendingListReloadAfterCreate = False
-                    }
-            in  case eDoc of
-                    Right _ | shouldReloadList -> base { filterState = defaultFilterState }
-                    _                          -> base
-        syncEditorFromCurrentState False
-        case eDoc of
-            Right _ -> do
-                when shouldReloadList reloadDocumentsForCurrentFilter
-                io (TagsLoaded <$> listTags env.apiClient)
-                io (FoldersLoaded <$> listFolders env.apiClient)
-                io_ (env.sendEditorCmd CmdFocus)
-            Left _ -> pure ()
+    DocumentCreated seqNo eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            let shouldReloadList :: Bool
+                shouldReloadList = stBefore.pendingListReloadAfterCreate
+            modify $ \ s ->
+                let base :: ClientState
+                    base = (applyDocumentCreated env.messages eDoc s)
+                        { pendingListReloadAfterCreate = False
+                        }
+                in  case eDoc of
+                        Right _ | shouldReloadList -> base { filterState = defaultFilterState }
+                        _                          -> base
+            syncEditorFromCurrentState False
+            case eDoc of
+                Right _ -> do
+                    when shouldReloadList reloadDocumentsForCurrentFilter
+                    io (TagsLoaded seqNo <$> listTags env.apiClient)
+                    io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                    io_ (env.sendEditorCmd CmdFocus)
+                Left _ -> pure ()
     ReturnToList -> do
         st <- get
         if isCurrentDocumentDirty st
@@ -1411,6 +1828,7 @@ updateClient env action = case action of
             shouldRevertDraft = case st.pendingNavigation of
                 Just NavImportDocument       -> True
                 Just NavRecoverOrphanedDraft -> True
+                Just NavLogout               -> True
                 _                            -> False
         modify $ \ s ->
             let base :: ClientState
@@ -1472,17 +1890,18 @@ updateClient env action = case action of
             }
     SaveCurrentDocument ->
         triggerSaveCurrentDocument
-    DocumentSaved docId eDoc -> do
-        modify (applyDocumentSaved env.messages docId eDoc)
-        case eDoc of
-            Right doc -> do
-                stAfter <- get
-                if fmap (.id) stAfter.selectedDocument == Just doc.id && isDraftDirty doc stAfter.draft
-                    then syncLocalDraftForCurrentState
-                    else io_ (env.draftStorage.deleteStoredDraft doc.id)
-                io (TagsLoaded <$> listTags env.apiClient)
-                io (FoldersLoaded <$> listFolders env.apiClient)
-            Left _ -> pure ()
+    DocumentSaved seqNo docId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            modify (applyDocumentSaved env.messages docId eDoc)
+            case eDoc of
+                Right doc -> do
+                    stAfter <- get
+                    if fmap (.id) stAfter.selectedDocument == Just doc.id && isDraftDirty doc stAfter.draft
+                        then syncLocalDraftForCurrentState
+                        else io_ (env.draftStorage.deleteStoredDraft doc.id)
+                    io (TagsLoaded seqNo <$> listTags env.apiClient)
+                    io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                Left _ -> pure ()
     EditorUndoClicked ->
         io_ (env.sendEditorCmd CmdUndo)
     EditorRedoClicked ->
@@ -1542,68 +1961,74 @@ updateClient env action = case action of
         io_ (env.sendEditorCmd CmdReplaceAll)
     SoftDeleteDocument docId -> do
         st <- get
-        if isJust st.mutatingDocumentId || isJust st.savingDocument
-            then pure ()
-            else do
-                modify $ \ s -> s
-                    { mutatingDocumentId = Just docId
-                    , lastError          = Nothing
-                    }
-                io (DocumentSoftDeleted docId <$> softDeleteDocument env.apiClient docId)
-    DocumentSoftDeleted docId eDoc -> do
-        stBefore <- get
-        let wasSelected :: Bool
-            wasSelected = fmap (.id) stBefore.selectedDocument == Just docId
-        modify (applyDocumentSoftDeleted env.messages docId eDoc)
-        case eDoc of
-            Right _ -> do
-                io_ (env.draftStorage.deleteStoredDraft docId)
-                when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
-                io (TagsLoaded <$> listTags env.apiClient)
-                io (FoldersLoaded <$> listFolders env.apiClient)
-            Left _ -> pure ()
+        case currentAuthSession st of
+            Just session
+                | isNothing st.mutatingDocumentId && isNothing st.savingDocument -> do
+                    modify $ \ s -> s
+                        { mutatingDocumentId = Just docId
+                        , lastError          = Nothing
+                        }
+                    io (DocumentSoftDeleted st.authSessionSeq docId <$> softDeleteDocument env.apiClient session.csrfToken docId)
+            _ -> pure ()
+    DocumentSoftDeleted seqNo docId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            let wasSelected :: Bool
+                wasSelected = fmap (.id) stBefore.selectedDocument == Just docId
+            modify (applyDocumentSoftDeleted env.messages docId eDoc)
+            case eDoc of
+                Right _ -> do
+                    io_ (env.draftStorage.deleteStoredDraft docId)
+                    when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
+                    io (TagsLoaded seqNo <$> listTags env.apiClient)
+                    io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                Left _ -> pure ()
     RestoreDocument docId -> do
         st <- get
-        if isJust st.mutatingDocumentId
-            then pure ()
-            else do
-                modify $ \ s -> s
-                    { mutatingDocumentId = Just docId
-                    , lastError          = Nothing
-                    }
-                io (DocumentRestored docId <$> restoreDocument env.apiClient docId)
-    DocumentRestored docId eDoc -> do
-        modify (applyDocumentRestored env.messages docId eDoc)
-        syncEditorFromCurrentState False
-        case eDoc of
-            Right _ -> do
-                io (TagsLoaded <$> listTags env.apiClient)
-                io (FoldersLoaded <$> listFolders env.apiClient)
-            Left _ -> pure ()
+        case currentAuthSession st of
+            Just session
+                | isNothing st.mutatingDocumentId -> do
+                    modify $ \ s -> s
+                        { mutatingDocumentId = Just docId
+                        , lastError          = Nothing
+                        }
+                    io (DocumentRestored st.authSessionSeq docId <$> restoreDocument env.apiClient session.csrfToken docId)
+            _ -> pure ()
+    DocumentRestored seqNo docId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            modify (applyDocumentRestored env.messages docId eDoc)
+            syncEditorFromCurrentState False
+            case eDoc of
+                Right _ -> do
+                    io (TagsLoaded seqNo <$> listTags env.apiClient)
+                    io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                Left _ -> pure ()
     RequestPermanentDelete docId ->
         modify (\ st -> st { confirmPermanentDelete = Just docId })
     CancelPermanentDelete ->
         modify (\ st -> st { confirmPermanentDelete = Nothing })
     ConfirmPermanentDelete docId -> do
         st <- get
-        if isJust st.mutatingDocumentId
-            then pure ()
-            else do
-                modify $ \ s -> s
-                    { mutatingDocumentId = Just docId
-                    , lastError          = Nothing
-                    }
-                io (DocumentPermanentlyDeleted docId <$> permanentDeleteDocument env.apiClient docId)
-    DocumentPermanentlyDeleted docId eUnit -> do
-        stBefore <- get
-        let wasSelected :: Bool
-            wasSelected = fmap (.id) stBefore.selectedDocument == Just docId
-        modify (applyDocumentPermanentlyDeleted env.messages docId eUnit)
-        case eUnit of
-            Right () -> do
-                io_ (env.draftStorage.deleteStoredDraft docId)
-                when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
-            Left _ -> pure ()
+        case currentAuthSession st of
+            Just session
+                | isNothing st.mutatingDocumentId -> do
+                    modify $ \ s -> s
+                        { mutatingDocumentId = Just docId
+                        , lastError          = Nothing
+                        }
+                    io (DocumentPermanentlyDeleted st.authSessionSeq docId <$> permanentDeleteDocument env.apiClient session.csrfToken docId)
+            _ -> pure ()
+    DocumentPermanentlyDeleted seqNo docId eUnit ->
+        guardAuthResponse seqNo eUnit $ do
+            stBefore <- get
+            let wasSelected :: Bool
+                wasSelected = fmap (.id) stBefore.selectedDocument == Just docId
+            modify (applyDocumentPermanentlyDeleted env.messages docId eUnit)
+            case eUnit of
+                Right () -> do
+                    io_ (env.draftStorage.deleteStoredDraft docId)
+                    when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
+                Left _ -> pure ()
     ApplyExtension extId -> do
         st <- get
         let hasExt :: Bool
@@ -1617,34 +2042,40 @@ updateClient env action = case action of
                 syncLocalDraftForCurrentState
                 syncEditorFromCurrentState False
             _ -> pure ()
-    DraftsLoaded eDrafts -> do
+    DraftsLoaded seqNo eDrafts -> do
         stBefore <- get
-        modify (applyDraftsLoaded env.messages eDrafts)
-        case eDrafts of
-            Left _ -> pure ()
-            Right drafts -> do
-                let loadedMap :: Map DocumentId StoredDraft
-                    loadedMap = Map.fromList [ (sd.docId, sd) | sd <- drafts ]
-                case stBefore.selectedDocument of
-                    Just doc | not (isDraftDirty doc stBefore.draft) ->
-                        case reconcileDocumentWithDraft doc (Map.lookup doc.id (Map.union stBefore.storedDrafts loadedMap)) of
-                            RedundantLocalDraft ->
-                                io_ (env.draftStorage.deleteStoredDraft doc.id)
-                            RestoreLocalDraft{} ->
-                                syncEditorFromCurrentState False
+        case currentUserId stBefore of
+            Just uid | seqNo == stBefore.authSessionSeq -> do
+                modify (applyDraftsLoaded env.messages eDrafts)
+                case eDrafts of
+                    Left _ -> pure ()
+                    Right drafts -> do
+                        let ownedDrafts :: [StoredDraft]
+                            ownedDrafts = filterDraftsForOwner uid drafts
+
+                            loadedMap :: Map DocumentId StoredDraft
+                            loadedMap = Map.fromList [ (sd.docId, sd) | sd <- ownedDrafts ]
+                        case stBefore.selectedDocument of
+                            Just doc | not (isDraftDirty doc stBefore.draft) ->
+                                case reconcileDocumentWithDraft doc (Map.lookup doc.id (Map.union stBefore.storedDrafts loadedMap)) of
+                                    RedundantLocalDraft ->
+                                        io_ (env.draftStorage.deleteStoredDraft doc.id)
+                                    RestoreLocalDraft{} ->
+                                        syncEditorFromCurrentState False
+                                    _ -> pure ()
+                            Nothing
+                                | isNothing stBefore.openingDocumentId
+                                    && not stBefore.isCreatingDocument
+                                    && not stBefore.isImportingDocument ->
+                                    for_ (latestStoredDraft ownedDrafts) $ \ latest -> do
+                                        modify $ \ s -> s
+                                            { openingDocumentId  = Just latest.docId
+                                            , autoOpeningDraftId = Just latest.docId
+                                            , mobilePane         = PaneEditor
+                                            }
+                                        io (DocumentLoaded seqNo latest.docId <$> getDocument env.apiClient latest.docId)
                             _ -> pure ()
-                    Nothing
-                        | isNothing stBefore.openingDocumentId
-                            && not stBefore.isCreatingDocument
-                            && not stBefore.isImportingDocument ->
-                            for_ (latestStoredDraft drafts) $ \ latest -> do
-                                modify $ \ s -> s
-                                    { openingDocumentId  = Just latest.docId
-                                    , autoOpeningDraftId = Just latest.docId
-                                    , mobilePane         = PaneEditor
-                                    }
-                                io (DocumentLoaded latest.docId <$> getDocument env.apiClient latest.docId)
-                    _ -> pure ()
+            _ -> pure ()
     DraftStorageEventReceived evt ->
         modify (applyDraftStorageEvent evt)
     ApplyStaleDraft -> do
@@ -1705,40 +2136,41 @@ updateClient env action = case action of
                     io_ (env.draftStorage.deleteStoredDraft doc.id)
     RecoverOrphanedDraft -> do
         st <- get
-        case st.orphanedDraft of
-            Nothing -> pure ()
-            Just _
+        case (currentAuthSession st, st.orphanedDraft) of
+            (Just _, Just _)
                 | st.isCreatingDocument || st.isImportingDocument -> pure ()
                 | isCurrentDocumentDirty st ->
                     modify (\ s -> s { pendingNavigation = Just NavRecoverOrphanedDraft })
                 | otherwise ->
                     executeNavigation NavRecoverOrphanedDraft
-    OrphanDraftRecovered oldDocId eDoc -> do
-        stBefore <- get
-        let shouldReloadList :: Bool
-            shouldReloadList = stBefore.pendingListReloadAfterCreate
-        modify $ \ s ->
-            let base :: ClientState
-                base = (applyDocumentCreated env.messages eDoc s)
-                    { pendingListReloadAfterCreate = False
-                    }
-            in  case eDoc of
-                    Right _ -> base
-                        { orphanedDraft = Nothing
-                        , storedDrafts  = Map.delete oldDocId base.storedDrafts
-                        , filterState   = if shouldReloadList then defaultFilterState else base.filterState
-                        , statusNotice  = Just env.messages.noticeDraftRestored
+            _ -> pure ()
+    OrphanDraftRecovered seqNo oldDocId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            let shouldReloadList :: Bool
+                shouldReloadList = stBefore.pendingListReloadAfterCreate
+            modify $ \ s ->
+                let base :: ClientState
+                    base = (applyDocumentCreated env.messages eDoc s)
+                        { pendingListReloadAfterCreate = False
                         }
-                    Left _ -> base
-        syncEditorFromCurrentState False
-        case eDoc of
-            Right _ -> do
-                io_ (env.draftStorage.deleteStoredDraft oldDocId)
-                when shouldReloadList reloadDocumentsForCurrentFilter
-                io (TagsLoaded <$> listTags env.apiClient)
-                io (FoldersLoaded <$> listFolders env.apiClient)
-                io_ (env.sendEditorCmd CmdFocus)
-            Left _ -> pure ()
+                in  case eDoc of
+                        Right _ -> base
+                            { orphanedDraft = Nothing
+                            , storedDrafts  = Map.delete oldDocId base.storedDrafts
+                            , filterState   = if shouldReloadList then defaultFilterState else base.filterState
+                            , statusNotice  = Just env.messages.noticeDraftRestored
+                            }
+                        Left _ -> base
+            syncEditorFromCurrentState False
+            case eDoc of
+                Right _ -> do
+                    io_ (env.draftStorage.deleteStoredDraft oldDocId)
+                    when shouldReloadList reloadDocumentsForCurrentFilter
+                    io (TagsLoaded seqNo <$> listTags env.apiClient)
+                    io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                    io_ (env.sendEditorCmd CmdFocus)
+                Left _ -> pure ()
     DiscardOrphanedDraft -> do
         st <- get
         for_ st.orphanedDraft $ \ sd -> do
@@ -1768,7 +2200,7 @@ updateClient env action = case action of
                 }
     RequestImportDocument -> do
         st <- get
-        if st.isImportingDocument || st.isCreatingDocument
+        if isNothing (currentAuthSession st) || st.isImportingDocument || st.isCreatingDocument
             then pure ()
             else if isCurrentDocumentDirty st
                 then modify (\ s -> s { pendingNavigation = Just NavImportDocument })
@@ -1779,122 +2211,209 @@ updateClient env action = case action of
             modify (\ s -> s { lastError = Just (formatFileImportError env.messages err) })
         FilePickSelected imported -> do
             st <- get
-            if st.isImportingDocument || st.isCreatingDocument
-                then pure ()
-                else do
-                    let fromTrash :: Bool
-                        fromTrash = st.filterState.status == StatusTrashed
+            case currentAuthSession st of
+                Just session
+                    | not st.isImportingDocument && not st.isCreatingDocument -> do
+                        let fromTrash :: Bool
+                            fromTrash = st.filterState.status == StatusTrashed
 
-                        targetFolder :: Maybe FolderPath
-                        targetFolder = if fromTrash then Nothing else st.filterState.selectedFolder
+                            targetFolder :: Maybe FolderPath
+                            targetFolder = if fromTrash then Nothing else st.filterState.selectedFolder
 
-                        targetTags :: TagSet
-                        targetTags =
-                            if fromTrash
-                                then emptyTagSet
-                                else case st.filterState.selectedTag of
-                                    Nothing -> emptyTagSet
-                                    Just t  -> fromRight emptyTagSet (mkTagSetFromTexts [toText t])
-                    case prepareImportedDocumentRequest imported targetFolder targetTags of
-                        Left err ->
-                            modify (\ s -> s { lastError = Just (formatFileImportError env.messages err) })
-                        Right createReq -> do
-                            modify $ \ s -> s
-                                { isImportingDocument          = True
-                                , pendingListReloadAfterImport = fromTrash
-                                , lastError                    = Nothing
-                                , statusNotice                 = Nothing
-                                }
-                            io (DocumentImported imported.fileName <$> createDocument env.apiClient createReq)
-    DocumentImported fileName eDoc -> do
-        stBefore <- get
-        let shouldReloadList :: Bool
-            shouldReloadList = stBefore.pendingListReloadAfterImport
-        modify $ \ s ->
-            let base :: ClientState
-                base = (applyDocumentCreated env.messages eDoc s)
-                    { isImportingDocument          = False
-                    , pendingListReloadAfterImport = False
-                    }
-            in  case eDoc of
-                    Right _ -> base
-                        { filterState  = if shouldReloadList then defaultFilterState else base.filterState
-                        , statusNotice = Just (env.messages.noticeImportedPrefix <> fileName)
+                            targetTags :: TagSet
+                            targetTags =
+                                if fromTrash
+                                    then emptyTagSet
+                                    else case st.filterState.selectedTag of
+                                        Nothing -> emptyTagSet
+                                        Just t  -> fromRight emptyTagSet (mkTagSetFromTexts [toText t])
+                        case prepareImportedDocumentRequest imported targetFolder targetTags of
+                            Left err ->
+                                modify (\ s -> s { lastError = Just (formatFileImportError env.messages err) })
+                            Right createReq -> do
+                                modify $ \ s -> s
+                                    { isImportingDocument          = True
+                                    , pendingListReloadAfterImport = fromTrash
+                                    , lastError                    = Nothing
+                                    , statusNotice                 = Nothing
+                                    }
+                                io (DocumentImported st.authSessionSeq imported.fileName <$> createDocument env.apiClient session.csrfToken createReq)
+                _ -> pure ()
+    DocumentImported seqNo fileName eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            let shouldReloadList :: Bool
+                shouldReloadList = stBefore.pendingListReloadAfterImport
+            modify $ \ s ->
+                let base :: ClientState
+                    base = (applyDocumentCreated env.messages eDoc s)
+                        { isImportingDocument          = False
+                        , pendingListReloadAfterImport = False
                         }
-                    Left _ -> base
-        syncEditorFromCurrentState False
-        case eDoc of
-            Right _ -> do
-                when shouldReloadList reloadDocumentsForCurrentFilter
-                io (TagsLoaded <$> listTags env.apiClient)
-                io (FoldersLoaded <$> listFolders env.apiClient)
-                io_ (env.sendEditorCmd CmdFocus)
-            Left _ -> pure ()
+                in  case eDoc of
+                        Right _ -> base
+                            { filterState  = if shouldReloadList then defaultFilterState else base.filterState
+                            , statusNotice = Just (env.messages.noticeImportedPrefix <> fileName)
+                            }
+                        Left _ -> base
+            syncEditorFromCurrentState False
+            case eDoc of
+                Right _ -> do
+                    when shouldReloadList reloadDocumentsForCurrentFilter
+                    io (TagsLoaded seqNo <$> listTags env.apiClient)
+                    io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                    io_ (env.sendEditorCmd CmdFocus)
+                Left _ -> pure ()
     DismissError ->
         modify dismissError
     DismissNotice ->
         modify dismissNotice
   where
-    triggerRefreshAll :: Effect () () ClientState ClientAction
-    triggerRefreshAll = do
+    triggerSessionBootstrap :: Effect () () ClientState ClientAction
+    triggerSessionBootstrap = do
         st <- get
-        case buildListQueryFromFilter st.filterState of
-            Left vErr ->
-                modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
-            Right listQuery -> do
-                let nextSeq :: Int
-                    nextSeq = st.listRequestSeq + 1
+        let nextAuthSeq :: Int
+            nextAuthSeq = st.authSessionSeq + 1
+        modify $ \ s -> s
+            { connectionStatus = ConnChecking
+            , authState        = AuthChecking
+            , authSessionSeq   = nextAuthSeq
+            , lastError        = Nothing
+            }
+        io (HealthChecked <$> fetchHealth env.apiClient)
+        io (AuthSessionChecked nextAuthSeq <$> getCurrentUser env.apiClient)
+
+    loadAuthenticatedWorkspace :: Effect () () ClientState ClientAction
+    loadAuthenticatedWorkspace = do
+        st <- get
+        case currentAuthSession st of
+            Nothing -> pure ()
+            Just _ -> do
+                let authSeq :: Int
+                    authSeq = st.authSessionSeq
+
+                    nextListSeq :: Int
+                    nextListSeq = st.listRequestSeq + 1
                 modify $ \ s -> s
-                    { connectionStatus   = ConnChecking
-                    , listRequestSeq     = nextSeq
+                    { listRequestSeq     = nextListSeq
                     , isLoadingDocuments = True
-                    , lastError          = Nothing
                     }
-                io (HealthChecked <$> fetchHealth env.apiClient)
-                io (DocumentsLoaded nextSeq <$> listDocuments env.apiClient listQuery)
-                io (TagsLoaded <$> listTags env.apiClient)
-                io (FoldersLoaded <$> listFolders env.apiClient)
+                io (DocumentsLoaded authSeq nextListSeq <$> listDocuments env.apiClient defaultDocumentListQuery)
+                io (TagsLoaded authSeq <$> listTags env.apiClient)
+                io (FoldersLoaded authSeq <$> listFolders env.apiClient)
+                io (DraftsLoaded authSeq <$> env.draftStorage.listStoredDrafts)
+
+    triggerRefreshWorkspace :: Effect () () ClientState ClientAction
+    triggerRefreshWorkspace = do
+        st <- get
+        case currentAuthSession st of
+            Nothing -> pure ()
+            Just _ -> case buildListQueryFromFilter st.filterState of
+                Left vErr ->
+                    modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
+                Right listQuery -> do
+                    let authSeq :: Int
+                        authSeq = st.authSessionSeq
+
+                        nextSeq :: Int
+                        nextSeq = st.listRequestSeq + 1
+                    modify $ \ s -> s
+                        { connectionStatus   = ConnChecking
+                        , listRequestSeq     = nextSeq
+                        , isLoadingDocuments = True
+                        , lastError          = Nothing
+                        }
+                    io (HealthChecked <$> fetchHealth env.apiClient)
+                    io (DocumentsLoaded authSeq nextSeq <$> listDocuments env.apiClient listQuery)
+                    io (TagsLoaded authSeq <$> listTags env.apiClient)
+                    io (FoldersLoaded authSeq <$> listFolders env.apiClient)
 
     reloadDocumentsForCurrentFilter :: Effect () () ClientState ClientAction
     reloadDocumentsForCurrentFilter = do
         st <- get
-        case buildListQueryFromFilter st.filterState of
-            Left vErr ->
-                modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
-            Right listQuery -> do
-                let nextSeq :: Int
-                    nextSeq = st.listRequestSeq + 1
-                modify $ \ s -> s
-                    { listRequestSeq     = nextSeq
-                    , isLoadingDocuments = True
-                    , lastError          = Nothing
-                    }
-                io (DocumentsLoaded nextSeq <$> listDocuments env.apiClient listQuery)
+        case currentAuthSession st of
+            Nothing -> pure ()
+            Just _ -> case buildListQueryFromFilter st.filterState of
+                Left vErr ->
+                    modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
+                Right listQuery -> do
+                    let authSeq :: Int
+                        authSeq = st.authSessionSeq
+
+                        nextSeq :: Int
+                        nextSeq = st.listRequestSeq + 1
+                    modify $ \ s -> s
+                        { listRequestSeq     = nextSeq
+                        , isLoadingDocuments = True
+                        , lastError          = Nothing
+                        }
+                    io (DocumentsLoaded authSeq nextSeq <$> listDocuments env.apiClient listQuery)
+
+    guardAuthResponse ::
+           Int
+        -> Either ApiClientError a
+        -> Effect () () ClientState ClientAction
+        -> Effect () () ClientState ClientAction
+    guardAuthResponse seqNo eRes onAuthorized = do
+        st <- get
+        case st.authState of
+            AuthAuthenticated{}
+                | seqNo == st.authSessionSeq -> case eRes of
+                    Left err | isUnauthorizedError err -> do
+                        modify (applySessionExpired env.messages)
+                        io_ (env.sendEditorCmd CmdResetEditor)
+                    _ -> onAuthorized
+            _ -> pure ()
+
+    updateAuthFormField :: (AuthFormState -> AuthFormState) -> Effect () () ClientState ClientAction
+    updateAuthFormField fn =
+        modify $ \ st -> case st.authState of
+            AuthUnauthenticated form -> st { authState = AuthUnauthenticated (fn form) }
+            _                        -> st
+
+    executeLogout :: Effect () () ClientState ClientAction
+    executeLogout = do
+        st <- get
+        case currentAuthSession st of
+            Just session
+                | not st.isLoggingOut -> do
+                    modify $ \ s -> s
+                        { isLoggingOut = True
+                        , lastError    = Nothing
+                        , statusNotice = Nothing
+                        }
+                    io (LoggedOut st.authSessionSeq <$> logoutUser env.apiClient session.csrfToken)
+            _ -> pure ()
 
     executeNavigation :: PendingNavigation -> Effect () () ClientState ClientAction
     executeNavigation nav = case nav of
         NavOpenDocument docId -> do
-            modify $ \ s -> s
-                { openingDocumentId  = Just docId
-                , autoOpeningDraftId = Nothing
-                , mobilePane         = PaneEditor
-                , lastError          = Nothing
-                }
-            io (DocumentLoaded docId <$> getDocument env.apiClient docId)
+            st <- get
+            when (isJust (currentAuthSession st)) $ do
+                modify $ \ s -> s
+                    { openingDocumentId  = Just docId
+                    , autoOpeningDraftId = Nothing
+                    , mobilePane         = PaneEditor
+                    , lastError          = Nothing
+                    }
+                io (DocumentLoaded st.authSessionSeq docId <$> getDocument env.apiClient docId)
         NavCreateDocument -> do
             st <- get
-            let fromTrash :: Bool
-                fromTrash = st.filterState.status == StatusTrashed
+            case currentAuthSession st of
+                Nothing -> pure ()
+                Just session -> do
+                    let fromTrash :: Bool
+                        fromTrash = st.filterState.status == StatusTrashed
 
-                initialReq :: CreateDocumentRequest
-                initialReq = buildCreateRequestFromFilter st.filterState
-            modify $ \ s -> s
-                { isCreatingDocument           = True
-                , pendingListReloadAfterCreate = fromTrash
-                , lastError                    = Nothing
-                , statusNotice                 = Nothing
-                }
-            io (DocumentCreated <$> createDocument env.apiClient initialReq)
+                        initialReq :: CreateDocumentRequest
+                        initialReq = buildCreateRequestFromFilter st.filterState
+                    modify $ \ s -> s
+                        { isCreatingDocument           = True
+                        , pendingListReloadAfterCreate = fromTrash
+                        , lastError                    = Nothing
+                        , statusNotice                 = Nothing
+                        }
+                    io (DocumentCreated st.authSessionSeq <$> createDocument env.apiClient session.csrfToken initialReq)
         NavSwitchStatus nextStatus -> do
             modify $ \ s -> s
                 { filterState        = setFilterStatus nextStatus s.filterState
@@ -1934,33 +2453,35 @@ updateClient env action = case action of
             io (ImportFilePicked <$> env.fileTransfer.pickImportFile)
         NavRecoverOrphanedDraft -> do
             st <- get
-            case st.orphanedDraft of
-                Nothing -> pure ()
-                Just sd
-                    | st.isCreatingDocument || st.isImportingDocument -> pure ()
-                    | otherwise -> case buildRecoveryRequestFromStoredDraft sd of
-                        Left vErr ->
-                            modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
-                        Right createReq -> do
-                            let fromTrash :: Bool
-                                fromTrash = st.filterState.status == StatusTrashed
-                            modify $ \ s -> s
-                                { isCreatingDocument           = True
-                                , pendingListReloadAfterCreate = fromTrash
-                                , lastError                    = Nothing
-                                , statusNotice                 = Nothing
-                                }
-                            io (OrphanDraftRecovered sd.docId <$> createDocument env.apiClient createReq)
+            case (currentAuthSession st, st.orphanedDraft) of
+                (Just session, Just sd)
+                    | not st.isCreatingDocument && not st.isImportingDocument ->
+                        case buildRecoveryRequestFromStoredDraft sd of
+                            Left vErr ->
+                                modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
+                            Right createReq -> do
+                                let fromTrash :: Bool
+                                    fromTrash = st.filterState.status == StatusTrashed
+                                modify $ \ s -> s
+                                    { isCreatingDocument           = True
+                                    , pendingListReloadAfterCreate = fromTrash
+                                    , lastError                    = Nothing
+                                    , statusNotice                 = Nothing
+                                    }
+                                io (OrphanDraftRecovered st.authSessionSeq sd.docId <$> createDocument env.apiClient session.csrfToken createReq)
+                _ -> pure ()
+        NavLogout ->
+            executeLogout
 
     syncLocalDraftForCurrentState :: Effect () () ClientState ClientAction
     syncLocalDraftForCurrentState = do
         st <- get
-        case st.selectedDocument of
-            Just doc | not (isTrashed doc) ->
+        case (currentUserId st, st.selectedDocument) of
+            (Just uid, Just doc) | not (isTrashed doc) ->
                 if isDraftDirty doc st.draft
                     then do
                         let provisional :: StoredDraft
-                            provisional = toStoredDraft doc st.draft doc.updatedAt
+                            provisional = toStoredDraft uid doc st.draft doc.updatedAt
                         modify $ \ s -> s
                             { storedDrafts     = Map.insert doc.id provisional s.storedDrafts
                             , draftSyncState   = DraftSyncPending
@@ -1968,7 +2489,7 @@ updateClient env action = case action of
                             }
                         io_ $ do
                             now <- env.getCurrentUtcTime
-                            env.draftStorage.scheduleSaveDraft (toStoredDraft doc st.draft now)
+                            env.draftStorage.scheduleSaveDraft (toStoredDraft uid doc st.draft now)
                     else do
                         modify $ \ s -> s
                             { storedDrafts       = Map.delete doc.id s.storedDrafts
@@ -1981,12 +2502,9 @@ updateClient env action = case action of
     triggerSaveCurrentDocument :: Effect () () ClientState ClientAction
     triggerSaveCurrentDocument = do
         st <- get
-        case st.selectedDocument of
-            Nothing -> pure ()
-            Just doc
-                | isTrashed doc -> pure ()
-                | isJust st.savingDocument -> pure ()
-                | otherwise ->
+        case (currentAuthSession st, st.selectedDocument) of
+            (Just session, Just doc)
+                | not (isTrashed doc) && isNothing st.savingDocument ->
                     case validateEditorDraft st.draft of
                         Left vErr ->
                             modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
@@ -1996,7 +2514,8 @@ updateClient env action = case action of
                                 , lastError      = Nothing
                                 , statusNotice   = Nothing
                                 }
-                            io (DocumentSaved doc.id <$> updateDocument env.apiClient doc.id updateReq)
+                            io (DocumentSaved st.authSessionSeq doc.id <$> updateDocument env.apiClient session.csrfToken doc.id updateReq)
+            _ -> pure ()
 
     syncEditorFromCurrentState :: Bool -> Effect () () ClientState ClientAction
     syncEditorFromCurrentState shouldResetHistory = do
@@ -2018,6 +2537,54 @@ updateClient env action = case action of
                 , useRegex      = sp.useRegex
                 }
             else io_ (env.sendEditorCmd CmdClearSearch)
+
+resetWorkspaceForAuthenticated ::
+       AuthSessionResponse
+    -> Maybe Text
+    -> ClientState
+    -> ClientState
+resetWorkspaceForAuthenticated session mNotice state = state
+    { authState                    = AuthAuthenticated session
+    , authSessionSeq               = state.authSessionSeq + 1
+    , isLoggingOut                 = False
+    , mobilePane                   = PaneList
+    , editorViewMode               = ModeEdit
+    , filterState                  = defaultFilterState
+    , availableTags                = []
+    , availableFolders             = []
+    , documentSummaries            = []
+    , totalDocuments               = 0
+    , listRequestSeq               = state.listRequestSeq + 1
+    , isLoadingDocuments           = False
+    , isCreatingDocument           = False
+    , isImportingDocument          = False
+    , pendingListReloadAfterCreate = False
+    , pendingListReloadAfterImport = False
+    , openingDocumentId            = Nothing
+    , autoOpeningDraftId           = Nothing
+    , savingDocument               = Nothing
+    , mutatingDocumentId           = Nothing
+    , selectedDocument             = Nothing
+    , draft                        = emptyEditorDraft
+    , storedDrafts                 = Map.empty
+    , draftSyncState               = DraftSyncIdle
+    , restoredDraftDocId           = Nothing
+    , staleDraftPrompt             = Nothing
+    , orphanedDraft                = Nothing
+    , editorSyncVersion            = state.editorSyncVersion + 1
+    , editorStats                  = emptyEditorStats
+    , canUndo                      = False
+    , canRedo                      = False
+    , metadataPanelOpen            = False
+    , searchPanel                  = emptySearchPanelState
+    , pendingNavigation            = Nothing
+    , confirmPermanentDelete       = Nothing
+    , lastError                    = Nothing
+    , statusNotice                 = mNotice
+    }
+
+filterDraftsForOwner :: UserId -> [StoredDraft] -> [StoredDraft]
+filterDraftsForOwner uid = filter (\ sd -> sd.ownerId == Just uid)
 
 buildCreateRequestFromFilter :: FilterState -> CreateDocumentRequest
 buildCreateRequestFromFilter flt

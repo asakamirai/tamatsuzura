@@ -9,6 +9,7 @@ module TamaTsuzura.Client.Api
       ApiBaseUrl
     , defaultApiBaseUrl
     , mkApiBaseUrl
+    , csrfHeaderName
     , HttpMethod(..)
     , HttpRequest(..)
     , HttpResponse(..)
@@ -18,10 +19,15 @@ module TamaTsuzura.Client.Api
     , defaultApiClient
       -- * クライアントエラー型
     , ApiClientError(..)
+    , isUnauthorizedError
       -- * 純粋な URL 構築・リクエスト生成・レスポンス解析
     , percentEncodeQueryComponent
     , buildDocumentListQueryString
     , buildHealthRequest
+    , buildRegisterRequest
+    , buildLoginRequest
+    , buildLogoutRequest
+    , buildGetCurrentUserRequest
     , buildListDocumentsRequest
     , buildCreateDocumentRequest
     , buildGetDocumentRequest
@@ -33,7 +39,12 @@ module TamaTsuzura.Client.Api
     , buildListFoldersRequest
     , parseJsonResponse
     , parseNoContentResponse
-      -- * M1 REST API クライアント操作
+      -- * 認証 REST API クライアント操作
+    , registerUser
+    , loginUser
+    , logoutUser
+    , getCurrentUser
+      -- * 文書 REST API クライアント操作
     , fetchHealth
     , listDocuments
     , createDocument
@@ -46,20 +57,21 @@ module TamaTsuzura.Client.Api
     , listFolders
     ) where
 
-import           Data.Aeson                   (FromJSON, ToJSON)
-import qualified Data.Aeson                   as Aeson
-import           Data.Bits                    (shiftR, (.&.))
-import           Data.ByteString              (ByteString)
-import qualified Data.ByteString              as BS
-import qualified Data.ByteString.Lazy         as LazyBS
-import qualified Data.Char                    as Char
-import           Data.Text                    (Text)
-import qualified Data.Text                    as Txt
-import qualified Data.Text.Encoding           as TxtEnc
-import           Data.Word                    (Word8)
-import           TamaTsuzura.Client.Ffi       (RawFetchResult(..), fetchRaw)
+import           Data.Aeson                    (FromJSON, ToJSON)
+import qualified Data.Aeson                    as Aeson
+import           Data.Bits                     (shiftR, (.&.))
+import           Data.ByteString               (ByteString)
+import qualified Data.ByteString               as BS
+import qualified Data.ByteString.Lazy          as LazyBS
+import qualified Data.Char                     as Char
+import           Data.Text                     (Text)
+import qualified Data.Text                     as Txt
+import qualified Data.Text.Encoding            as TxtEnc
+import           Data.Word                     (Word8)
+import           TamaTsuzura.Client.Ffi        (RawFetchResult(..), fetchRaw)
 import           TamaTsuzura.Common.Api
-    ( ApiError
+    ( ApiError(..)
+    , ApiErrorCode(..)
     , CreateDocumentRequest
     , DocumentListQuery(..)
     , DocumentListResponse
@@ -73,8 +85,15 @@ import           TamaTsuzura.Common.Api
     , validateCreateDocumentRequest
     , validateUpdateDocumentRequest
     )
-import           TamaTsuzura.Common.Document  (Document, DocumentId)
-import           TamaTsuzura.Common.Text      (ToText(..))
+import           TamaTsuzura.Common.Auth
+    ( AuthSessionResponse
+    , CsrfToken
+    , LoginRequest
+    , RegisterRequest
+    , validateRegisterRequest
+    )
+import           TamaTsuzura.Common.Document   (Document, DocumentId)
+import           TamaTsuzura.Common.Text       (ToText(..))
 import           TamaTsuzura.Common.Validation (ValidationError)
 
 -- | REST API 接続先のベース URL (末尾スラッシュを正規化除去済み)。
@@ -93,6 +112,10 @@ defaultApiBaseUrl = ApiBaseUrl ""
 -- | 文字列の前後の空白と末尾のスラッシュを正規化して 'ApiBaseUrl' を構築する。
 mkApiBaseUrl :: Text -> ApiBaseUrl
 mkApiBaseUrl raw = ApiBaseUrl (Txt.dropWhileEnd (== '/') (Txt.strip raw))
+
+-- | 状態変更 API リクエストへ添付する CSRF トークン HTTP ヘッダ名 (@X-CSRF-Token@)。
+csrfHeaderName :: Text
+csrfHeaderName = "X-CSRF-Token"
 
 -- | REST API 呼び出しで使用する HTTP メソッド。
 data HttpMethod
@@ -198,6 +221,14 @@ instance ToText ApiClientError where
 instance Show ApiClientError where
     show = Txt.unpack . toText
 
+-- | エラーが HTTP 401 未認証 (セッション未開始・期限切れ・失効) に該当するか判定する。
+isUnauthorizedError :: ApiClientError -> Bool
+isUnauthorizedError (ClientApiError status apiErr) =
+    status == 401 || apiErr.code == ErrUnauthorized
+isUnauthorizedError (ClientHttpError status _) =
+    status == 401
+isUnauthorizedError _ = False
+
 -- | クエリパラメータのキー・値を RFC 3986 非予約文字以外 UTF-8 パーセントエンコードする。
 -- 日本語のタグ・フォルダ名・検索語や @&@ / @=@ / @+@ / @%@ / 空白を安全に転送するために使用する。
 percentEncodeQueryComponent :: Text -> Text
@@ -267,6 +298,47 @@ buildHealthRequest base = HttpRequest
     , body    = Nothing
     }
 
+-- | @POST /api/auth/register@ のリクエストをドメイン検証付きで構築する。
+buildRegisterRequest ::
+       ApiBaseUrl
+    -> RegisterRequest
+    -> Either ValidationError HttpRequest
+buildRegisterRequest base req = do
+    validated <- validateRegisterRequest req
+    Right HttpRequest
+        { method  = MethodPost
+        , url     = endpointUrl base "/api/auth/register"
+        , headers = jsonBodyHeaders
+        , body    = Just (encodeJsonBody validated)
+        }
+
+-- | @POST /api/auth/login@ のリクエストを構築する。
+buildLoginRequest :: ApiBaseUrl -> LoginRequest -> HttpRequest
+buildLoginRequest base req = HttpRequest
+    { method  = MethodPost
+    , url     = endpointUrl base "/api/auth/login"
+    , headers = jsonBodyHeaders
+    , body    = Just (encodeJsonBody req)
+    }
+
+-- | @POST /api/auth/logout@ のリクエストを CSRF ヘッダ付きで構築する。
+buildLogoutRequest :: ApiBaseUrl -> CsrfToken -> HttpRequest
+buildLogoutRequest base csrf = HttpRequest
+    { method  = MethodPost
+    , url     = endpointUrl base "/api/auth/logout"
+    , headers = withCsrfHeader csrf acceptJsonHeaders
+    , body    = Nothing
+    }
+
+-- | @GET /api/auth/me@ のリクエストを構築する。
+buildGetCurrentUserRequest :: ApiBaseUrl -> HttpRequest
+buildGetCurrentUserRequest base = HttpRequest
+    { method  = MethodGet
+    , url     = endpointUrl base "/api/auth/me"
+    , headers = acceptJsonHeaders
+    , body    = Nothing
+    }
+
 -- | @GET /api/documents@ のリクエストを構築する。
 buildListDocumentsRequest :: ApiBaseUrl -> DocumentListQuery -> HttpRequest
 buildListDocumentsRequest base query = HttpRequest
@@ -276,17 +348,18 @@ buildListDocumentsRequest base query = HttpRequest
     , body    = Nothing
     }
 
--- | @POST /api/documents@ のリクエストをドメイン検証付きで構築する。
+-- | @POST /api/documents@ のリクエストをドメイン検証・CSRF ヘッダ付きで構築する。
 buildCreateDocumentRequest ::
        ApiBaseUrl
+    -> CsrfToken
     -> CreateDocumentRequest
     -> Either ValidationError HttpRequest
-buildCreateDocumentRequest base req = do
+buildCreateDocumentRequest base csrf req = do
     validated <- validateCreateDocumentRequest req
     Right HttpRequest
         { method  = MethodPost
         , url     = endpointUrl base "/api/documents"
-        , headers = jsonBodyHeaders
+        , headers = withCsrfHeader csrf jsonBodyHeaders
         , body    = Just (encodeJsonBody validated)
         }
 
@@ -299,45 +372,46 @@ buildGetDocumentRequest base docId = HttpRequest
     , body    = Nothing
     }
 
--- | @PUT /api/documents/{id}@ のリクエストをドメイン検証付きで構築する。
+-- | @PUT /api/documents/{id}@ のリクエストをドメイン検証・CSRF ヘッダ付きで構築する。
 buildUpdateDocumentRequest ::
        ApiBaseUrl
+    -> CsrfToken
     -> DocumentId
     -> UpdateDocumentRequest
     -> Either ValidationError HttpRequest
-buildUpdateDocumentRequest base docId req = do
+buildUpdateDocumentRequest base csrf docId req = do
     validated <- validateUpdateDocumentRequest req
     Right HttpRequest
         { method  = MethodPut
         , url     = documentEndpointUrl base docId ""
-        , headers = jsonBodyHeaders
+        , headers = withCsrfHeader csrf jsonBodyHeaders
         , body    = Just (encodeJsonBody validated)
         }
 
--- | @DELETE /api/documents/{id}@ (論理削除・ゴミ箱移動) のリクエストを構築する。
-buildSoftDeleteDocumentRequest :: ApiBaseUrl -> DocumentId -> HttpRequest
-buildSoftDeleteDocumentRequest base docId = HttpRequest
+-- | @DELETE /api/documents/{id}@ (論理削除・ゴミ箱移動) のリクエストを CSRF ヘッダ付きで構築する。
+buildSoftDeleteDocumentRequest :: ApiBaseUrl -> CsrfToken -> DocumentId -> HttpRequest
+buildSoftDeleteDocumentRequest base csrf docId = HttpRequest
     { method  = MethodDelete
     , url     = documentEndpointUrl base docId ""
-    , headers = acceptJsonHeaders
+    , headers = withCsrfHeader csrf acceptJsonHeaders
     , body    = Nothing
     }
 
--- | @POST /api/documents/{id}/restore@ (ゴミ箱からの復元) のリクエストを構築する。
-buildRestoreDocumentRequest :: ApiBaseUrl -> DocumentId -> HttpRequest
-buildRestoreDocumentRequest base docId = HttpRequest
+-- | @POST /api/documents/{id}/restore@ (ゴミ箱からの復元) のリクエストを CSRF ヘッダ付きで構築する。
+buildRestoreDocumentRequest :: ApiBaseUrl -> CsrfToken -> DocumentId -> HttpRequest
+buildRestoreDocumentRequest base csrf docId = HttpRequest
     { method  = MethodPost
     , url     = documentEndpointUrl base docId "/restore"
-    , headers = acceptJsonHeaders
+    , headers = withCsrfHeader csrf acceptJsonHeaders
     , body    = Nothing
     }
 
--- | @DELETE /api/documents/{id}/permanent@ (完全削除) のリクエストを構築する。
-buildPermanentDeleteDocumentRequest :: ApiBaseUrl -> DocumentId -> HttpRequest
-buildPermanentDeleteDocumentRequest base docId = HttpRequest
+-- | @DELETE /api/documents/{id}/permanent@ (完全削除) のリクエストを CSRF ヘッダ付きで構築する。
+buildPermanentDeleteDocumentRequest :: ApiBaseUrl -> CsrfToken -> DocumentId -> HttpRequest
+buildPermanentDeleteDocumentRequest base csrf docId = HttpRequest
     { method  = MethodDelete
     , url     = documentEndpointUrl base docId "/permanent"
-    , headers = acceptJsonHeaders
+    , headers = withCsrfHeader csrf acceptJsonHeaders
     , body    = Nothing
     }
 
@@ -376,6 +450,28 @@ parseNoContentResponse res
     | res.statusCode == 204 = Right ()
     | otherwise             = Left (classifyErrorResponse res)
 
+-- | 新規ユーザー登録 (@POST /api/auth/register@) を実行する。
+registerUser :: ApiClient -> RegisterRequest -> IO (Either ApiClientError AuthSessionResponse)
+registerUser client req =
+    case buildRegisterRequest client.baseUrl req of
+        Left vErr     -> pure (Left (ClientValidationError vErr))
+        Right httpReq -> executeRequest client httpReq (parseJsonResponse 201)
+
+-- | ログイン (@POST /api/auth/login@) を実行する。
+loginUser :: ApiClient -> LoginRequest -> IO (Either ApiClientError AuthSessionResponse)
+loginUser client req =
+    executeRequest client (buildLoginRequest client.baseUrl req) (parseJsonResponse 200)
+
+-- | ログアウト (@POST /api/auth/logout@) を実行する。
+logoutUser :: ApiClient -> CsrfToken -> IO (Either ApiClientError ())
+logoutUser client csrf =
+    executeRequest client (buildLogoutRequest client.baseUrl csrf) parseNoContentResponse
+
+-- | 現在の認証セッション情報 (@GET /api/auth/me@) を取得する。
+getCurrentUser :: ApiClient -> IO (Either ApiClientError AuthSessionResponse)
+getCurrentUser client =
+    executeRequest client (buildGetCurrentUserRequest client.baseUrl) (parseJsonResponse 200)
+
 -- | ヘルスチェック (@GET /api/health@) を実行する。
 fetchHealth :: ApiClient -> IO (Either ApiClientError HealthStatus)
 fetchHealth client =
@@ -387,9 +483,9 @@ listDocuments client query =
     executeRequest client (buildListDocumentsRequest client.baseUrl query) (parseJsonResponse 200)
 
 -- | 新規文書を作成 (@POST /api/documents@) する。
-createDocument :: ApiClient -> CreateDocumentRequest -> IO (Either ApiClientError Document)
-createDocument client req =
-    case buildCreateDocumentRequest client.baseUrl req of
+createDocument :: ApiClient -> CsrfToken -> CreateDocumentRequest -> IO (Either ApiClientError Document)
+createDocument client csrf req =
+    case buildCreateDocumentRequest client.baseUrl csrf req of
         Left vErr     -> pure (Left (ClientValidationError vErr))
         Right httpReq -> executeRequest client httpReq (parseJsonResponse 201)
 
@@ -399,26 +495,31 @@ getDocument client docId =
     executeRequest client (buildGetDocumentRequest client.baseUrl docId) (parseJsonResponse 200)
 
 -- | 稼働中文書を更新 (@PUT /api/documents/{id}@) する。
-updateDocument :: ApiClient -> DocumentId -> UpdateDocumentRequest -> IO (Either ApiClientError Document)
-updateDocument client docId req =
-    case buildUpdateDocumentRequest client.baseUrl docId req of
+updateDocument ::
+       ApiClient
+    -> CsrfToken
+    -> DocumentId
+    -> UpdateDocumentRequest
+    -> IO (Either ApiClientError Document)
+updateDocument client csrf docId req =
+    case buildUpdateDocumentRequest client.baseUrl csrf docId req of
         Left vErr     -> pure (Left (ClientValidationError vErr))
         Right httpReq -> executeRequest client httpReq (parseJsonResponse 200)
 
 -- | 文書を論理削除 (ゴミ箱移動: @DELETE /api/documents/{id}@) する。
-softDeleteDocument :: ApiClient -> DocumentId -> IO (Either ApiClientError Document)
-softDeleteDocument client docId =
-    executeRequest client (buildSoftDeleteDocumentRequest client.baseUrl docId) (parseJsonResponse 200)
+softDeleteDocument :: ApiClient -> CsrfToken -> DocumentId -> IO (Either ApiClientError Document)
+softDeleteDocument client csrf docId =
+    executeRequest client (buildSoftDeleteDocumentRequest client.baseUrl csrf docId) (parseJsonResponse 200)
 
 -- | ゴミ箱内の文書を復元 (@POST /api/documents/{id}/restore@) する。
-restoreDocument :: ApiClient -> DocumentId -> IO (Either ApiClientError Document)
-restoreDocument client docId =
-    executeRequest client (buildRestoreDocumentRequest client.baseUrl docId) (parseJsonResponse 200)
+restoreDocument :: ApiClient -> CsrfToken -> DocumentId -> IO (Either ApiClientError Document)
+restoreDocument client csrf docId =
+    executeRequest client (buildRestoreDocumentRequest client.baseUrl csrf docId) (parseJsonResponse 200)
 
 -- | ゴミ箱内の文書を完全削除 (@DELETE /api/documents/{id}/permanent@) する。
-permanentDeleteDocument :: ApiClient -> DocumentId -> IO (Either ApiClientError ())
-permanentDeleteDocument client docId =
-    executeRequest client (buildPermanentDeleteDocumentRequest client.baseUrl docId) parseNoContentResponse
+permanentDeleteDocument :: ApiClient -> CsrfToken -> DocumentId -> IO (Either ApiClientError ())
+permanentDeleteDocument client csrf docId =
+    executeRequest client (buildPermanentDeleteDocumentRequest client.baseUrl csrf docId) parseNoContentResponse
 
 -- | 稼働中文書のタグ一覧 (@GET /api/tags@) を取得する。
 listTags :: ApiClient -> IO (Either ApiClientError TagListResponse)
@@ -475,6 +576,10 @@ jsonBodyHeaders =
     [ ("Accept",       "application/json")
     , ("Content-Type", "application/json; charset=utf-8")
     ]
+
+withCsrfHeader :: CsrfToken -> [(Text, Text)] -> [(Text, Text)]
+withCsrfHeader csrf baseHeaders =
+    baseHeaders <> [(csrfHeaderName, toText csrf)]
 
 encodeJsonBody :: ToJSON a => a -> ByteString
 encodeJsonBody = LazyBS.toStrict . Aeson.encode

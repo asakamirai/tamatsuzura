@@ -31,6 +31,7 @@ import qualified Data.Text                   as Txt
 import qualified Data.Text.Encoding          as TxtEnc
 import           Data.Time.Clock             (UTCTime)
 import           Miso.Effect                 (Sub)
+import           TamaTsuzura.Common.Auth     (UserId)
 import           TamaTsuzura.Common.Document
     ( DocumentBody
     , DocumentFormat
@@ -46,9 +47,13 @@ import           TamaTsuzura.Common.Text     (ToText(..))
 -- | IndexedDB に自動退避される未保存ドラフト 1 件分のレコード。
 -- サーバ側の更新日時 ('baseUpdatedAt') を併せて記録することで、
 -- 再読み込み時にサーバ側で別更新が行われていた場合の上書き衝突を安全に検知する。
+-- また、同一ブラウザ上で複数アカウントを切り替えた際の情報漏洩を防ぐため、
+-- 所有者 ID ('ownerId') を記録し、読み込み時に現在ログイン中ユーザーと一致するものだけを採用する。
 data StoredDraft = StoredDraft
     { docId         :: !DocumentId
       -- ^ 対象文書の ID (IndexedDB の主キー)
+    , ownerId       :: !(Maybe UserId)
+      -- ^ ドラフト所有者ユーザー ID (M2 以前のレガシードラフトは 'Nothing' として後方互換デコードする)
     , titleInput    :: !Text
       -- ^ 未保存のタイトル入力文字列
     , body          :: !DocumentBody
@@ -68,6 +73,7 @@ data StoredDraft = StoredDraft
 instance ToJSON StoredDraft where
     toJSON sd = Aeson.object
         [ "docId"         Aeson..= sd.docId
+        , "ownerId"       Aeson..= sd.ownerId
         , "titleInput"    Aeson..= sd.titleInput
         , "body"          Aeson..= sd.body
         , "format"        Aeson..= sd.format
@@ -80,14 +86,15 @@ instance ToJSON StoredDraft where
 instance FromJSON StoredDraft where
     parseJSON = Aeson.withObject "StoredDraft" $ \ obj ->
         StoredDraft
-            <$> obj Aeson..: "docId"
-            <*> obj Aeson..: "titleInput"
-            <*> obj Aeson..: "body"
-            <*> obj Aeson..: "format"
-            <*> obj Aeson..: "folderInput"
-            <*> obj Aeson..: "tagsInput"
-            <*> obj Aeson..: "baseUpdatedAt"
-            <*> obj Aeson..: "savedAt"
+            <$> obj Aeson..:  "docId"
+            <*> obj Aeson..:? "ownerId"
+            <*> obj Aeson..:  "titleInput"
+            <*> obj Aeson..:  "body"
+            <*> obj Aeson..:  "format"
+            <*> obj Aeson..:  "folderInput"
+            <*> obj Aeson..:  "tagsInput"
+            <*> obj Aeson..:  "baseUpdatedAt"
+            <*> obj Aeson..:  "savedAt"
 
 -- | 現在編集中の文書に関するローカルドラフト自動退避ステータス。
 data DraftSyncState

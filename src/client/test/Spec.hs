@@ -32,33 +32,46 @@ import           TamaTsuzura.Client.Api
     , HttpTransport(..)
     , buildCreateDocumentRequest
     , buildDocumentListQueryString
+    , buildGetCurrentUserRequest
     , buildGetDocumentRequest
     , buildHealthRequest
     , buildListDocumentsRequest
     , buildListFoldersRequest
     , buildListTagsRequest
+    , buildLoginRequest
+    , buildLogoutRequest
     , buildPermanentDeleteDocumentRequest
+    , buildRegisterRequest
     , buildRestoreDocumentRequest
     , buildSoftDeleteDocumentRequest
     , buildUpdateDocumentRequest
     , createDocument
+    , csrfHeaderName
     , defaultApiBaseUrl
     , fetchHealth
+    , getCurrentUser
     , getDocument
+    , isUnauthorizedError
     , listDocuments
     , listFolders
     , listTags
+    , loginUser
+    , logoutUser
     , mkApiBaseUrl
     , parseJsonResponse
     , parseNoContentResponse
     , percentEncodeQueryComponent
     , permanentDeleteDocument
+    , registerUser
     , restoreDocument
     , softDeleteDocument
     , updateDocument
     )
 import           TamaTsuzura.Client.App
-    ( ClientAction(..)
+    ( AuthFormMode(..)
+    , AuthFormState(..)
+    , AuthState(..)
+    , ClientAction(..)
     , ClientEnv(..)
     , ClientState(..)
     , ConnectionStatus(..)
@@ -69,6 +82,8 @@ import           TamaTsuzura.Client.App
     , MobilePane(..)
     , PendingNavigation(..)
     , SearchPanelState(..)
+    , applyAuthSessionChecked
+    , applyAuthSubmitted
     , applyDocumentCreated
     , applyDocumentLoaded
     , applyDocumentPermanentlyDeleted
@@ -82,15 +97,19 @@ import           TamaTsuzura.Client.App
     , applyExtensionById
     , applyFoldersResult
     , applyHealthResult
+    , applySessionExpired
     , applyTagsResult
     , buildEditorSyncPayload
     , buildListQueryFromFilter
     , buildRecoveryRequestFromStoredDraft
+    , currentAuthSession
+    , currentUserId
     , defaultFilterState
     , dismissError
     , dismissNotice
     , draftFromDocument
     , editorDraftFromStored
+    , emptyAuthFormState
     , emptyEditorDraft
     , emptySearchPanelState
     , formatTagsInput
@@ -99,12 +118,16 @@ import           TamaTsuzura.Client.App
     , isCurrentDocumentDirty
     , isDraftDirty
     , mergeDraftAfterSave
+    , parseDisplayNameInput
     , parseFolderInput
     , parseTagsInput
     , reconcileDocumentWithDraft
+    , resetWorkspaceForUnauthenticated
     , toStoredDraft
     , updateClient
     , validateEditorDraft
+    , validateLoginForm
+    , validateRegisterForm
     )
 import           TamaTsuzura.Client.DraftStorage
     ( DraftStorage(..)
@@ -155,6 +178,8 @@ import           TamaTsuzura.Client.I18n
     , formatApiClientError
     , formatDocumentFormat
     , formatFileImportError
+    , formatLoginApiError
+    , formatRegisterApiError
     , formatValidationError
     , jaMessages
     )
@@ -170,6 +195,7 @@ import           TamaTsuzura.Client.Markdown
     )
 import           TamaTsuzura.Client.View
     ( displayTitle
+    , displayUserLabel
     , formatSearchMatchCounter
     , formatUtcTimestamp
     , viewClient
@@ -190,6 +216,19 @@ import           TamaTsuzura.Common.Api
     , mkListLimit
     , mkListOffset
     , mkSearchQuery
+    )
+import           TamaTsuzura.Common.Auth
+    ( AuthSessionResponse(..)
+    , CsrfToken
+    , LoginRequest(..)
+    , RegisterRequest(..)
+    , UserId
+    , UserProfile(..)
+    , mkCsrfToken
+    , mkDisplayName
+    , mkPassword
+    , mkUserId
+    , mkUsername
     )
 import           TamaTsuzura.Common.Document
     ( Document(..)
@@ -298,13 +337,25 @@ spec = do
                     }
             buildDocumentListQueryString query `shouldBe` ""
 
-        it "builds accurate HTTP requests for all 10 M1 endpoints" $ do
+        it "builds accurate HTTP requests for all M1/M3 endpoints and attaches X-CSRF-Token on state changes" $ do
             docId <- expectRight (mkDocumentId "doc-123")
+            csrf  <- mkSampleCsrfToken
+            uname <- expectRight (mkUsername "alice_01")
+            pass  <- expectRight (mkPassword "secret-pass-123")
             let base :: ApiBaseUrl
                 base = mkApiBaseUrl "/app/"
 
                 healthReq :: HttpRequest
                 healthReq = buildHealthRequest base
+
+                meReq :: HttpRequest
+                meReq = buildGetCurrentUserRequest base
+
+                loginReq :: HttpRequest
+                loginReq = buildLoginRequest base (LoginRequest uname pass)
+
+                logoutReq :: HttpRequest
+                logoutReq = buildLogoutRequest base csrf
 
                 listReq :: HttpRequest
                 listReq = buildListDocumentsRequest base defaultDocumentListQuery
@@ -313,13 +364,13 @@ spec = do
                 getReq = buildGetDocumentRequest base docId
 
                 softDelReq :: HttpRequest
-                softDelReq = buildSoftDeleteDocumentRequest base docId
+                softDelReq = buildSoftDeleteDocumentRequest base csrf docId
 
                 restoreReq :: HttpRequest
-                restoreReq = buildRestoreDocumentRequest base docId
+                restoreReq = buildRestoreDocumentRequest base csrf docId
 
                 permDelReq :: HttpRequest
-                permDelReq = buildPermanentDeleteDocumentRequest base docId
+                permDelReq = buildPermanentDeleteDocumentRequest base csrf docId
 
                 tagsReq :: HttpRequest
                 tagsReq = buildListTagsRequest base
@@ -328,20 +379,37 @@ spec = do
                 foldersReq = buildListFoldersRequest base
 
             (healthReq.method, healthReq.url) `shouldBe` (MethodGet, "/app/api/health")
+            (meReq.method, meReq.url) `shouldBe` (MethodGet, "/app/api/auth/me")
+            (loginReq.method, loginReq.url) `shouldBe` (MethodPost, "/app/api/auth/login")
+            (logoutReq.method, logoutReq.url) `shouldBe` (MethodPost, "/app/api/auth/logout")
+            lookup csrfHeaderName logoutReq.headers `shouldBe` Just (toText csrf)
             (listReq.method, listReq.url) `shouldBe` (MethodGet, "/app/api/documents")
             (getReq.method, getReq.url) `shouldBe` (MethodGet, "/app/api/documents/doc-123")
             (softDelReq.method, softDelReq.url) `shouldBe` (MethodDelete, "/app/api/documents/doc-123")
+            lookup csrfHeaderName softDelReq.headers `shouldBe` Just (toText csrf)
             (restoreReq.method, restoreReq.url) `shouldBe` (MethodPost, "/app/api/documents/doc-123/restore")
+            lookup csrfHeaderName restoreReq.headers `shouldBe` Just (toText csrf)
             (permDelReq.method, permDelReq.url) `shouldBe` (MethodDelete, "/app/api/documents/doc-123/permanent")
+            lookup csrfHeaderName permDelReq.headers `shouldBe` Just (toText csrf)
             (tagsReq.method, tagsReq.url) `shouldBe` (MethodGet, "/app/api/tags")
             (foldersReq.method, foldersReq.url) `shouldBe` (MethodGet, "/app/api/folders")
 
-            createReq <- expectRight (buildCreateDocumentRequest base defaultCreateDocumentRequest)
+            regReq <- expectRight (buildRegisterRequest base (RegisterRequest uname Nothing pass))
+            regReq.method `shouldBe` MethodPost
+            regReq.url `shouldBe` "/app/api/auth/register"
+            regReq.body `shouldSatisfy` (/= Nothing)
+
+            shortPass <- expectRight (mkPassword "short")
+            buildRegisterRequest base (RegisterRequest uname Nothing shortPass)
+                `shouldBe` Left (PasswordTooShort 5 8)
+
+            createReq <- expectRight (buildCreateDocumentRequest base csrf defaultCreateDocumentRequest)
             createReq.method `shouldBe` MethodPost
             createReq.url `shouldBe` "/app/api/documents"
             createReq.body `shouldSatisfy` (/= Nothing)
+            lookup csrfHeaderName createReq.headers `shouldBe` Just (toText csrf)
 
-            updateReq <- expectRight $ buildUpdateDocumentRequest base docId UpdateDocumentRequest
+            updateReq <- expectRight $ buildUpdateDocumentRequest base csrf docId UpdateDocumentRequest
                 { title  = emptyDocumentTitle
                 , body   = DocumentBody "updated"
                 , format = FormatPlainText
@@ -350,8 +418,12 @@ spec = do
                 }
             updateReq.method `shouldBe` MethodPut
             updateReq.url `shouldBe` "/app/api/documents/doc-123"
+            lookup csrfHeaderName updateReq.headers `shouldBe` Just (toText csrf)
 
-        it "rejects oversized document body before hitting transport" $ do
+        it "rejects oversized document body and short register password before hitting transport" $ do
+            csrf <- mkSampleCsrfToken
+            uname <- expectRight (mkUsername "alice_01")
+            shortPass <- expectRight (mkPassword "short")
             let hugeBody :: DocumentBody
                 hugeBody = DocumentBody (Txt.replicate (maxDocumentBodyBytes + 1) "a")
 
@@ -369,7 +441,12 @@ spec = do
                     { baseUrl   = defaultApiBaseUrl
                     , transport = HttpTransport (\ _ -> pure (Left "must not be called"))
                     }
-            res <- createDocument client req
+            regRes <- registerUser client (RegisterRequest uname Nothing shortPass)
+            case regRes of
+                Left (ClientValidationError PasswordTooShort{}) -> pure ()
+                other -> expectationFailure ("Expected PasswordTooShort, got: " <> show other)
+
+            res <- createDocument client csrf req
             case res of
                 Left (ClientValidationError BodyTooLarge{}) -> pure ()
                 other -> expectationFailure ("Expected ClientValidationError BodyTooLarge, got: " <> show other)
@@ -383,7 +460,7 @@ spec = do
                     , folder = Nothing
                     , tags   = emptyTagSet
                     }
-            updRes <- updateDocument client docId updReq
+            updRes <- updateDocument client csrf docId updReq
             case updRes of
                 Left (ClientValidationError BodyTooLarge{}) -> pure ()
                 other -> expectationFailure ("Expected ClientValidationError BodyTooLarge on update, got: " <> show other)
@@ -432,11 +509,16 @@ spec = do
             parseNoContentResponse (HttpResponse 204 "") `shouldBe` Right ()
             parseNoContentResponse htmlErr `shouldBe` Left (ClientHttpError 502 "Bad Gateway")
 
-        it "executes all 10 high-level API operations against injected HttpTransport" $ do
+        it "executes all high-level auth and document API operations against injected HttpTransport" $ do
             sampleDoc <- mkSampleDocument "doc-1" "執筆メモ"
             sampleTag <- expectRight (mkTag "メモ")
             sampleFolder <- expectRight (mkFolderPath "diary/2026")
-            let sampleSummary :: DocumentSummary
+            session <- mkSampleAuthSession "user-alice" "alice" (Just "アリス")
+            pass <- expectRight (mkPassword "secret-password-123")
+            let csrf :: CsrfToken
+                csrf = session.csrfToken
+
+                sampleSummary :: DocumentSummary
                 sampleSummary = toDocumentSummary sampleDoc
 
                 sampleList :: DocumentListResponse
@@ -461,10 +543,24 @@ spec = do
             eHealth <- fetchHealth (mkClient (HttpResponse 200 (encodeStrict healthOk)))
             eHealth `shouldBe` Right healthOk
 
+            eReg <- registerUser (mkClient (HttpResponse 201 (encodeStrict session)))
+                (RegisterRequest session.user.username session.user.displayName pass)
+            eReg `shouldBe` Right session
+
+            eLogin <- loginUser (mkClient (HttpResponse 200 (encodeStrict session)))
+                (LoginRequest session.user.username pass)
+            eLogin `shouldBe` Right session
+
+            eMe <- getCurrentUser (mkClient (HttpResponse 200 (encodeStrict session)))
+            eMe `shouldBe` Right session
+
+            eLogout <- logoutUser (mkClient (HttpResponse 204 "")) csrf
+            eLogout `shouldBe` Right ()
+
             eList <- listDocuments (mkClient (HttpResponse 200 (encodeStrict sampleList))) defaultDocumentListQuery
             eList `shouldBe` Right sampleList
 
-            eCreated <- createDocument (mkClient (HttpResponse 201 (encodeStrict sampleDoc))) defaultCreateDocumentRequest
+            eCreated <- createDocument (mkClient (HttpResponse 201 (encodeStrict sampleDoc))) csrf defaultCreateDocumentRequest
             eCreated `shouldBe` Right sampleDoc
 
             eGot <- getDocument (mkClient (HttpResponse 200 (encodeStrict sampleDoc))) sampleDoc.id
@@ -478,16 +574,16 @@ spec = do
                     , folder = Nothing
                     , tags   = emptyTagSet
                     }
-            eUpdated <- updateDocument (mkClient (HttpResponse 200 (encodeStrict sampleDoc))) sampleDoc.id updReq
+            eUpdated <- updateDocument (mkClient (HttpResponse 200 (encodeStrict sampleDoc))) csrf sampleDoc.id updReq
             eUpdated `shouldBe` Right sampleDoc
 
-            eSoftDel <- softDeleteDocument (mkClient (HttpResponse 200 (encodeStrict sampleDoc))) sampleDoc.id
+            eSoftDel <- softDeleteDocument (mkClient (HttpResponse 200 (encodeStrict sampleDoc))) csrf sampleDoc.id
             eSoftDel `shouldBe` Right sampleDoc
 
-            eRestored <- restoreDocument (mkClient (HttpResponse 200 (encodeStrict sampleDoc))) sampleDoc.id
+            eRestored <- restoreDocument (mkClient (HttpResponse 200 (encodeStrict sampleDoc))) csrf sampleDoc.id
             eRestored `shouldBe` Right sampleDoc
 
-            ePermDel <- permanentDeleteDocument (mkClient (HttpResponse 204 "")) sampleDoc.id
+            ePermDel <- permanentDeleteDocument (mkClient (HttpResponse 204 "")) csrf sampleDoc.id
             ePermDel `shouldBe` Right ()
 
             eTags <- listTags (mkClient (HttpResponse 200 (encodeStrict sampleTags)))
@@ -498,6 +594,11 @@ spec = do
 
             mLastReq <- readIORef lastReqRef
             fmap (\ r -> r.url) mLastReq `shouldBe` Just "/api/folders"
+
+            isUnauthorizedError (ClientApiError 401 (ApiError ErrUnauthorized "unauth" Nothing)) `shouldBe` True
+            isUnauthorizedError (ClientHttpError 401 "Unauthorized") `shouldBe` True
+            isUnauthorizedError (ClientApiError 403 (ApiError ErrForbidden "csrf" Nothing)) `shouldBe` False
+            isUnauthorizedError (ClientNetworkError "offline") `shouldBe` False
 
         it "propagates network transport failures as ClientNetworkError" $ do
             let failClient :: ApiClient
@@ -866,9 +967,10 @@ spec = do
         it "guards unsaved changes, resets history on discard, and resets editor on tab switch" $ do
             docA <- mkSampleDocument "doc-mvu-a" "文書A"
             docB <- mkSampleDocument "doc-mvu-b" "文書B"
+            authBase <- mkAuthenticatedState
             (env, reqRef, cmdRef) <- mkMockClientEnv (\ _ -> pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [] 0)))))
             let dirtyState :: ClientState
-                dirtyState = (initialClientState bundledExtensions)
+                dirtyState = authBase
                     { selectedDocument = Just docA
                     , draft            = withDraftBody (DocumentBody "未保存編集") (draftFromDocument docA)
                     , mobilePane       = PaneEditor
@@ -905,6 +1007,7 @@ spec = do
 
         it "validates before saving, blocks trash during in-flight save, and defers list reload on create from Trash" $ do
             doc <- mkSampleDocument "doc-mvu-save" "保存対象"
+            authBase <- mkAuthenticatedState
             (env, reqRef, cmdRef) <- mkMockClientEnv $ \ req ->
                 if req.method == MethodPost && req.url == "/api/documents"
                     then pure (Right (HttpResponse 201 (encodeStrict doc)))
@@ -918,7 +1021,7 @@ spec = do
 
             -- Invalid title blocks PUT and records localized validation error
             let badDraftState :: ClientState
-                badDraftState = (initialClientState bundledExtensions)
+                badDraftState = authBase
                     { selectedDocument = Just doc
                     , draft            = withDraftTitle "bad\ntitle" (draftFromDocument doc)
                     }
@@ -940,7 +1043,7 @@ spec = do
 
             -- Creating a document from Trash tab issues POST first and only fetches list after DocumentCreated
             let trashState :: ClientState
-                trashState = (initialClientState bundledExtensions)
+                trashState = authBase
                     { filterState = withFilterStatus StatusTrashed defaultFilterState
                     }
             writeIORef reqRef []
@@ -966,9 +1069,10 @@ spec = do
         it "dispatches search, format normalization, extension sync, and clears openingDocumentId on same-doc select" $ do
             doc <- mkSampleDocument "doc-mvu-ops" "操作テスト"
             otherId <- expectRight (mkDocumentId "doc-other")
+            authBase <- mkAuthenticatedState
             (env, _reqRef, cmdRef) <- mkMockClientEnv (\ _ -> pure (Right (HttpResponse 200 "{}")))
             let base :: ClientState
-                base = (initialClientState bundledExtensions)
+                base = authBase
                     { selectedDocument  = Just doc
                     , openingDocumentId = Just otherId
                     , draft             = withDraftBody (DocumentBody "abc   \n") (draftFromDocument doc)
@@ -1196,10 +1300,11 @@ spec = do
 
         it "renders mobile-first Japanese Miso view HTML for editor, preview, search panel, and modals" $ do
             doc <- mkSampleDocument "doc-view-1" "設計メモ"
+            authBase <- mkAuthenticatedState
             let onlineState :: ClientState
                 onlineState =
                     (applyDocumentCreated jaMessages (Right doc)
-                        (applyHealthResult jaMessages (Right healthOk) (initialClientState bundledExtensions)))
+                        (applyHealthResult jaMessages (Right healthOk) authBase))
                         { editorViewMode         = ModeSplit
                         , metadataPanelOpen      = True
                         , searchPanel            = SearchPanelState
@@ -1259,12 +1364,15 @@ spec = do
         it "renders draft badges, recovery/stale/orphaned banners, sync status, and export/import buttons" $ do
             doc <- mkSampleDocument "doc-view-draft" "ドラフト表示テスト"
             otherId <- expectRight (mkDocumentId "doc-orphan")
+            authBase <- mkAuthenticatedState
+            uid <- mkSampleUserId "user-alice"
             let sd :: StoredDraft
-                sd = toStoredDraft doc (withDraftBody (DocumentBody "ローカル変更") (draftFromDocument doc)) sampleLaterUtcTime
+                sd = toStoredDraft uid doc (withDraftBody (DocumentBody "ローカル変更") (draftFromDocument doc)) sampleLaterUtcTime
 
                 orphanSd :: StoredDraft
                 orphanSd = StoredDraft
                     { docId         = otherId
+                    , ownerId       = Just uid
                     , titleInput    = "消えた文書"
                     , body          = DocumentBody "救出本文"
                     , format        = FormatMarkdown
@@ -1275,7 +1383,7 @@ spec = do
                     }
 
                 restoredState :: ClientState
-                restoredState = (initialClientState bundledExtensions)
+                restoredState = authBase
                     { documentSummaries  = [toDocumentSummary doc]
                     , totalDocuments     = 1
                     , selectedDocument   = Just doc
@@ -1313,15 +1421,22 @@ spec = do
         it "round-trips StoredDraft through JSON list payloads and selects latest draft deterministically" $ do
             doc1 <- mkSampleDocument "doc-d1" "一番目"
             doc2 <- mkSampleDocument "doc-d2" "二番目"
+            uid  <- mkSampleUserId "user-alice"
             let sd1 :: StoredDraft
-                sd1 = toStoredDraft doc1 (withDraftBody (DocumentBody "draft1") (draftFromDocument doc1)) sampleUtcTime
+                sd1 = toStoredDraft uid doc1 (withDraftBody (DocumentBody "draft1") (draftFromDocument doc1)) sampleUtcTime
 
                 sd2 :: StoredDraft
-                sd2 = toStoredDraft doc2 (withDraftBody (DocumentBody "draft2") (draftFromDocument doc2)) sampleLaterUtcTime
+                sd2 = toStoredDraft uid doc2 (withDraftBody (DocumentBody "draft2") (draftFromDocument doc2)) sampleLaterUtcTime
 
                 listJson :: Text
                 listJson = "{\"ok\":true,\"drafts\":[" <> encodeStoredDraftJson sd1 <> "," <> encodeStoredDraftJson sd2 <> "]}"
+
+                legacyJson :: Text
+                legacyJson = "{\"ok\":true,\"drafts\":[{\"docId\":\"doc-d1\",\"titleInput\":\"一番目\",\"body\":\"old\",\"format\":\"markdown\",\"folderInput\":\"\",\"tagsInput\":\"\",\"baseUpdatedAt\":\"2026-11-20T09:30:00Z\",\"savedAt\":\"2026-11-20T09:30:00Z\"}]}"
             decodeStoredDraftListJson listJson `shouldBe` Right [sd1, sd2]
+            case decodeStoredDraftListJson legacyJson of
+                Right [legacySd] -> legacySd.ownerId `shouldBe` Nothing
+                other            -> expectationFailure ("Expected legacy draft with Nothing ownerId, got: " <> show other)
             decodeStoredDraftListJson "{\"ok\":false,\"error\":\"QuotaExceededError\"}"
                 `shouldBe` Left "QuotaExceededError"
             decodeStoredDraftListJson "{broken" `shouldSatisfy` isLeftEither
@@ -1421,11 +1536,12 @@ spec = do
     describe "TamaTsuzura.Client.App Phase 3 draft autosave, recovery, and file transfer MVU" $ do
         it "reconciles server documents against local drafts and builds safe recovery requests" $ do
             doc <- mkSampleDocument "doc-rec" "照合対象"
+            uid <- mkSampleUserId "user-alice"
             let cleanSd :: StoredDraft
-                cleanSd = toStoredDraft doc (draftFromDocument doc) sampleLaterUtcTime
+                cleanSd = toStoredDraft uid doc (draftFromDocument doc) sampleLaterUtcTime
 
                 dirtySd :: StoredDraft
-                dirtySd = toStoredDraft doc (withDraftBody (DocumentBody "未保存追記") (draftFromDocument doc)) sampleLaterUtcTime
+                dirtySd = toStoredDraft uid doc (withDraftBody (DocumentBody "未保存追記") (draftFromDocument doc)) sampleLaterUtcTime
 
                 staleDoc :: Document
                 staleDoc = withDocUpdatedAt sampleLaterUtcTime doc
@@ -1444,6 +1560,7 @@ spec = do
             let brokenMetaSd :: StoredDraft
                 brokenMetaSd = StoredDraft
                     { docId         = dirtySd.docId
+                    , ownerId       = Just uid
                     , titleInput    = "bad\ntitle"
                     , body          = dirtySd.body
                     , format        = dirtySd.format
@@ -1460,6 +1577,8 @@ spec = do
 
         it "autosaves dirty edits to IndexedDB, clears on clean revert/save/discard/trash, and resaves concurrent edits" $ do
             doc <- mkSampleDocument "doc-auto" "自動退避"
+            authBase <- mkAuthenticatedState
+            uid <- mkSampleUserId "user-alice"
             let savedDoc :: Document
                 savedDoc = withDocUpdatedAt sampleLaterUtcTime (withDocBody (DocumentBody "編集中1") doc)
             (env, _reqRef, _cmdRef, savedDraftsRef, deletedIdsRef, _exportsRef) <-
@@ -1469,7 +1588,7 @@ spec = do
                     (pure FilePickCancelled)
 
             let base :: ClientState
-                base = (initialClientState bundledExtensions)
+                base = authBase
                     { selectedDocument = Just doc
                     , draft            = draftFromDocument doc
                     }
@@ -1501,10 +1620,10 @@ spec = do
                 cleanInFlight :: ClientState
                 cleanInFlight = base
                     { draft          = sentDraft
-                    , storedDrafts   = Map.singleton doc.id (toStoredDraft doc sentDraft sampleUtcTime)
+                    , storedDrafts   = Map.singleton doc.id (toStoredDraft uid doc sentDraft sampleUtcTime)
                     , savingDocument = Just (doc.id, sentDraft)
                     }
-            (sSavedClean, _) <- runUpdateStep env (DocumentSaved doc.id (Right savedDoc)) cleanInFlight
+            (sSavedClean, _) <- runUpdateStep env (DocumentSaved authBase.authSessionSeq doc.id (Right savedDoc)) cleanInFlight
             sSavedClean.draftSyncState `shouldBe` DraftSyncIdle
             Map.member doc.id sSavedClean.storedDrafts `shouldBe` False
             readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
@@ -1515,11 +1634,12 @@ spec = do
                 concurrentInFlight = cleanInFlight
                     { draft = withDraftBody (DocumentBody "保存中にさらに追記") sentDraft
                     }
-            (sSavedConcurrent, _) <- runUpdateStep env (DocumentSaved doc.id (Right savedDoc)) concurrentInFlight
+            (sSavedConcurrent, _) <- runUpdateStep env (DocumentSaved authBase.authSessionSeq doc.id (Right savedDoc)) concurrentInFlight
             sSavedConcurrent.draftSyncState `shouldBe` DraftSyncPending
             resaved <- readIORef savedDraftsRef
             case resaved of
                 [sd] -> do
+                    sd.ownerId `shouldBe` Just uid
                     sd.baseUpdatedAt `shouldBe` savedDoc.updatedAt
                     sd.body `shouldBe` DocumentBody "保存中にさらに追記"
                 other -> expectationFailure ("Expected 1 re-saved draft, got: " <> show other)
@@ -1535,25 +1655,25 @@ spec = do
             writeIORef deletedIdsRef []
             let trashedDoc :: Document
                 trashedDoc = withDocDeletedAt (Just sampleLaterUtcTime) doc
-            (sAfterSoftDel, _) <- runUpdateStep env (DocumentSoftDeleted doc.id (Right trashedDoc)) sEdited
+            (sAfterSoftDel, _) <- runUpdateStep env (DocumentSoftDeleted authBase.authSessionSeq doc.id (Right trashedDoc)) sEdited
             Map.member doc.id sAfterSoftDel.storedDrafts `shouldBe` False
             readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
 
             writeIORef deletedIdsRef []
-            (sAfterPermDel, _) <- runUpdateStep env (DocumentPermanentlyDeleted doc.id (Right ())) sEdited
+            (sAfterPermDel, _) <- runUpdateStep env (DocumentPermanentlyDeleted authBase.authSessionSeq doc.id (Right ())) sEdited
             Map.member doc.id sAfterPermDel.storedDrafts `shouldBe` False
             readIORef deletedIdsRef >>= (`shouldBe` [doc.id])
 
             -- Saving docA after switching to docB preserves docB's draft status and recovery banners
             docB <- mkSampleDocument "doc-other-open" "別文書"
             let sdB :: StoredDraft
-                sdB = toStoredDraft docB (withDraftBody (DocumentBody "docB未保存") (draftFromDocument docB)) sampleLaterUtcTime
+                sdB = toStoredDraft uid docB (withDraftBody (DocumentBody "docB未保存") (draftFromDocument docB)) sampleLaterUtcTime
 
                 switchedDuringSave :: ClientState
-                switchedDuringSave = (initialClientState bundledExtensions)
+                switchedDuringSave = authBase
                     { selectedDocument   = Just docB
                     , draft              = editorDraftFromStored sdB
-                    , storedDrafts       = Map.fromList [(doc.id, toStoredDraft doc sentDraft sampleUtcTime), (docB.id, sdB)]
+                    , storedDrafts       = Map.fromList [(doc.id, toStoredDraft uid doc sentDraft sampleUtcTime), (docB.id, sdB)]
                     , draftSyncState     = DraftSyncSaved sampleLaterUtcTime
                     , restoredDraftDocId = Just docB.id
                     , staleDraftPrompt   = Just sdB
@@ -1588,12 +1708,15 @@ spec = do
             doc <- mkSampleDocument "doc-recover" "復元対象"
             orphanId <- expectRight (mkDocumentId "doc-deleted-remote")
             recoveredDoc <- mkSampleDocument "doc-new-recovered" "孤立復元"
+            authBase <- mkAuthenticatedState
+            uid <- mkSampleUserId "user-alice"
             let storedForDoc :: StoredDraft
-                storedForDoc = toStoredDraft doc (withDraftBody (DocumentBody "リロード前ドラフト") (draftFromDocument doc)) sampleLaterUtcTime
+                storedForDoc = toStoredDraft uid doc (withDraftBody (DocumentBody "リロード前ドラフト") (draftFromDocument doc)) sampleLaterUtcTime
 
                 orphanSd :: StoredDraft
                 orphanSd = StoredDraft
                     { docId         = orphanId
+                    , ownerId       = Just uid
                     , titleInput    = "孤立復元"
                     , body          = storedForDoc.body
                     , format        = storedForDoc.format
@@ -1618,7 +1741,7 @@ spec = do
                     (pure FilePickCancelled)
 
             -- DraftsLoaded triggers auto-open GET and DocumentLoaded restores draft automatically
-            (sAutoOpen, autoActs) <- runUpdateStep env (DraftsLoaded (Right [storedForDoc])) (initialClientState bundledExtensions)
+            (sAutoOpen, autoActs) <- runUpdateStep env (DraftsLoaded authBase.authSessionSeq (Right [storedForDoc])) authBase
             sAutoOpen.autoOpeningDraftId `shouldBe` Just doc.id
             (sRestored, _) <- case autoActs of
                 (act : _) -> runUpdateStep env act sAutoOpen
@@ -1653,7 +1776,7 @@ spec = do
                 trashedDoc = withDocDeletedAt (Just sampleLaterUtcTime) doc
 
                 trashedWithStale :: ClientState
-                trashedWithStale = (initialClientState bundledExtensions)
+                trashedWithStale = authBase
                     { selectedDocument = Just trashedDoc
                     , draft            = draftFromDocument trashedDoc
                     , storedDrafts     = Map.singleton doc.id storedForDoc
@@ -1666,7 +1789,7 @@ spec = do
 
             -- Late DraftsLoaded arriving after user already opened clean doc still restores
             let alreadyOpenClean :: ClientState
-                alreadyOpenClean = (initialClientState bundledExtensions)
+                alreadyOpenClean = authBase
                     { selectedDocument = Just doc
                     , draft            = draftFromDocument doc
                     }
@@ -1683,7 +1806,7 @@ spec = do
                 staleStored = storedForDoc { baseUpdatedAt = sampleUtcTime }
 
                 waitingLoad :: ClientState
-                waitingLoad = (initialClientState bundledExtensions)
+                waitingLoad = authBase
                     { openingDocumentId = Just doc.id
                     , storedDrafts      = Map.singleton doc.id staleStored
                     }
@@ -1697,7 +1820,7 @@ spec = do
 
             -- Auto-open 404 surfaces orphanedDraft; RecoverOrphanedDraft guards dirty doc, recovers, and DiscardOrphanedDraft purges
             writeIORef deletedIdsRef []
-            (sOrphanOpen, orphanActs) <- runUpdateStep env (DraftsLoaded (Right [orphanSd])) (initialClientState bundledExtensions)
+            (sOrphanOpen, orphanActs) <- runUpdateStep env (DraftsLoaded authBase.authSessionSeq (Right [orphanSd])) authBase
             (sOrphaned, _) <- case orphanActs of
                 (act : _) -> runUpdateStep env act sOrphanOpen
                 []        -> expectationFailure "Expected DocumentLoaded 404 action" >> pure (sOrphanOpen, [])
@@ -1732,6 +1855,7 @@ spec = do
         it "exports active drafts and imports Markdown/text files with unsaved guard and filter inheritance" $ do
             doc <- mkSampleDocument "doc-io" "入出力テスト"
             importedDoc <- mkSampleDocument "doc-imported" "取り込みメモ"
+            authBase <- mkAuthenticatedState
             folderVal <- expectRight (mkFolderPath "work/import")
             tagVal <- expectRight (mkTag "取込")
             let picked :: FilePickResult
@@ -1754,7 +1878,7 @@ spec = do
                     (pure picked)
 
             let activeState :: ClientState
-                activeState = (initialClientState bundledExtensions)
+                activeState = authBase
                     { selectedDocument = Just doc
                     , draft            = withDraftBody (DocumentBody "エクスポート本文") (draftFromDocument doc)
                     , filterState      = defaultFilterState
@@ -1804,14 +1928,14 @@ spec = do
             sErrPick.lastError `shouldBe` Just jaMessages.errImportInvalidUtf8
             (sExpFail, _) <- runUpdateStep env (ExportFinished "a.md" (Left "blocked")) sImported
             sExpFail.lastError `shouldSatisfy` maybe False (Txt.isInfixOf jaMessages.errExportFailedPrefix)
-            (sImpFail, _) <- runUpdateStep env (DocumentImported "a.md" (Left (ClientNetworkError "offline"))) sImporting
+            (sImpFail, _) <- runUpdateStep env (DocumentImported authBase.authSessionSeq "a.md" (Left (ClientNetworkError "offline"))) sImporting
             sImpFail.isImportingDocument `shouldBe` False
             sImpFail.lastError `shouldSatisfy` maybe False (Txt.isInfixOf jaMessages.errNetworkPrefix)
 
             -- Importing from Trash tab switches back to StatusActive and reloads list only on success
             writeIORef reqRef []
             let trashImportState :: ClientState
-                trashImportState = (initialClientState bundledExtensions)
+                trashImportState = authBase
                     { filterState = withFilterStatus StatusTrashed defaultFilterState
                     }
             (sTrashImp1, trashImpActs) <- runUpdateStep env (ImportFilePicked picked) trashImportState
@@ -1824,6 +1948,381 @@ spec = do
             sTrashImp2.filterState.status `shouldBe` StatusActive
             trashReqs <- readIORef reqRef
             any (\ r -> r.method == MethodGet && r.url == "/api/documents") trashReqs `shouldBe` True
+
+    describe "TamaTsuzura.Client M3 authentication UI, CSRF, 401 handling, and multi-user isolation" $ do
+        it "validates login/register forms, formats auth errors, and builds user display labels" $ do
+            parseDisplayNameInput "   " `shouldBe` Right Nothing
+            dn <- expectRight (mkDisplayName "アリス")
+            parseDisplayNameInput " アリス " `shouldBe` Right (Just dn)
+            parseDisplayNameInput "bad\nname" `shouldBe` Left DisplayNameContainsControlChar
+
+            let validLogin :: AuthFormState
+                validLogin = emptyAuthFormState
+                    { usernameInput = "  Alice_01 "
+                    , passwordInput = "password123"
+                    }
+            loginReq <- expectRight (validateLoginForm jaMessages validLogin)
+            toText loginReq.username `shouldBe` "alice_01"
+
+            validateLoginForm jaMessages emptyAuthFormState `shouldSatisfy` isLeftEither
+            validateLoginForm jaMessages (validLogin { passwordInput = "" })
+                `shouldSatisfy` either (Txt.isInfixOf jaMessages.valEmptyPassword) (const False)
+
+            let baseRegister :: AuthFormState
+                baseRegister = emptyAuthFormState
+                    { mode                 = AuthModeRegister
+                    , usernameInput        = "bob-99"
+                    , displayNameInput     = "ボブ"
+                    , passwordInput        = "strong-pass-123"
+                    , passwordConfirmInput = "strong-pass-123"
+                    }
+            regReq <- expectRight (validateRegisterForm jaMessages baseRegister)
+            toText regReq.username `shouldBe` "bob-99"
+            fmap toText regReq.displayName `shouldBe` Just "ボブ"
+
+            validateRegisterForm jaMessages (baseRegister { passwordInput = "short", passwordConfirmInput = "short" })
+                `shouldSatisfy` either (Txt.isInfixOf jaMessages.valPasswordTooShort) (const False)
+            validateRegisterForm jaMessages (baseRegister { passwordConfirmInput = "different-pass" })
+                `shouldSatisfy` either (Txt.isInfixOf jaMessages.valPasswordMismatch) (const False)
+
+            formatLoginApiError jaMessages (ClientApiError 401 (ApiError ErrUnauthorized "invalid" Nothing))
+                `shouldBe` jaMessages.errInvalidCredentials
+            formatRegisterApiError jaMessages (ClientApiError 409 (ApiError ErrConflict "dup" Nothing))
+                `shouldBe` jaMessages.errUsernameAlreadyExists
+            formatRegisterApiError jaMessages (ClientApiError 403 (ApiError ErrForbidden "closed" Nothing))
+                `shouldBe` jaMessages.errRegistrationDisabled
+
+            aliceSession <- mkSampleAuthSession "user-alice" "alice" (Just "アリス")
+            bobSession   <- mkSampleAuthSession "user-bob" "bob" Nothing
+            displayUserLabel aliceSession.user `shouldBe` "アリス"
+            displayUserLabel bobSession.user `shouldBe` "@bob"
+
+        it "bootstraps with /api/health and /api/auth/me, handles 401 login gate, register, and CSRF-authenticated workspace" $ do
+            aliceSession <- mkSampleAuthSession "user-alice" "alice" (Just "アリス")
+            aliceDoc <- mkSampleDocument "doc-alice-1" "アリスのメモ"
+            (env, reqRef, _cmdRef, _savedRef, _delRef, _exportsRef) <-
+                mkFullMockClientEnv
+                    (\ req -> case (req.method, req.url) of
+                        (MethodGet, "/api/health") ->
+                            pure (Right (HttpResponse 200 (encodeStrict healthOk)))
+                        (MethodGet, "/api/auth/me") ->
+                            pure (Right (HttpResponse 401 (encodeStrict (ApiError ErrUnauthorized "Authentication required" Nothing))))
+                        (MethodPost, "/api/auth/register") ->
+                            pure (Right (HttpResponse 201 (encodeStrict aliceSession)))
+                        (MethodGet, "/api/documents") ->
+                            pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [toDocumentSummary aliceDoc] 1))))
+                        (MethodGet, "/api/tags") ->
+                            pure (Right (HttpResponse 200 (encodeStrict (TagListResponse []))))
+                        (MethodGet, "/api/folders") ->
+                            pure (Right (HttpResponse 200 (encodeStrict (FolderListResponse []))))
+                        (MethodPost, "/api/documents") ->
+                            pure (Right (HttpResponse 201 (encodeStrict aliceDoc)))
+                        _ ->
+                            pure (Right (HttpResponse 200 (encodeStrict aliceDoc)))
+                    )
+                    (pure (Right []))
+                    (pure FilePickCancelled)
+
+            -- Initialize only calls /api/health and /api/auth/me (no document/draft fetches before auth)
+            (sBoot, bootActs) <- runUpdateStep env Initialize (initialClientState bundledExtensions)
+            sBoot.authState `shouldBe` AuthChecking
+            bootReqs <- readIORef reqRef
+            map (\ r -> (r.method, r.url)) bootReqs
+                `shouldBe` [(MethodGet, "/api/health"), (MethodGet, "/api/auth/me")]
+
+            -- Receiving 401 from /api/auth/me transitions cleanly to login screen without error banner
+            (sAfterBoot, _) <- runActionQueue env bootActs sBoot
+            case sAfterBoot.authState of
+                AuthUnauthenticated form -> do
+                    form.mode `shouldBe` AuthModeLogin
+                    form.formError `shouldBe` Nothing
+                other -> expectationFailure ("Expected AuthUnauthenticated, got: " <> show other)
+            sAfterBoot.lastError `shouldBe` Nothing
+            sAfterBoot.connectionStatus `shouldBe` ConnOnline
+
+            -- Switch to register tab, fill valid fields, submit -> authenticated & workspace loaded
+            writeIORef reqRef []
+            (sReg1, _) <- runUpdateStep env (SwitchAuthMode AuthModeRegister) sAfterBoot
+            (sReg2, _) <- runUpdateStep env (UpdateAuthUsername "Alice") sReg1
+            (sReg3, _) <- runUpdateStep env (UpdateAuthDisplayName "アリス") sReg2
+            (sReg4, _) <- runUpdateStep env (UpdateAuthPassword "alice-secret-123") sReg3
+            (sReg5, _) <- runUpdateStep env (UpdateAuthPasswordConfirm "alice-secret-123") sReg4
+            (sSubmitting, submitActs) <- runUpdateStep env SubmitAuthForm sReg5
+            (sAuthed, _) <- runActionQueue env submitActs sSubmitting
+            currentAuthSession sAuthed `shouldBe` Just aliceSession
+            sAuthed.statusNotice `shouldBe` Just jaMessages.noticeRegistered
+            sAuthed.totalDocuments `shouldBe` 1
+
+            -- Creating a document attaches session's X-CSRF-Token header
+            writeIORef reqRef []
+            (sCreating, createActs) <- runUpdateStep env RequestCreateDocument sAuthed
+            createReqs <- readIORef reqRef
+            case createReqs of
+                [postReq] -> do
+                    postReq.method `shouldBe` MethodPost
+                    postReq.url `shouldBe` "/api/documents"
+                    lookup csrfHeaderName postReq.headers `shouldBe` Just (toText aliceSession.csrfToken)
+                other -> expectationFailure ("Expected single POST /api/documents, got: " <> show other)
+            (sCreated, _) <- runActionQueue env createActs sCreating
+            sCreated.selectedDocument `shouldBe` Just aliceDoc
+
+        it "expires session to login screen on 401 while preserving IndexedDB drafts and protecting active login input" $ do
+            doc <- mkSampleDocument "doc-401" "作業中メモ"
+            authBase <- mkAuthenticatedState
+            uid <- mkSampleUserId "user-alice"
+            let localSd :: StoredDraft
+                localSd = toStoredDraft uid doc (withDraftBody (DocumentBody "未保存の重要本文") (draftFromDocument doc)) sampleLaterUtcTime
+
+                dirtyState :: ClientState
+                dirtyState = authBase
+                    { documentSummaries = [toDocumentSummary doc]
+                    , totalDocuments    = 1
+                    , selectedDocument  = Just doc
+                    , draft             = editorDraftFromStored localSd
+                    , storedDrafts      = Map.singleton doc.id localSd
+                    , mobilePane        = PaneEditor
+                    }
+            (env, _reqRef, cmdRef, _savedRef, deletedIdsRef, _exportsRef) <-
+                mkFullMockClientEnv
+                    (\ _ -> pure (Right (HttpResponse 401 (encodeStrict (ApiError ErrUnauthorized "Session expired" Nothing)))))
+                    (pure (Right [localSd]))
+                    (pure FilePickCancelled)
+
+            -- Saving triggers 401 -> clears workspace, resets CodeMirror, shows session expired error, keeps IndexedDB draft
+            (sSaving, saveActs) <- runUpdateStep env SaveCurrentDocument dirtyState
+            (sExpired, _) <- runActionQueue env saveActs sSaving
+            case sExpired.authState of
+                AuthUnauthenticated{} -> pure ()
+                other -> expectationFailure ("Expected AuthUnauthenticated after 401, got: " <> show other)
+            sExpired.lastError `shouldBe` Just jaMessages.errSessionExpired
+            sExpired.documentSummaries `shouldBe` []
+            sExpired.selectedDocument `shouldBe` Nothing
+            sExpired.storedDrafts `shouldBe` Map.empty
+            sExpired.mobilePane `shouldBe` PaneList
+            readIORef cmdRef >>= (`shouldSatisfy` elem CmdResetEditor)
+            readIORef deletedIdsRef >>= (`shouldBe` [])
+
+            -- Late 401 response from previous session must not wipe user's active login form input
+            (sTyping, _) <- runUpdateStep env (UpdateAuthUsername "alice") sExpired
+            (sAfterLate401, _) <- runUpdateStep env
+                (TagsLoaded authBase.authSessionSeq (Left (ClientApiError 401 (ApiError ErrUnauthorized "expired" Nothing))))
+                sTyping
+            case sAfterLate401.authState of
+                AuthUnauthenticated form -> form.usernameInput `shouldBe` "alice"
+                other -> expectationFailure ("Expected login form preserved, got: " <> show other)
+
+        it "guards dirty document on logout, sends CSRF token to /api/auth/logout, and isolates IndexedDB drafts per user" $ do
+            docAlice <- mkSampleDocument "doc-alice-iso" "アリス文書"
+            docBob   <- mkSampleDocument "doc-bob-iso" "ボブ文書"
+            docLeg   <- mkSampleDocument "doc-legacy-iso" "旧形式文書"
+            aliceSession <- mkSampleAuthSession "user-alice" "alice" (Just "アリス")
+            bobSession   <- mkSampleAuthSession "user-bob" "bob" (Just "ボブ")
+
+            let sdAlice :: StoredDraft
+                sdAlice = toStoredDraft aliceSession.user.id docAlice
+                    (withDraftBody (DocumentBody "アリス未保存") (draftFromDocument docAlice))
+                    sampleLaterUtcTime
+
+                sdBob :: StoredDraft
+                sdBob = toStoredDraft bobSession.user.id docBob
+                    (withDraftBody (DocumentBody "ボブ未保存") (draftFromDocument docBob))
+                    sampleUtcTime
+
+                sdLegacy :: StoredDraft
+                sdLegacy = (toStoredDraft aliceSession.user.id docLeg
+                    (withDraftBody (DocumentBody "旧未保存") (draftFromDocument docLeg))
+                    sampleLaterUtcTime)
+                    { ownerId = Nothing }
+
+            (env, reqRef, cmdRef, _savedRef, deletedIdsRef, _exportsRef) <-
+                mkFullMockClientEnv
+                    (\ req -> case (req.method, req.url) of
+                        (MethodPost, "/api/auth/logout") ->
+                            pure (Right (HttpResponse 204 ""))
+                        (MethodGet, "/api/documents/doc-bob-iso") ->
+                            pure (Right (HttpResponse 200 (encodeStrict docBob)))
+                        _ ->
+                            pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [] 0))))
+                    )
+                    (pure (Right [sdAlice, sdBob, sdLegacy]))
+                    (pure FilePickCancelled)
+
+            -- Dirty doc triggers NavLogout guard before sending POST /api/auth/logout
+            let aliceDirty :: ClientState
+                aliceDirty = (mkAuthenticatedStateFor aliceSession)
+                    { selectedDocument = Just docAlice
+                    , draft            = editorDraftFromStored sdAlice
+                    , storedDrafts     = Map.singleton docAlice.id sdAlice
+                    }
+            (sLogoutGuard, actsGuard) <- runUpdateStep env RequestLogout aliceDirty
+            sLogoutGuard.pendingNavigation `shouldBe` Just NavLogout
+            actsGuard `shouldBe` []
+            readIORef reqRef >>= (`shouldBe` [])
+
+            -- Confirming discard deletes Alice's discarded draft, calls POST /api/auth/logout with CSRF, and resets editor
+            (sLoggingOut, logoutActs) <- runUpdateStep env ConfirmDiscardNavigation sLogoutGuard
+            readIORef deletedIdsRef >>= (`shouldBe` [docAlice.id])
+            logoutReqs <- readIORef reqRef
+            case logoutReqs of
+                [logoutReq] -> do
+                    logoutReq.method `shouldBe` MethodPost
+                    logoutReq.url `shouldBe` "/api/auth/logout"
+                    lookup csrfHeaderName logoutReq.headers `shouldBe` Just (toText aliceSession.csrfToken)
+                other -> expectationFailure ("Expected POST /api/auth/logout, got: " <> show other)
+            (sLoggedOut, _) <- runActionQueue env logoutActs sLoggingOut
+            case sLoggedOut.authState of
+                AuthUnauthenticated{} -> pure ()
+                other -> expectationFailure ("Expected AuthUnauthenticated after logout, got: " <> show other)
+            sLoggedOut.statusNotice `shouldBe` Just jaMessages.noticeLoggedOut
+            readIORef cmdRef >>= (`shouldSatisfy` elem CmdResetEditor)
+
+            -- When Bob logs in, DraftsLoaded filters strictly by Bob's userId (Alice's newer draft and legacy Nothing ownerId are hidden)
+            let bobState :: ClientState
+                bobState = mkAuthenticatedStateFor bobSession
+            (sBobDrafts, bobActs) <- runUpdateStep env
+                (DraftsLoaded bobState.authSessionSeq (Right [sdAlice, sdBob, sdLegacy]))
+                bobState
+            Map.keys sBobDrafts.storedDrafts `shouldBe` [docBob.id]
+            sBobDrafts.autoOpeningDraftId `shouldBe` Just docBob.id
+            (sBobRestored, _) <- runActionQueue env bobActs sBobDrafts
+            sBobRestored.selectedDocument `shouldBe` Just docBob
+            sBobRestored.draft.body `shouldBe` DocumentBody "ボブ未保存"
+
+        it "handles login 401 failure, ignores RefreshAll/duplicate submit while submitting, and handles logout 401/network errors" $ do
+            (env, reqRef, cmdRef) <- mkMockClientEnv $ \ req -> case (req.method, req.url) of
+                (MethodPost, "/api/auth/login") ->
+                    pure (Right (HttpResponse 401 (encodeStrict (ApiError ErrUnauthorized "Invalid credentials" Nothing))))
+                (MethodPost, "/api/auth/logout") ->
+                    pure (Left "network-offline")
+                _ ->
+                    pure (Right (HttpResponse 200 (encodeStrict healthOk)))
+
+            let loginFormState :: ClientState
+                loginFormState = resetWorkspaceForUnauthenticated
+                    (emptyAuthFormState { usernameInput = "alice", passwordInput = "wrong-pass" })
+                    Nothing
+                    Nothing
+                    (initialClientState bundledExtensions)
+
+            -- Submit enters isSubmitting=True; duplicate submit and RefreshAll are ignored while in flight
+            (sSubmitting, submitActs) <- runUpdateStep env SubmitAuthForm loginFormState
+            writeIORef reqRef []
+            (sDupSubmit, dupActs) <- runUpdateStep env SubmitAuthForm sSubmitting
+            dupActs `shouldBe` []
+            sDupSubmit `shouldBe` sSubmitting
+            (sDuringRefresh, refActs) <- runUpdateStep env RefreshAll sSubmitting
+            refActs `shouldBe` []
+            sDuringRefresh `shouldBe` sSubmitting
+            readIORef reqRef >>= (`shouldBe` [])
+
+            -- Receiving 401 login failure clears isSubmitting and shows invalid credentials error
+            (sLoginFailed, _) <- runActionQueue env submitActs sSubmitting
+            case sLoginFailed.authState of
+                AuthUnauthenticated form -> do
+                    form.isSubmitting `shouldBe` False
+                    form.formError `shouldBe` Just jaMessages.errInvalidCredentials
+                other -> expectationFailure ("Expected AuthUnauthenticated with error, got: " <> show other)
+
+            -- Logout network failure keeps user authenticated and resets isLoggingOut
+            authBase <- mkAuthenticatedState
+            (sLogoutStart, logoutNetActs) <- runUpdateStep env RequestLogout authBase
+            sLogoutStart.isLoggingOut `shouldBe` True
+            -- RefreshAll while logging out is ignored
+            writeIORef reqRef []
+            (sRefreshWhileLogout, _) <- runUpdateStep env RefreshAll sLogoutStart
+            sRefreshWhileLogout `shouldBe` sLogoutStart
+            readIORef reqRef >>= (`shouldBe` [])
+            (sLogoutNetErr, _) <- runActionQueue env logoutNetActs sLogoutStart
+            sLogoutNetErr.isLoggingOut `shouldBe` False
+            currentAuthSession sLogoutNetErr `shouldSatisfy` (/= Nothing)
+            sLogoutNetErr.lastError `shouldSatisfy` maybe False (Txt.isInfixOf jaMessages.errNetworkPrefix)
+
+            -- Logout returning 401 (already expired server-side) still transitions cleanly to unauthenticated
+            writeIORef cmdRef []
+            (sLogout401, _) <- runUpdateStep env
+                (LoggedOut authBase.authSessionSeq (Left (ClientApiError 401 (ApiError ErrUnauthorized "expired" Nothing))))
+                sLogoutStart
+            case sLogout401.authState of
+                AuthUnauthenticated{} -> pure ()
+                other -> expectationFailure ("Expected AuthUnauthenticated on logout 401, got: " <> show other)
+            sLogout401.statusNotice `shouldBe` Just jaMessages.noticeLoggedOut
+            readIORef cmdRef >>= (`shouldSatisfy` elem CmdResetEditor)
+
+        it "renders auth checking, login/register screens, authenticated user badge, logout button, and logout confirm modal" $ do
+            let checkingState :: ClientState
+                checkingState = initialClientState bundledExtensions
+
+                checkingHtml :: Text
+                checkingHtml = TxtEnc.decodeUtf8Lenient
+                    (LazyBS.toStrict (toHtmlWith () () checkingState (viewClient jaMessages checkingState)))
+
+                loginState :: ClientState
+                loginState = resetWorkspaceForUnauthenticated
+                    (emptyAuthFormState { formError = Just jaMessages.errInvalidCredentials })
+                    (Just jaMessages.errSessionExpired)
+                    Nothing
+                    checkingState
+
+                loginHtml :: Text
+                loginHtml = TxtEnc.decodeUtf8Lenient
+                    (LazyBS.toStrict (toHtmlWith () () loginState (viewClient jaMessages loginState)))
+
+                registerState :: ClientState
+                registerState = resetWorkspaceForUnauthenticated
+                    (emptyAuthFormState { mode = AuthModeRegister })
+                    Nothing
+                    Nothing
+                    checkingState
+
+                registerHtml :: Text
+                registerHtml = TxtEnc.decodeUtf8Lenient
+                    (LazyBS.toStrict (toHtmlWith () () registerState (viewClient jaMessages registerState)))
+
+            authStateSample <- mkAuthenticatedState
+            let logoutModalState :: ClientState
+                logoutModalState = authStateSample { pendingNavigation = Just NavLogout }
+
+                authedHtml :: Text
+                authedHtml = TxtEnc.decodeUtf8Lenient
+                    (LazyBS.toStrict (toHtmlWith () () logoutModalState (viewClient jaMessages logoutModalState)))
+
+            checkingHtml `shouldSatisfy` Txt.isInfixOf jaMessages.authCheckingMessage
+            checkingHtml `shouldSatisfy` (not . Txt.isInfixOf jaMessages.actionLogout)
+
+            loginHtml `shouldSatisfy` Txt.isInfixOf jaMessages.authLoginHeading
+            loginHtml `shouldSatisfy` Txt.isInfixOf jaMessages.errInvalidCredentials
+            loginHtml `shouldSatisfy` Txt.isInfixOf jaMessages.errSessionExpired
+            loginHtml `shouldSatisfy` (not . Txt.isInfixOf jaMessages.authPasswordConfirmLabel)
+
+            registerHtml `shouldSatisfy` Txt.isInfixOf jaMessages.authRegisterHeading
+            registerHtml `shouldSatisfy` Txt.isInfixOf jaMessages.authDisplayNameLabel
+            registerHtml `shouldSatisfy` Txt.isInfixOf jaMessages.authPasswordConfirmLabel
+            registerHtml `shouldSatisfy` Txt.isInfixOf jaMessages.actionRegister
+
+            authedHtml `shouldSatisfy` Txt.isInfixOf "アリス"
+            authedHtml `shouldSatisfy` Txt.isInfixOf jaMessages.actionLogout
+            authedHtml `shouldSatisfy` Txt.isInfixOf jaMessages.confirmUnsavedLogoutBody
+            authedHtml `shouldSatisfy` Txt.isInfixOf jaMessages.actionDiscardAndLogout
+
+        it "handles pure auth state transitions (applyAuthSessionChecked, applyAuthSubmitted, applySessionExpired, currentUserId)" $ do
+            session <- mkSampleAuthSession "user-pure" "pureuser" Nothing
+            let s0 :: ClientState
+                s0 = initialClientState bundledExtensions
+
+                sAuthed :: ClientState
+                sAuthed = applyAuthSessionChecked jaMessages 0 (Right session) s0
+
+                sExpired :: ClientState
+                sExpired = applySessionExpired jaMessages sAuthed
+
+                sSubmitted :: ClientState
+                sSubmitted = applyAuthSubmitted jaMessages sExpired.authSessionSeq AuthModeLogin (Right session) sExpired
+            currentUserId s0 `shouldBe` Nothing
+            currentUserId sAuthed `shouldBe` Just session.user.id
+            currentUserId sExpired `shouldBe` Nothing
+            sExpired.lastError `shouldBe` Just jaMessages.errSessionExpired
+            currentUserId sSubmitted `shouldBe` Just session.user.id
+            sSubmitted.statusNotice `shouldBe` Just jaMessages.noticeLoggedIn
 
 recordingTransport ::
        IORef (Maybe HttpRequest)
@@ -2060,3 +2559,48 @@ runUpdateStep env action state = do
     runSchedule :: (ClientAction -> IO ()) -> Schedule () ClientAction -> IO ()
     runSchedule sink (Schedule _ actionIo) = actionIo sink
     runSchedule _    _                     = pure ()
+
+runActionQueue ::
+       ClientEnv
+    -> [ClientAction]
+    -> ClientState
+    -> IO (ClientState, [ClientAction])
+runActionQueue _ [] state = pure (state, [])
+runActionQueue env (act : rest) state = do
+    (nextState, emitted) <- runUpdateStep env act state
+    runActionQueue env (rest <> emitted) nextState
+
+mkSampleUserId :: Text -> IO UserId
+mkSampleUserId = expectRight . mkUserId
+
+mkSampleCsrfToken :: IO CsrfToken
+mkSampleCsrfToken = expectRight (mkCsrfToken "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU")
+
+mkSampleAuthSession :: Text -> Text -> Maybe Text -> IO AuthSessionResponse
+mkSampleAuthSession rawUid rawUsername mRawDisplay = do
+    uid   <- mkSampleUserId rawUid
+    uname <- expectRight (mkUsername rawUsername)
+    mDisp <- traverse (expectRight . mkDisplayName) mRawDisplay
+    csrf  <- mkSampleCsrfToken
+    pure AuthSessionResponse
+        { user = UserProfile
+            { id          = uid
+            , username    = uname
+            , displayName = mDisp
+            , createdAt   = sampleUtcTime
+            }
+        , csrfToken = csrf
+        }
+
+mkAuthenticatedState :: IO ClientState
+mkAuthenticatedState = do
+    session <- mkSampleAuthSession "user-alice" "alice" (Just "アリス")
+    pure (mkAuthenticatedStateFor session)
+
+mkAuthenticatedStateFor :: AuthSessionResponse -> ClientState
+mkAuthenticatedStateFor session =
+    (initialClientState bundledExtensions)
+        { connectionStatus = ConnOnline
+        , authState        = AuthAuthenticated session
+        , authSessionSeq   = 1
+        }
