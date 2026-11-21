@@ -10,6 +10,7 @@ import qualified Data.Aeson                    as Aeson
 import qualified Data.Char                     as Char
 import           Data.Either                   (isLeft)
 import qualified Data.List.NonEmpty            as NE
+import qualified Data.Map.Strict               as Map
 import           Data.Maybe                    (isNothing)
 import           Data.Text                     (Text)
 import qualified Data.Text                     as Txt
@@ -118,9 +119,23 @@ import           TamaTsuzura.Common.Document
     , tagSetToList
     , toDocumentSummary
     )
+import           TamaTsuzura.Common.Merge
+    ( ConflictBlock(..)
+    , ConflictChoice(..)
+    , ConflictMarkerLabels(..)
+    , MergeOutcome(..)
+    , MergeRegion(..)
+    , defaultConflictMarkerLabels
+    , mergeThreeWay
+    , renderMergedText
+    , resolveConflictBlock
+    , resolveMergeOutcome
+    , splitLinesPreserveNewlines
+    )
 import           TamaTsuzura.Common.Revision
     ( ContentHash
     , RestoreRevisionRequest(..)
+    , RevisionCompareResponse(..)
     , RevisionDetail(..)
     , RevisionId
     , RevisionListResponse(..)
@@ -1214,6 +1229,29 @@ spec = do
                             }
                     Aeson.decode (Aeson.encode initialDetail) `shouldBe` Just initialDetail
 
+                    -- RevisionCompareResponse の JSON キーおよび往復
+                    let cmpRes :: RevisionCompareResponse
+                        cmpRes = RevisionCompareResponse
+                            { documentId    = docId
+                            , fromRevision  = toRevisionSummary initialDetail
+                            , toRevision    = summary
+                            , titleChanged  = True
+                            , formatChanged = False
+                            , bodyDiff      = sampleDiff
+                            }
+
+                        expectedCmpJson :: Aeson.Value
+                        expectedCmpJson = Aeson.object
+                            [ "document_id"    Aeson..= docId
+                            , "from_revision"  Aeson..= toRevisionSummary initialDetail
+                            , "to_revision"    Aeson..= summary
+                            , "title_changed"  Aeson..= True
+                            , "format_changed" Aeson..= False
+                            , "body_diff"      Aeson..= sampleDiff
+                            ]
+                    Aeson.toJSON cmpRes `shouldBe` expectedCmpJson
+                    Aeson.decode (Aeson.encode cmpRes) `shouldBe` Just cmpRes
+
                     -- 必須 nullable キー parent_revision_id が欠落した JSON は Summary / Detail 双方で拒否される
                     let missingParentKey :: Aeson.Value
                         missingParentKey = Aeson.object
@@ -1248,3 +1286,199 @@ spec = do
                             (revisionContentCanonicalText t1 f1 b1 == revisionContentCanonicalText t2 f2 b2)
                                 == ((t1, f1, b1) == (t2, f2, b2))
                         _ -> False
+
+    describe "Pure 3-way merge engine (TamaTsuzura.Common.Merge)" $ do
+        it "round-trips any text through splitLinesPreserveNewlines (QuickCheck)" $
+            property $ \ rawStr ->
+                let txt :: Text
+                    txt = Txt.pack rawStr
+                in  Txt.concat (splitLinesPreserveNewlines txt) == txt
+
+        it "satisfies identity, one-sided, and convergent merge laws (QuickCheck)" $
+            property $ \ baseStr sideStr ->
+                let b :: Text
+                    b = Txt.pack baseStr
+
+                    s :: Text
+                    s = Txt.pack sideStr
+
+                    mId :: MergeOutcome
+                    mId = mergeThreeWay b b b
+
+                    mOurs :: MergeOutcome
+                    mOurs = mergeThreeWay b s b
+
+                    mTheirs :: MergeOutcome
+                    mTheirs = mergeThreeWay b b s
+
+                    mConv :: MergeOutcome
+                    mConv = mergeThreeWay b s s
+                in  not mId.hasConflicts
+                        && renderMergedText defaultConflictMarkerLabels mId == b
+                        && not mOurs.hasConflicts
+                        && renderMergedText defaultConflictMarkerLabels mOurs == s
+                        && not mTheirs.hasConflicts
+                        && renderMergedText defaultConflictMarkerLabels mTheirs == s
+                        && not mConv.hasConflicts
+                        && renderMergedText defaultConflictMarkerLabels mConv == s
+
+        it "auto-merges non-overlapping edits on opposite ends without conflicts" $ do
+            let base :: Text
+                base = "line1\nline2\nline3\nline4\n"
+
+                ours :: Text
+                ours = "LINE1-OURS\nline2\nline3\nline4\n"
+
+                theirs :: Text
+                theirs = "line1\nline2\nline3\nLINE4-THEIRS\n"
+
+                outcome :: MergeOutcome
+                outcome = mergeThreeWay base ours theirs
+            outcome.hasConflicts `shouldBe` False
+            outcome.conflictCount `shouldBe` 0
+            renderMergedText defaultConflictMarkerLabels outcome
+                `shouldBe` "LINE1-OURS\nline2\nline3\nLINE4-THEIRS\n"
+
+        it "detects conflicting edits and resolves via ChooseOurs, ChooseTheirs, ChooseBoth, ChooseBase, and ChooseCustom" $ do
+            let base :: Text
+                base = "header\noriginal\nfooter\n"
+
+                ours :: Text
+                ours = "header\nlocal-change\nfooter\n"
+
+                theirs :: Text
+                theirs = "header\nserver-change\nfooter\n"
+
+                outcome :: MergeOutcome
+                outcome = mergeThreeWay base ours theirs
+            outcome.hasConflicts `shouldBe` True
+            outcome.conflictCount `shouldBe` 1
+            resolveMergeOutcome Map.empty outcome `shouldBe` Left 0
+            resolveMergeOutcome (Map.singleton 0 ChooseOurs) outcome `shouldBe` Right ours
+            resolveMergeOutcome (Map.singleton 0 ChooseTheirs) outcome `shouldBe` Right theirs
+            resolveMergeOutcome (Map.singleton 0 ChooseBase) outcome `shouldBe` Right base
+            resolveMergeOutcome (Map.singleton 0 ChooseBothOursFirst) outcome
+                `shouldBe` Right "header\nlocal-change\nserver-change\nfooter\n"
+            resolveMergeOutcome (Map.singleton 0 ChooseBothTheirsFirst) outcome
+                `shouldBe` Right "header\nserver-change\nlocal-change\nfooter\n"
+            resolveMergeOutcome (Map.singleton 0 (ChooseCustom "manual-merge\n")) outcome
+                `shouldBe` Right "header\nmanual-merge\nfooter\n"
+            let rendered :: Text
+                rendered = renderMergedText defaultConflictMarkerLabels outcome
+            Txt.isInfixOf "<<<<<<< LOCAL\nlocal-change\n=======\nserver-change\n>>>>>>> SERVER\n" rendered
+                `shouldBe` True
+
+        it "handles empty base, no-trailing-newline conflicts, same-position pure insertions, transitive clustering, and adjacent edits" $ do
+            -- 1. Empty base with divergent insertions on both sides
+            let emptyDiv :: MergeOutcome
+                emptyDiv = mergeThreeWay "" "local-only" "server-only"
+            emptyDiv.hasConflicts `shouldBe` True
+            emptyDiv.conflictCount `shouldBe` 1
+            resolveMergeOutcome (Map.singleton 0 ChooseBothOursFirst) emptyDiv
+                `shouldBe` Right "local-only\nserver-only"
+            resolveMergeOutcome (Map.singleton 0 ChooseBothTheirsFirst) emptyDiv
+                `shouldBe` Right "server-only\nlocal-only"
+
+            -- 2. Custom marker labels and no-trailing-newline conflict rendering
+            let customLabels :: ConflictMarkerLabels
+                customLabels = ConflictMarkerLabels
+                    { oursLabel   = "MY-DRAFT"
+                    , baseLabel   = "ANCESTOR"
+                    , theirsLabel = "REMOTE"
+                    }
+            renderMergedText customLabels emptyDiv
+                `shouldBe` "<<<<<<< MY-DRAFT\nlocal-only\n=======\nserver-only\n>>>>>>> REMOTE\n"
+
+            -- 3. Same-position pure insertion: identical converges cleanly, divergent conflicts with empty baseLines
+            let sameInsertClean :: MergeOutcome
+                sameInsertClean = mergeThreeWay "a\nb\n" "a\nX\nb\n" "a\nX\nb\n"
+            sameInsertClean.hasConflicts `shouldBe` False
+            renderMergedText defaultConflictMarkerLabels sameInsertClean `shouldBe` "a\nX\nb\n"
+
+            let sameInsertConflict :: MergeOutcome
+                sameInsertConflict = mergeThreeWay "a\nb\n" "a\nX\nb\n" "a\nY\nb\n"
+            sameInsertConflict.hasConflicts `shouldBe` True
+            case [ cb | MergeConflict cb <- sameInsertConflict.regions ] of
+                [cb] -> do
+                    cb.baseLines `shouldBe` []
+                    cb.oursLines `shouldBe` ["X\n"]
+                    cb.theirsLines `shouldBe` ["Y\n"]
+                other -> expectationFailure ("Expected 1 pure-insert conflict block, got: " <> show other)
+
+            -- 4. Transitive overlap clustering across two ours spans bridged by one theirs span
+            let transBase :: Text
+                transBase = "l0\nl1\nl2\nl3\nl4\nl5\n"
+
+                transOurs :: Text
+                transOurs = "O0\nO1\nl2\nO3\nO4\nl5\n"
+
+                transTheirs :: Text
+                transTheirs = "l0\nT1\nT2\nT3\nl4\nl5\n"
+
+                transOutcome :: MergeOutcome
+                transOutcome = mergeThreeWay transBase transOurs transTheirs
+            transOutcome.conflictCount `shouldBe` 1
+            resolveMergeOutcome (Map.singleton 0 ChooseOurs) transOutcome `shouldBe` Right transOurs
+            resolveMergeOutcome (Map.singleton 0 ChooseTheirs) transOutcome `shouldBe` Right transTheirs
+
+            -- 5. Adjacent non-overlapping edits [0,1) vs [1,2) merge cleanly; [0,1) vs pure insert [1,1) conflicts
+            let adjClean :: MergeOutcome
+                adjClean = mergeThreeWay "a\nb\nc\n" "A\nb\nc\n" "a\nB\nc\n"
+            adjClean.hasConflicts `shouldBe` False
+            renderMergedText defaultConflictMarkerLabels adjClean `shouldBe` "A\nB\nc\n"
+
+            let adjInsert :: MergeOutcome
+                adjInsert = mergeThreeWay "a\nb\n" "A\nb\n" "a\nINS\nb\n"
+            adjInsert.hasConflicts `shouldBe` True
+
+            -- 6. Multiple conflicts partial resolution reports first unresolved index
+            let multiOutcome :: MergeOutcome
+                multiOutcome = mergeThreeWay "a\nmid\nb\n" "A1\nmid\nB1\n" "A2\nmid\nB2\n"
+            multiOutcome.conflictCount `shouldBe` 2
+            resolveMergeOutcome (Map.singleton 0 ChooseOurs) multiOutcome `shouldBe` Left 1
+            resolveMergeOutcome (Map.fromList [(0, ChooseOurs), (1, ChooseTheirs)]) multiOutcome
+                `shouldBe` Right "A1\nmid\nB2\n"
+
+        it "satisfies MergeOutcome structural invariants and resolution laws on multi-line inputs (QuickCheck)" $
+            forAll ((,,) <$> genDiffText <*> genDiffText <*> genDiffText) $ \ (b, o, t) ->
+                let outcome :: MergeOutcome
+                    outcome = mergeThreeWay b o t
+
+                    conflictIndices :: [Int]
+                    conflictIndices = [ cb.conflictIndex | MergeConflict cb <- outcome.regions ]
+
+                    hasNoEmptyOrAdjacentClean :: [MergeRegion] -> Bool
+                    hasNoEmptyOrAdjacentClean []                                = True
+                    hasNoEmptyOrAdjacentClean (MergeClean [] : _)               = False
+                    hasNoEmptyOrAdjacentClean (MergeClean{} : MergeClean{} : _) = False
+                    hasNoEmptyOrAdjacentClean (_ : rest)                        = hasNoEmptyOrAdjacentClean rest
+
+                    allOurs :: Map.Map Int ConflictChoice
+                    allOurs = Map.fromList [ (i, ChooseOurs) | i <- [0 .. outcome.conflictCount - 1] ]
+
+                    allTheirs :: Map.Map Int ConflictChoice
+                    allTheirs = Map.fromList [ (i, ChooseTheirs) | i <- [0 .. outcome.conflictCount - 1] ]
+
+                    checkRegion :: MergeRegion -> Bool
+                    checkRegion (MergeConflict cb) =
+                        resolveConflictBlock ChooseOurs cb == Txt.concat cb.oursLines
+                            && resolveConflictBlock ChooseTheirs cb == Txt.concat cb.theirsLines
+                    checkRegion MergeClean{} = True
+
+                    lawsHold :: Bool
+                    lawsHold =
+                        not (mergeThreeWay b b b).hasConflicts
+                            && renderMergedText defaultConflictMarkerLabels (mergeThreeWay b b b) == b
+                            && not (mergeThreeWay b o b).hasConflicts
+                            && renderMergedText defaultConflictMarkerLabels (mergeThreeWay b o b) == o
+                            && not (mergeThreeWay b b t).hasConflicts
+                            && renderMergedText defaultConflictMarkerLabels (mergeThreeWay b b t) == t
+                            && not (mergeThreeWay b o o).hasConflicts
+                            && renderMergedText defaultConflictMarkerLabels (mergeThreeWay b o o) == o
+                in  lawsHold
+                        && outcome.hasConflicts == (outcome.conflictCount > 0)
+                        && conflictIndices == [0 .. outcome.conflictCount - 1]
+                        && hasNoEmptyOrAdjacentClean outcome.regions
+                        && case (resolveMergeOutcome allOurs outcome, resolveMergeOutcome allTheirs outcome) of
+                            (Right _, Right _) -> all checkRegion outcome.regions
+                            _                  -> False

@@ -13,6 +13,7 @@ module TamaTsuzura.Server.Storage.Revision
       -- * リビジョン履歴取得 (所有者分離)
     , listDocumentRevisions
     , getDocumentRevision
+    , compareDocumentRevisions
     ) where
 
 import           Crypto.Hash                       (Digest, SHA256(..))
@@ -57,6 +58,7 @@ import           TamaTsuzura.Common.Document
     )
 import           TamaTsuzura.Common.Revision
     ( ContentHash
+    , RevisionCompareResponse(..)
     , RevisionDetail(..)
     , RevisionId
     , RevisionListResponse(..)
@@ -64,6 +66,7 @@ import           TamaTsuzura.Common.Revision
     , mkContentHash
     , mkRevisionId
     , revisionContentCanonicalText
+    , toRevisionSummary
     )
 import           TamaTsuzura.Common.Text           (ToText(..))
 import           TamaTsuzura.Server.Storage.Schema
@@ -248,6 +251,55 @@ getDocumentRevision handle ownerId docId targetRev =
                 Left err -> pure (Left err)
                 Right (currentBody, currentRev) ->
                     reconstructRevisionDetailInTx handle.connection docId currentBody currentRev targetRev
+
+-- | 所有者本人の文書について、任意の 2 リビジョン (@fromRev@ から @toRev@) を
+-- 同一読み取りトランザクション内で再構成し、差分比較レスポンスを生成する。
+-- 他ユーザーの文書や存在しないリビジョン番号を指定した場合は 'DocumentNotFound' / 'RevisionNotFound' を返す。
+compareDocumentRevisions ::
+       StorageHandle
+    -> UserId
+    -> DocumentId
+    -> RevisionNumber
+    -> RevisionNumber
+    -> IO (Either StorageError RevisionCompareResponse)
+compareDocumentRevisions handle ownerId docId fromRev toRev =
+    catchSqliteErrors $
+        withReadTransaction handle.connection $ do
+            docRows <- SQLite.query
+                handle.connection
+                "SELECT body, revision FROM documents WHERE id = ? AND owner_id = ?"
+                (toText docId, toText ownerId)
+                :: IO [CurrentDocMetaRow]
+            case docRows of
+                [] ->
+                    pure (Left (DocumentNotFound docId))
+                [(rawBody, rawCurrentRev)] ->
+                    case mapValidationToCorrupted "revision" (mkRevisionNumber rawCurrentRev) of
+                        Left err -> pure (Left err)
+                        Right currentRev -> do
+                            let currentBody :: DocumentBody
+                                currentBody = DocumentBody rawBody
+                            eFrom <- reconstructRevisionDetailInTx handle.connection docId currentBody currentRev fromRev
+                            case eFrom of
+                                Left err -> pure (Left err)
+                                Right fromDetail -> do
+                                    eTo <-
+                                        if fromRev == toRev
+                                            then pure (Right fromDetail)
+                                            else reconstructRevisionDetailInTx handle.connection docId currentBody currentRev toRev
+                                    pure $ fmap (buildCompareResponse fromDetail) eTo
+                _ ->
+                    pure (Left (CorruptedData ("Duplicate document id: " <> toText docId)))
+  where
+    buildCompareResponse :: RevisionDetail -> RevisionDetail -> RevisionCompareResponse
+    buildCompareResponse fromDetail toDetail = RevisionCompareResponse
+        { documentId    = docId
+        , fromRevision  = toRevisionSummary fromDetail
+        , toRevision    = toRevisionSummary toDetail
+        , titleChanged  = fromDetail.title /= toDetail.title
+        , formatChanged = fromDetail.format /= toDetail.format
+        , bodyDiff      = generateUnifiedDiff (toText fromDetail.body) (toText toDetail.body)
+        }
 
 -- | トランザクション内で指定リビジョン番号の 'RevisionDetail' を再構成・整合性検証する。
 -- 復元操作 ('restoreDocumentRevisionAt') と詳細取得 ('getDocumentRevision') の双方から共有される。

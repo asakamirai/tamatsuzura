@@ -10,7 +10,7 @@
 
 ## 現在地
 
-**M6（PWA / オフライン対応と同期）完了。次は M7（差分管理 Phase 2: リビジョン比較・マージ）の Phase 1 へ着手予定。**
+**M7（差分管理 Phase 2: リビジョン比較・マージ）Phase 1 完了。次は Phase 2（クライアント比較 UI・3-way マージ手動解決 UI）へ着手予定。**
 
 | マイルストーン | 内容 | 状態 | 完了記録 |
 | --- | --- | --- | --- |
@@ -21,7 +21,7 @@
 | M4 | 差分管理 Phase 1 (リビジョン履歴) | **完了** | [M4.md](./project/history/M4.md) |
 | M5 | Haskell 拡張機構 (MVP: 同梱拡張) | **完了** | [M5.md](./project/history/M5.md) |
 | M6 | PWA / オフライン対応と同期 | **完了** | [M6.md](./project/history/M6.md) |
-| **M7** | **差分管理 Phase 2 (リビジョン比較・マージ)** | **進行中 (Phase 1 着手前)** | — |
+| **M7** | **差分管理 Phase 2 (リビジョン比較・マージ)** | **進行中 (Phase 1 完了)** | — |
 
 ※ 各マイルストーンの詳細な目的・完了条件は [project/milestones.md](./project/milestones.md) を参照してください。
 
@@ -31,7 +31,7 @@
 
 **M7: 差分管理 Phase 2 (リビジョン比較・マージ)**
 
-- [ ] Phase 1: `src/common/` 純粋 3-way マージエンジンおよび任意 2 リビジョン比較ロジック（`hspec` + `QuickCheck`）・サーバ比較 API 統合
+- [x] Phase 1: `src/common/` 純粋 3-way マージエンジンおよび任意 2 リビジョン比較ロジック（`hspec` + `QuickCheck`）・サーバ比較 API 統合
 - [ ] Phase 2: クライアント任意 2 リビジョン比較 UI および競合発生時の 3-way マージ手動解決 UI（モバイル対応）
 
 ※ マイルストーンの新規追加や調整は Antigravity スキル `add-milestone` を利用してください。

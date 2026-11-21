@@ -16,6 +16,7 @@ module TamaTsuzura.Common.Revision
     , RevisionDetail(..)
     , toRevisionSummary
     , RevisionListResponse(..)
+    , RevisionCompareResponse(..)
     , RestoreRevisionRequest(..)
     , defaultRestoreRevisionRequest
       -- re-export
@@ -287,6 +288,51 @@ instance FromJSON RevisionListResponse where
                 { revisions = revs
                 , total     = tot
                 }
+
+-- | 任意 2 リビジョン比較 API (@GET /api/documents/{id}/revisions/compare?from={r1}&to={r2}@) のレスポンス DTO。
+-- 比較元・比較先の各メタデータサマリと、比較元本文から比較先本文への unified diff を返す。
+data RevisionCompareResponse = RevisionCompareResponse
+    { documentId    :: !DocumentId
+      -- ^ 対象文書 ID
+    , fromRevision  :: !RevisionSummary
+      -- ^ 比較元リビジョンのサマリ情報
+    , toRevision    :: !RevisionSummary
+      -- ^ 比較先リビジョンのサマリ情報
+    , titleChanged  :: !Bool
+      -- ^ 比較元と比較先でタイトルが異なるかどうか
+    , formatChanged :: !Bool
+      -- ^ 比較元と比較先でフォーマットが異なるかどうか
+    , bodyDiff      :: !UnifiedDiff
+      -- ^ 比較元本文から比較先本文への unified diff (変更なし時は空文字)
+    } deriving (Eq, Show)
+
+instance ToText RevisionCompareResponse where
+    toText res =
+        toText res.documentId
+            <> "@r"
+            <> toText res.fromRevision.revision
+            <> "..r"
+            <> toText res.toRevision.revision
+
+instance ToJSON RevisionCompareResponse where
+    toJSON res = Aeson.object
+        [ "document_id"    Aeson..= res.documentId
+        , "from_revision"  Aeson..= res.fromRevision
+        , "to_revision"    Aeson..= res.toRevision
+        , "title_changed"  Aeson..= res.titleChanged
+        , "format_changed" Aeson..= res.formatChanged
+        , "body_diff"      Aeson..= res.bodyDiff
+        ]
+
+instance FromJSON RevisionCompareResponse where
+    parseJSON = Aeson.withObject "RevisionCompareResponse" $ \ obj ->
+        RevisionCompareResponse
+            <$> obj Aeson..: "document_id"
+            <*> obj Aeson..: "from_revision"
+            <*> obj Aeson..: "to_revision"
+            <*> obj Aeson..: "title_changed"
+            <*> obj Aeson..: "format_changed"
+            <*> obj Aeson..: "body_diff"
 
 -- | 過去リビジョン復元 API (@POST /api/documents/{id}/revisions/{revision}/restore@) のリクエスト DTO。
 -- @baseRevision@ を指定した場合は現在の最新リビジョン番号と照合し、不一致時は 409 Conflict を返却する。

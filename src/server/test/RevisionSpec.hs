@@ -68,6 +68,7 @@ import           TamaTsuzura.Common.Document
     )
 import           TamaTsuzura.Common.Revision
     ( RestoreRevisionRequest(..)
+    , RevisionCompareResponse(..)
     , RevisionDetail(..)
     , RevisionListResponse(..)
     , RevisionSummary(..)
@@ -79,6 +80,7 @@ import           TamaTsuzura.Server.Api
     , RevisionListQuery(..)
     , defaultRevisionListQuery
     , emptyRawRevisionListQuery
+    , parseCompareRevisionsQuery
     , parseRevisionListQuery
     , parseRevisionNumberParam
     )
@@ -893,6 +895,118 @@ revisionApiSpec = describe "Revision history HTTP REST API endpoints" $ do
                     liftEq err500.field Nothing
                 )
                 app
+
+    it "compares any two revisions with metadata flags, handles reverse/same revision, validates params, and enforces owner isolation" $
+        withTestApp $ \ app -> do
+            assertFieldError "from" (parseCompareRevisionsQuery Nothing (Just "2"))
+            assertFieldError "to"   (parseCompareRevisionsQuery (Just "1") Nothing)
+            assertFieldError "from" (parseCompareRevisionsQuery (Just "0") (Just "2"))
+            assertFieldError "to"   (parseCompareRevisionsQuery (Just "1") (Just "abc"))
+
+            WaiTest.runSession
+                ( do
+                    alice <- registerTestUser "cmp_alice"
+                    let aliceRead :: Http.RequestHeaders
+                        aliceRead = [(Http.hCookie, alice.cookie)]
+
+                        aliceWrite :: Http.RequestHeaders
+                        aliceWrite = [(Http.hCookie, alice.cookie), (csrfHeaderName, alice.csrf)]
+
+                    let payload1 :: LazyBS.ByteString
+                        payload1 = Aeson.encode $ Aeson.object
+                            [ "title"  Aeson..= ("初版タイトル" :: Text)
+                            , "body"   Aeson..= ("line1\nline2\n" :: Text)
+                            , "format" Aeson..= ("markdown" :: Text)
+                            ]
+
+                        payload2 :: LazyBS.ByteString
+                        payload2 = Aeson.encode $ Aeson.object
+                            [ "title"  Aeson..= ("初版タイトル" :: Text)
+                            , "body"   Aeson..= ("line1\nline2-v2\n" :: Text)
+                            , "format" Aeson..= ("markdown" :: Text)
+                            , "tags"   Aeson..= ([] :: [Text])
+                            ]
+
+                        payload3 :: LazyBS.ByteString
+                        payload3 = Aeson.encode $ Aeson.object
+                            [ "title"  Aeson..= ("改訂タイトル" :: Text)
+                            , "body"   Aeson..= ("line1\nline2-v3\nline3\n" :: Text)
+                            , "format" Aeson..= ("plain_text" :: Text)
+                            , "tags"   Aeson..= ([] :: [Text])
+                            ]
+
+                    resCreate <- sendJsonRequest Http.methodPost "/api/documents" aliceWrite (Just payload1)
+                    WaiTest.assertStatus 201 resCreate
+                    doc1 <- liftDecode resCreate :: WaiTest.Session Document
+                    let docPath :: ByteString
+                        docPath = "/api/documents/" <> TxtEnc.encodeUtf8 (toText doc1.id)
+
+                        cmpBase :: ByteString
+                        cmpBase = docPath <> "/revisions/compare"
+
+                    resU2 <- sendJsonRequest Http.methodPut docPath aliceWrite (Just payload2)
+                    WaiTest.assertStatus 200 resU2
+                    resU3 <- sendJsonRequest Http.methodPut docPath aliceWrite (Just payload3)
+                    WaiTest.assertStatus 200 resU3
+
+                    -- 1. Forward comparison r1 -> r3
+                    resFwd <- sendJsonRequest Http.methodGet (cmpBase <> "?from=1&to=3") aliceRead Nothing
+                    WaiTest.assertStatus 200 resFwd
+                    cmpFwd <- liftDecode resFwd :: WaiTest.Session RevisionCompareResponse
+                    liftEq cmpFwd.documentId doc1.id
+                    liftEq (revisionNumberValue cmpFwd.fromRevision.revision) 1
+                    liftEq (revisionNumberValue cmpFwd.toRevision.revision) 3
+                    liftEq cmpFwd.titleChanged True
+                    liftEq cmpFwd.formatChanged True
+                    liftEq cmpFwd.bodyDiff (generateUnifiedDiff "line1\nline2\n" "line1\nline2-v3\nline3\n")
+
+                    -- 2. Reverse comparison r3 -> r1
+                    resRev <- sendJsonRequest Http.methodGet (cmpBase <> "?from=3&to=1") aliceRead Nothing
+                    WaiTest.assertStatus 200 resRev
+                    cmpRev <- liftDecode resRev :: WaiTest.Session RevisionCompareResponse
+                    liftEq cmpRev.bodyDiff (generateUnifiedDiff "line1\nline2-v3\nline3\n" "line1\nline2\n")
+
+                    -- 3. Same revision r2 -> r2 yields empty diff and no metadata changes
+                    resSame <- sendJsonRequest Http.methodGet (cmpBase <> "?from=2&to=2") aliceRead Nothing
+                    WaiTest.assertStatus 200 resSame
+                    cmpSame <- liftDecode resSame :: WaiTest.Session RevisionCompareResponse
+                    liftEq cmpSame.titleChanged False
+                    liftEq cmpSame.formatChanged False
+                    liftEq cmpSame.bodyDiff emptyUnifiedDiff
+
+                    -- 4. Missing query param returns 400
+                    resBad <- sendJsonRequest Http.methodGet (cmpBase <> "?from=1") aliceRead Nothing
+                    WaiTest.assertStatus 400 resBad
+
+                    -- 5. Non-existent revision returns 404 (both to and from)
+                    resNoRevTo <- sendJsonRequest Http.methodGet (cmpBase <> "?from=1&to=99") aliceRead Nothing
+                    WaiTest.assertStatus 404 resNoRevTo
+                    resNoRevFrom <- sendJsonRequest Http.methodGet (cmpBase <> "?from=99&to=1") aliceRead Nothing
+                    WaiTest.assertStatus 404 resNoRevFrom
+
+                    -- 6. Trashed document revisions remain comparable (200)
+                    resTrash <- sendJsonRequest Http.methodDelete docPath aliceWrite Nothing
+                    WaiTest.assertStatus 200 resTrash
+                    resTrashedCmp <- sendJsonRequest Http.methodGet (cmpBase <> "?from=1&to=3") aliceRead Nothing
+                    WaiTest.assertStatus 200 resTrashedCmp
+
+                    -- 7. Another user cannot compare Alice's revisions (404)
+                    bob <- registerTestUser "cmp_bob"
+                    let bobRead :: Http.RequestHeaders
+                        bobRead = [(Http.hCookie, bob.cookie)]
+                    resBob <- sendJsonRequest Http.methodGet (cmpBase <> "?from=1&to=3") bobRead Nothing
+                    WaiTest.assertStatus 404 resBob
+                    pure cmpBase
+                )
+                app
+                >>= \ cmpBasePath ->
+                    -- 8. Unauthenticated request in a clean session returns 401
+                    WaiTest.runSession
+                        ( do
+                            resUnauth <- sendJsonRequest Http.methodGet (cmpBasePath <> "?from=1&to=3") [] Nothing
+                            WaiTest.assertStatus 401 resUnauth
+                        )
+                        app
 
 seedUser :: StorageHandle -> Text -> Text -> IO UserId
 seedUser storage rawUid rawUname = do

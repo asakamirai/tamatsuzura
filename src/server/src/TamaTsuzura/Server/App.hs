@@ -75,6 +75,7 @@ import           TamaTsuzura.Common.Auth
 import           TamaTsuzura.Common.Document      (Document, DocumentId, RevisionNumber)
 import           TamaTsuzura.Common.Revision
     ( RestoreRevisionRequest
+    , RevisionCompareResponse
     , RevisionDetail
     , RevisionListResponse
     )
@@ -95,6 +96,7 @@ import           TamaTsuzura.Server.Api
     , apiErrorFormatters
     , apiErrorToServerError
     , jsonContentType
+    , parseCompareRevisionsQuery
     , parseDocumentIdParam
     , parseDocumentListQuery
     , parseRevisionListQuery
@@ -383,6 +385,7 @@ documentByIdHandlers storageCfg rawId =
 documentRevisionsHandlers :: StorageConfig -> Text -> Server DocumentRevisionsApi
 documentRevisionsHandlers storageCfg rawId =
     handleListDocumentRevisions storageCfg rawId
+        :<|> handleCompareDocumentRevisions storageCfg rawId
         :<|> documentRevisionByNumberHandlers storageCfg rawId
 
 documentRevisionByNumberHandlers :: StorageConfig -> Text -> Text -> Server DocumentRevisionByNumberApi
@@ -626,6 +629,20 @@ handleListDocumentRevisions storageCfg rawId sessionCtx mLimit mOffset = do
     docId <- parseIdOrThrow rawId
     query <- either (Servant.throwError . apiErrorToServerError) pure (parseRevisionListQuery rawQuery)
     runStorage storageCfg (\ handle -> Storage.listDocumentRevisions handle ownerId docId query.limit query.offset)
+
+handleCompareDocumentRevisions ::
+       StorageConfig
+    -> Text
+    -> SessionAuthContext
+    -> Maybe Text
+    -> Maybe Text
+    -> Handler RevisionCompareResponse
+handleCompareDocumentRevisions storageCfg rawId sessionCtx mFrom mTo = do
+    let ownerId :: UserId
+        ownerId = sessionCtx.authenticated.user.id
+    docId <- parseIdOrThrow rawId
+    (fromRev, toRev) <- either (Servant.throwError . apiErrorToServerError) pure (parseCompareRevisionsQuery mFrom mTo)
+    runStorage storageCfg (\ handle -> Storage.compareDocumentRevisions handle ownerId docId fromRev toRev)
 
 handleGetDocumentRevision ::
        StorageConfig

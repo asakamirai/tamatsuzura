@@ -31,6 +31,7 @@ module TamaTsuzura.Server.Api
     , RevisionListQuery(..)
     , defaultRevisionListQuery
     , parseRevisionListQuery
+    , parseCompareRevisionsQuery
     , parseDocumentIdParam
     , parseRevisionNumberParam
       -- * エラーレスポンス変換・フォーマッタ
@@ -116,6 +117,7 @@ import           TamaTsuzura.Common.Document
     )
 import           TamaTsuzura.Common.Revision
     ( RestoreRevisionRequest
+    , RevisionCompareResponse
     , RevisionDetail
     , RevisionListResponse
     )
@@ -247,6 +249,11 @@ type DocumentRevisionsApi
         :> QueryParam "limit" Text
         :> QueryParam "offset" Text
         :> Get '[JSON] RevisionListResponse
+      :<|> "compare"
+        :> SessionAuth
+        :> QueryParam "from" Text
+        :> QueryParam "to" Text
+        :> Get '[JSON] RevisionCompareResponse
       :<|> Capture "revision" Text
         :> DocumentRevisionByNumberApi
 
@@ -401,21 +408,51 @@ parseDocumentIdParam raw = first validationErrorToApiError (mkDocumentId raw)
 
 -- | URL パスセグメントのリビジョン番号 (1 以上の整数) を検証して 'RevisionNumber' へ変換する。
 parseRevisionNumberParam :: Text -> Either ApiError RevisionNumber
-parseRevisionNumberParam raw = do
+parseRevisionNumberParam = parseNamedRevisionNumber "revision"
+
+-- | @GET /api/documents/{id}/revisions/compare@ の必須クエリパラメータ (@from@, @to@) を検証する。
+parseCompareRevisionsQuery ::
+       Maybe Text
+    -> Maybe Text
+    -> Either ApiError (RevisionNumber, RevisionNumber)
+parseCompareRevisionsQuery mFrom mTo = do
+    fromRev <- parseRequired "from" mFrom
+    toRev   <- parseRequired "to" mTo
+    Right (fromRev, toRev)
+  where
+    parseRequired :: Text -> Maybe Text -> Either ApiError RevisionNumber
+    parseRequired paramName Nothing       = Left ApiError
+        { code    = ErrValidation
+        , message = "Missing required query parameter: " <> paramName
+        , field   = Just paramName
+        }
+    parseRequired paramName (Just rawVal) = parseNamedRevisionNumber paramName rawVal
+
+parseNamedRevisionNumber :: Text -> Text -> Either ApiError RevisionNumber
+parseNamedRevisionNumber paramName raw = do
     rawInt <- parseBoundedInteger
-        "revision"
+        paramName
         raw
         (toInteger minRevisionNumber)
         (toInteger (maxBound :: Int))
         revisionRangeMessage
-    first validationErrorToApiError (mkRevisionNumber rawInt)
+    first (withParamField . validationErrorToApiError) (mkRevisionNumber rawInt)
   where
     revisionRangeMessage :: Text -> Text
     revisionRangeMessage rawVal =
-        "Revision number must be an integer >= "
+        "Revision number for "
+            <> paramName
+            <> " must be an integer >= "
             <> Txt.pack (show minRevisionNumber)
             <> " within supported range, got "
             <> rawVal
+
+    withParamField :: ApiError -> ApiError
+    withParamField err = ApiError
+        { code    = err.code
+        , message = err.message
+        , field   = Just paramName
+        }
 
 parseListLimitParam :: Maybe Text -> Either ApiError ListLimit
 parseListLimitParam Nothing  = Right defaultListLimitValue

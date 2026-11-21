@@ -26,6 +26,7 @@ module TamaTsuzura.Server.Storage
       -- * リビジョン履歴取得・復元 (所有者分離)
     , listDocumentRevisions
     , getDocumentRevision
+    , compareDocumentRevisions
     , restoreDocumentRevision
     , restoreDocumentRevisionAt
       -- re-export
@@ -99,6 +100,7 @@ import           TamaTsuzura.Common.Revision         (RestoreRevisionRequest(..)
 import           TamaTsuzura.Common.Text             (ToText(..))
 import           TamaTsuzura.Server.Storage.Revision
     ( appendRevisionInTx
+    , compareDocumentRevisions
     , computeRevisionContentHash
     , getDocumentRevision
     , insertInitialRevisionInTx

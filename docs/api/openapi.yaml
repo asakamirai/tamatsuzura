@@ -2,9 +2,9 @@ openapi: 3.0.3
 info:
   title: TamaTsuzura API
   description: |
-    TamaTsuzura Web API specification (M1 Document CRUD + M3 CGI-Compatible SQLite Cookie Authentication and User Isolation + M4 Revision History).
+    TamaTsuzura Web API specification (M1 Document CRUD + M3 CGI-Compatible SQLite Cookie Authentication and User Isolation + M4 Revision History + M7 Revision Comparison).
     Designed to run identically on both shared-hosting CGI (wai-extra) and standalone Warp servers.
-  version: 0.4.0
+  version: 0.5.0
 tags:
   - name: health
     description: Server health check
@@ -532,6 +532,46 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+
+  /api/documents/{id}/revisions/compare:
+    get:
+      tags:
+        - revisions
+      summary: Compare any two revisions of a document owned by the authenticated user
+      description: |
+        Reconstructs both `from` and `to` revision snapshots inside a single read transaction,
+        verifies their stored content hashes, and returns metadata change flags alongside a unified diff
+        from `from` body to `to` body.
+      operationId: compareDocumentRevisions
+      security:
+        - SessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/DocumentIdPath'
+        - name: from
+          in: query
+          required: true
+          description: 1-based source revision number to compare from
+          schema:
+            $ref: '#/components/schemas/RevisionNumber'
+        - name: to
+          in: query
+          required: true
+          description: 1-based target revision number to compare to
+          schema:
+            $ref: '#/components/schemas/RevisionNumber'
+      responses:
+        '200':
+          description: Comparison summary and unified diff between the two revisions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevisionCompareResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   /api/tags:
     get:
@@ -1081,6 +1121,32 @@ components:
       properties:
         base_revision:
           $ref: '#/components/schemas/NullableRevisionNumber'
+
+    RevisionCompareResponse:
+      type: object
+      required:
+        - document_id
+        - from_revision
+        - to_revision
+        - title_changed
+        - format_changed
+        - body_diff
+      properties:
+        document_id:
+          $ref: '#/components/schemas/DocumentId'
+        from_revision:
+          $ref: '#/components/schemas/RevisionSummary'
+        to_revision:
+          $ref: '#/components/schemas/RevisionSummary'
+        title_changed:
+          type: boolean
+          description: Whether the document title differs between `from_revision` and `to_revision`
+        format_changed:
+          type: boolean
+          description: Whether the document format differs between `from_revision` and `to_revision`
+        body_diff:
+          type: string
+          description: Unified diff from `from_revision` body to `to_revision` body (empty string when identical)
 
     DocumentListResponse:
       type: object
