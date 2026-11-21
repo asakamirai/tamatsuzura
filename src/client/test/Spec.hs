@@ -34,15 +34,19 @@ import           TamaTsuzura.Client.Api
     , buildDocumentListQueryString
     , buildGetCurrentUserRequest
     , buildGetDocumentRequest
+    , buildGetRevisionRequest
     , buildHealthRequest
     , buildListDocumentsRequest
     , buildListFoldersRequest
+    , buildListRevisionsRequest
     , buildListTagsRequest
     , buildLoginRequest
     , buildLogoutRequest
     , buildPermanentDeleteDocumentRequest
     , buildRegisterRequest
     , buildRestoreDocumentRequest
+    , buildRestoreRevisionRequest
+    , buildRevisionListQueryString
     , buildSoftDeleteDocumentRequest
     , buildUpdateDocumentRequest
     , createDocument
@@ -51,7 +55,9 @@ import           TamaTsuzura.Client.Api
     , fetchHealth
     , getCurrentUser
     , getDocument
+    , getDocumentRevision
     , isUnauthorizedError
+    , listDocumentRevisions
     , listDocuments
     , listFolders
     , listTags
@@ -64,6 +70,7 @@ import           TamaTsuzura.Client.Api
     , permanentDeleteDocument
     , registerUser
     , restoreDocument
+    , restoreDocumentRevision
     , softDeleteDocument
     , updateDocument
     )
@@ -81,6 +88,8 @@ import           TamaTsuzura.Client.App
     , FilterState(..)
     , MobilePane(..)
     , PendingNavigation(..)
+    , RevisionDetailTab(..)
+    , RevisionHistoryState(..)
     , SearchPanelState(..)
     , applyAuthSessionChecked
     , applyAuthSubmitted
@@ -97,6 +106,9 @@ import           TamaTsuzura.Client.App
     , applyExtensionById
     , applyFoldersResult
     , applyHealthResult
+    , applyRevisionDetailLoaded
+    , applyRevisionListLoaded
+    , applyRevisionRestored
     , applySessionExpired
     , applyTagsResult
     , buildEditorSyncPayload
@@ -111,6 +123,7 @@ import           TamaTsuzura.Client.App
     , editorDraftFromStored
     , emptyAuthFormState
     , emptyEditorDraft
+    , emptyRevisionHistoryState
     , emptySearchPanelState
     , formatTagsInput
     , hasActiveFilters
@@ -122,6 +135,7 @@ import           TamaTsuzura.Client.App
     , parseFolderInput
     , parseTagsInput
     , reconcileDocumentWithDraft
+    , resetRevisionHistory
     , resetWorkspaceForUnauthenticated
     , toStoredDraft
     , updateClient
@@ -230,12 +244,14 @@ import           TamaTsuzura.Common.Auth
     , mkUserId
     , mkUsername
     )
+import           TamaTsuzura.Common.Diff              (UnifiedDiff(..), emptyUnifiedDiff, generateUnifiedDiff)
 import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentBody(..)
     , DocumentFormat(..)
     , DocumentId
     , DocumentSummary(..)
+    , RevisionNumber
     , Tag
     , TagSet
     , emptyDocumentTitle
@@ -244,9 +260,19 @@ import           TamaTsuzura.Common.Document
     , mkDocumentId
     , mkDocumentTitle
     , mkFolderPath
+    , mkRevisionNumber
     , mkTag
     , mkTagSet
     , toDocumentSummary
+    )
+import           TamaTsuzura.Common.Revision
+    ( RestoreRevisionRequest(..)
+    , RevisionDetail(..)
+    , RevisionListResponse(..)
+    , RevisionSummary(..)
+    , mkContentHash
+    , mkRevisionId
+    , toRevisionSummary
     )
 import           TamaTsuzura.Common.Text              (ToText(..))
 import           TamaTsuzura.Common.Validation        (ValidationError(..), maxDocumentBodyBytes)
@@ -2329,6 +2355,582 @@ spec = do
             currentUserId sSubmitted `shouldBe` Just session.user.id
             sSubmitted.statusNotice `shouldBe` Just jaMessages.noticeLoggedIn
 
+    describe "M4 Phase 3: Revision history API, MVU flow, and View" $ do
+        it "builds revision list/detail/restore requests with query encoding and CSRF header" $ do
+            docId <- expectRight (mkDocumentId "doc-rev")
+            rev2  <- expectRight (mkRevisionNumber 2)
+            rev3  <- expectRight (mkRevisionNumber 3)
+            lim   <- expectRight (mkListLimit 10)
+            off   <- expectRight (mkListOffset 5)
+            csrf  <- mkSampleCsrfToken
+            let base :: ApiBaseUrl
+                base = mkApiBaseUrl "/app/"
+
+                listDefaultReq :: HttpRequest
+                listDefaultReq = buildListRevisionsRequest base docId Nothing Nothing
+
+                listPagedReq :: HttpRequest
+                listPagedReq = buildListRevisionsRequest base docId (Just lim) (Just off)
+
+                detailReq :: HttpRequest
+                detailReq = buildGetRevisionRequest base docId rev2
+
+                restoreReq :: HttpRequest
+                restoreReq = buildRestoreRevisionRequest base csrf docId rev2 (RestoreRevisionRequest (Just rev3))
+
+            buildRevisionListQueryString Nothing Nothing `shouldBe` ""
+            buildRevisionListQueryString (Just lim) (Just off) `shouldBe` "?limit=10&offset=5"
+            (listDefaultReq.method, listDefaultReq.url) `shouldBe` (MethodGet, "/app/api/documents/doc-rev/revisions")
+            (listPagedReq.method, listPagedReq.url) `shouldBe` (MethodGet, "/app/api/documents/doc-rev/revisions?limit=10&offset=5")
+            (detailReq.method, detailReq.url) `shouldBe` (MethodGet, "/app/api/documents/doc-rev/revisions/2")
+            (restoreReq.method, restoreReq.url) `shouldBe` (MethodPost, "/app/api/documents/doc-rev/revisions/2/restore")
+            lookup csrfHeaderName restoreReq.headers `shouldBe` Just (toText csrf)
+            restoreReq.body `shouldSatisfy` maybe False (Txt.isInfixOf "\"base_revision\":3" . TxtEnc.decodeUtf8Lenient)
+
+        it "executes listDocumentRevisions, getDocumentRevision, and restoreDocumentRevision against HttpTransport" $ do
+            doc <- mkSampleDocument "doc-rev-io" "最新タイトル"
+            revId1 <- expectRight (mkRevisionId "rev-1")
+            hash1  <- expectRight (mkContentHash (Txt.replicate 64 "a"))
+            csrf   <- mkSampleCsrfToken
+            let detail1 :: RevisionDetail
+                detail1 = RevisionDetail
+                    { id               = revId1
+                    , documentId       = doc.id
+                    , revision         = initialRevisionNumber
+                    , parentRevisionId = Nothing
+                    , title            = doc.title
+                    , body             = doc.body
+                    , format           = doc.format
+                    , diff             = generateUnifiedDiff "" (toText doc.body)
+                    , contentHash      = hash1
+                    , createdAt        = sampleUtcTime
+                    }
+                listRes :: RevisionListResponse
+                listRes = RevisionListResponse
+                    { revisions = [toRevisionSummary detail1]
+                    , total     = 1
+                    }
+                mkClient :: HttpResponse -> ApiClient
+                mkClient fixed = ApiClient
+                    { baseUrl   = defaultApiBaseUrl
+                    , transport = HttpTransport (\ _ -> pure (Right fixed))
+                    }
+            eList <- listDocumentRevisions (mkClient (HttpResponse 200 (encodeStrict listRes))) doc.id Nothing Nothing
+            eList `shouldBe` Right listRes
+            eDetail <- getDocumentRevision (mkClient (HttpResponse 200 (encodeStrict detail1))) doc.id initialRevisionNumber
+            eDetail `shouldBe` Right detail1
+            eRestored <- restoreDocumentRevision
+                (mkClient (HttpResponse 200 (encodeStrict doc)))
+                csrf
+                doc.id
+                initialRevisionNumber
+                (RestoreRevisionRequest (Just doc.revision))
+            eRestored `shouldBe` Right doc
+
+        it "handles pure revision state transitions with stale-sequence guards and resetRevisionHistory" $ do
+            doc1 <- mkSampleDocument "doc-pure-rev" "版2タイトル"
+            rev2 <- expectRight (mkRevisionNumber 2)
+            rev3 <- expectRight (mkRevisionNumber 3)
+            revId1 <- expectRight (mkRevisionId "rev-p1")
+            revId2 <- expectRight (mkRevisionId "rev-p2")
+            hash1  <- expectRight (mkContentHash (Txt.replicate 64 "1"))
+            hash2  <- expectRight (mkContentHash (Txt.replicate 64 "2"))
+            let docAtRev2 :: Document
+                docAtRev2 = withDocRevision rev2 doc1
+
+                detail1 :: RevisionDetail
+                detail1 = RevisionDetail
+                    { id               = revId1
+                    , documentId       = doc1.id
+                    , revision         = initialRevisionNumber
+                    , parentRevisionId = Nothing
+                    , title            = doc1.title
+                    , body             = DocumentBody "初版本文"
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "" "初版本文"
+                    , contentHash      = hash1
+                    , createdAt        = sampleUtcTime
+                    }
+
+                detail2 :: RevisionDetail
+                detail2 = RevisionDetail
+                    { id               = revId2
+                    , documentId       = doc1.id
+                    , revision         = rev2
+                    , parentRevisionId = Just revId1
+                    , title            = doc1.title
+                    , body             = DocumentBody "第2版本文"
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "初版本文" "第2版本文"
+                    , contentHash      = hash2
+                    , createdAt        = sampleLaterUtcTime
+                    }
+
+                listRes :: RevisionListResponse
+                listRes = RevisionListResponse
+                    { revisions = [toRevisionSummary detail2, toRevisionSummary detail1]
+                    , total     = 2
+                    }
+
+                sOpen :: ClientState
+                sOpen = (initialClientState bundledExtensions)
+                    { selectedDocument = Just docAtRev2
+                    , draft            = draftFromDocument docAtRev2
+                    , revisionHistory  = emptyRevisionHistoryState
+                        { isHistoryOpen  = True
+                        , documentId     = Just doc1.id
+                        , listRequestSeq = 1
+                        , isLoadingList  = True
+                        }
+                    }
+
+                -- Stale list sequence must be ignored
+                sStaleList :: ClientState
+                sStaleList = applyRevisionListLoaded jaMessages 999 doc1.id False (Right listRes) sOpen
+
+                -- Closed panel response must be ignored without touching lastError
+                sClosedPanel :: ClientState
+                sClosedPanel = applyRevisionListLoaded
+                    jaMessages
+                    1
+                    doc1.id
+                    False
+                    (Left (ClientNetworkError "closed"))
+                    (sOpen { revisionHistory = sOpen.revisionHistory { isHistoryOpen = False }, lastError = Just "keep-me" })
+
+                sListLoaded :: ClientState
+                sListLoaded = applyRevisionListLoaded jaMessages 1 doc1.id False (Right listRes) sOpen
+
+                sDetailWait :: ClientState
+                sDetailWait = sListLoaded
+                    { revisionHistory = sListLoaded.revisionHistory
+                        { detailRequestSeq = 2
+                        , isLoadingDetail  = True
+                        }
+                    }
+
+                -- Stale detail sequence must be ignored
+                sStaleDetail :: ClientState
+                sStaleDetail = applyRevisionDetailLoaded jaMessages 1 doc1.id rev2 (Right detail2) sDetailWait
+
+                sDetailLoaded :: ClientState
+                sDetailLoaded = applyRevisionDetailLoaded jaMessages 2 doc1.id rev2 (Right detail2) sDetailWait
+
+                restoredDoc :: Document
+                restoredDoc = withDocRevision rev3 (withDocBody (DocumentBody "初版本文") docAtRev2)
+
+                -- Unmatched restoringRevisionDoc must be ignored
+                sStaleRestore :: ClientState
+                sStaleRestore = applyRevisionRestored jaMessages doc1.id (Right restoredDoc) sDetailLoaded
+
+                sRestored :: ClientState
+                sRestored = applyRevisionRestored
+                    jaMessages
+                    doc1.id
+                    (Right restoredDoc)
+                    (sDetailLoaded { restoringRevisionDoc = Just doc1.id })
+
+                rhReset :: RevisionHistoryState
+                rhReset = resetRevisionHistory sDetailLoaded.revisionHistory
+            sStaleList.revisionHistory.revisions `shouldBe` []
+            sClosedPanel.lastError `shouldBe` Just "keep-me"
+            sListLoaded.revisionHistory.totalRevisions `shouldBe` 2
+            sListLoaded.revisionHistory.selectedRevision `shouldBe` Just rev2
+            sStaleDetail.revisionHistory.revisionDetail `shouldBe` Nothing
+            sDetailLoaded.revisionHistory.revisionDetail `shouldBe` Just detail2
+            fmap (.revision) sStaleRestore.selectedDocument `shouldBe` Just rev2
+            fmap (.revision) sRestored.selectedDocument `shouldBe` Just rev3
+            sRestored.restoringRevisionDoc `shouldBe` Nothing
+            sRestored.draft.body `shouldBe` DocumentBody "初版本文"
+            sRestored.statusNotice `shouldBe` Just jaMessages.noticeRevisionRestored
+            rhReset.isHistoryOpen `shouldBe` False
+            rhReset.listRequestSeq `shouldBe` sDetailLoaded.revisionHistory.listRequestSeq + 1
+            rhReset.detailRequestSeq `shouldBe` sDetailLoaded.revisionHistory.detailRequestSeq + 1
+
+        it "runs full MVU revision browse, detail inspect, restore, and save auto-refresh flow" $ do
+            baseState <- mkAuthenticatedState
+            docBase <- mkSampleDocument "doc-mvu-rev" "v2 タイトル"
+            titleV1 <- expectRight (mkDocumentTitle "v1 タイトル")
+            rev2 <- expectRight (mkRevisionNumber 2)
+            rev3 <- expectRight (mkRevisionNumber 3)
+            revId1 <- expectRight (mkRevisionId "rev-m1")
+            revId2 <- expectRight (mkRevisionId "rev-m2")
+            revId3 <- expectRight (mkRevisionId "rev-m3")
+            hash1  <- expectRight (mkContentHash (Txt.replicate 64 "a"))
+            hash2  <- expectRight (mkContentHash (Txt.replicate 64 "b"))
+            hash3  <- expectRight (mkContentHash (Txt.replicate 64 "c"))
+
+            let docV2 :: Document
+                docV2 = withDocRevision rev2 (withDocBody (DocumentBody "line1\nline2-v2\n") docBase)
+
+                docV3 :: Document
+                docV3 = Document
+                    { id        = docV2.id
+                    , title     = titleV1
+                    , body      = DocumentBody "line1\nline2-v1\n"
+                    , format    = FormatMarkdown
+                    , folder    = docV2.folder
+                    , tags      = docV2.tags
+                    , revision  = rev3
+                    , createdAt = docV2.createdAt
+                    , updatedAt = sampleLaterUtcTime
+                    , deletedAt = Nothing
+                    }
+
+                detail1 :: RevisionDetail
+                detail1 = RevisionDetail
+                    { id               = revId1
+                    , documentId       = docV2.id
+                    , revision         = initialRevisionNumber
+                    , parentRevisionId = Nothing
+                    , title            = titleV1
+                    , body             = DocumentBody "line1\nline2-v1\n"
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "" "line1\nline2-v1\n"
+                    , contentHash      = hash1
+                    , createdAt        = sampleUtcTime
+                    }
+
+                detail2 :: RevisionDetail
+                detail2 = RevisionDetail
+                    { id               = revId2
+                    , documentId       = docV2.id
+                    , revision         = rev2
+                    , parentRevisionId = Just revId1
+                    , title            = docV2.title
+                    , body             = docV2.body
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "line1\nline2-v1\n" "line1\nline2-v2\n"
+                    , contentHash      = hash2
+                    , createdAt        = sampleLaterUtcTime
+                    }
+
+                detail3 :: RevisionDetail
+                detail3 = RevisionDetail
+                    { id               = revId3
+                    , documentId       = docV2.id
+                    , revision         = rev3
+                    , parentRevisionId = Just revId2
+                    , title            = titleV1
+                    , body             = DocumentBody "line1\nline2-v1\n"
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "line1\nline2-v2\n" "line1\nline2-v1\n"
+                    , contentHash      = hash3
+                    , createdAt        = sampleLaterUtcTime
+                    }
+
+            restoredFlagRef <- newIORef False
+            let handler :: HttpRequest -> IO (Either Text HttpResponse)
+                handler req
+                    | req.method == MethodGet && req.url == "/api/documents/doc-mvu-rev/revisions" = do
+                        wasRestored <- readIORef restoredFlagRef
+                        let summaries :: [RevisionSummary]
+                            summaries =
+                                if wasRestored
+                                    then [toRevisionSummary detail3, toRevisionSummary detail2, toRevisionSummary detail1]
+                                    else [toRevisionSummary detail2, toRevisionSummary detail1]
+                            res :: RevisionListResponse
+                            res = RevisionListResponse
+                                { revisions = summaries
+                                , total     = length summaries
+                                }
+                        pure (Right (HttpResponse 200 (encodeStrict res)))
+                    | req.method == MethodGet && req.url == "/api/documents/doc-mvu-rev/revisions/1" =
+                        pure (Right (HttpResponse 200 (encodeStrict detail1)))
+                    | req.method == MethodGet && req.url == "/api/documents/doc-mvu-rev/revisions/2" =
+                        pure (Right (HttpResponse 200 (encodeStrict detail2)))
+                    | req.method == MethodGet && req.url == "/api/documents/doc-mvu-rev/revisions/3" =
+                        pure (Right (HttpResponse 200 (encodeStrict detail3)))
+                    | req.method == MethodPost && req.url == "/api/documents/doc-mvu-rev/revisions/1/restore" = do
+                        writeIORef restoredFlagRef True
+                        pure (Right (HttpResponse 200 (encodeStrict docV3)))
+                    | req.method == MethodPut && req.url == "/api/documents/doc-mvu-rev" =
+                        pure (Right (HttpResponse 200 (encodeStrict docV3)))
+                    | req.method == MethodGet && req.url == "/api/tags" =
+                        pure (Right (HttpResponse 200 (encodeStrict (TagListResponse []))))
+                    | req.method == MethodGet && req.url == "/api/folders" =
+                        pure (Right (HttpResponse 200 (encodeStrict (FolderListResponse []))))
+                    | otherwise =
+                        pure (Left ("unexpected request: " <> showMethodUrl req))
+
+                showMethodUrl :: HttpRequest -> Text
+                showMethodUrl r = toText r.method <> " " <> r.url
+
+            (env, reqRef, cmdRef, _, deletedDraftsRef, _) <-
+                mkFullMockClientEnv handler (pure (Right [])) (pure FilePickCancelled)
+
+            let s0 :: ClientState
+                s0 = baseState
+                    { documentSummaries = [toDocumentSummary docV2]
+                    , totalDocuments    = 1
+                    , selectedDocument  = Just docV2
+                    , draft             = draftFromDocument docV2
+                    , mobilePane        = PaneEditor
+                    }
+
+            -- 1. Open history panel -> loads list and auto-fetches latest revision detail (r2)
+            (s1, _) <- runActionQueue env [ToggleRevisionHistory] s0
+            s1.revisionHistory.isHistoryOpen `shouldBe` True
+            s1.revisionHistory.totalRevisions `shouldBe` 2
+            s1.revisionHistory.selectedRevision `shouldBe` Just rev2
+            s1.revisionHistory.revisionDetail `shouldBe` Just detail2
+
+            -- 2. Requesting restore on current revision (r2) is a no-op
+            (s1Noop, _) <- runActionQueue env [RequestRestoreRevision rev2] s1
+            s1Noop.revisionHistory.confirmRestoreRev `shouldBe` Nothing
+
+            -- 3. Select older revision (r1) -> fetches detail1 and opens restore confirmation modal
+            (s2, _) <- runActionQueue env
+                [ SelectRevision initialRevisionNumber
+                , SetRevisionDetailTab RevTabDiff
+                , RequestRestoreRevision initialRevisionNumber
+                ]
+                s1
+            s2.revisionHistory.selectedRevision `shouldBe` Just initialRevisionNumber
+            s2.revisionHistory.revisionDetail `shouldBe` Just detail1
+            s2.revisionHistory.activeTab `shouldBe` RevTabDiff
+            s2.revisionHistory.confirmRestoreRev `shouldBe` Just initialRevisionNumber
+
+            -- Verify view renders history panel, diff lines, and confirmation modal
+            let htmlWithModal :: Text
+                htmlWithModal =
+                    TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () s2 (viewClient jaMessages s2)))
+            htmlWithModal `shouldSatisfy` Txt.isInfixOf jaMessages.historyHeading
+            htmlWithModal `shouldSatisfy` Txt.isInfixOf jaMessages.historyCurrentBadge
+            htmlWithModal `shouldSatisfy` Txt.isInfixOf "tt-diff-add"
+            htmlWithModal `shouldSatisfy` Txt.isInfixOf jaMessages.confirmRestoreRevTitle
+            htmlWithModal `shouldSatisfy` Txt.isInfixOf "r2"
+
+            -- 4. Confirm restore -> calls POST restore, updates doc to r3, resets editor, reloads list (3 items)
+            (s3, _) <- runActionQueue env [ConfirmRestoreRevision initialRevisionNumber] s2
+            fmap (.revision) s3.selectedDocument `shouldBe` Just rev3
+            s3.draft.body `shouldBe` DocumentBody "line1\nline2-v1\n"
+            s3.draft.titleInput `shouldBe` "v1 タイトル"
+            s3.revisionHistory.totalRevisions `shouldBe` 3
+            s3.revisionHistory.selectedRevision `shouldBe` Just rev3
+            s3.revisionHistory.revisionDetail `shouldBe` Just detail3
+            s3.statusNotice `shouldBe` Just jaMessages.noticeRevisionRestored
+
+            deletedIds <- readIORef deletedDraftsRef
+            deletedIds `shouldSatisfy` elem docV2.id
+
+            let isResetSyncCmd :: EditorCommand -> Bool
+                isResetSyncCmd (CmdSyncDocument payload) =
+                    payload.resetHistory && payload.body == "line1\nline2-v1\n"
+                isResetSyncCmd _ = False
+            cmds <- readIORef cmdRef
+            cmds `shouldSatisfy` any isResetSyncCmd
+
+            reqs <- readIORef reqRef
+            reqs `shouldSatisfy` any (\ r ->
+                r.method == MethodPost
+                    && r.url == "/api/documents/doc-mvu-rev/revisions/1/restore"
+                    && maybe False (Txt.isInfixOf "\"base_revision\":2" . TxtEnc.decodeUtf8Lenient) r.body)
+
+            -- 5. CancelRestoreRevision and RefreshRevisionHistory work cleanly, and SaveCurrentDocument auto-refreshes open history
+            (s3Cancel, _) <- runActionQueue env
+                [ RequestRestoreRevision initialRevisionNumber
+                , CancelRestoreRevision
+                , RefreshRevisionHistory
+                ]
+                s3
+            s3Cancel.revisionHistory.confirmRestoreRev `shouldBe` Nothing
+
+            writeIORef reqRef []
+            (sSaved, _) <- runActionQueue env
+                [ UpdateDraftTitle "v3 保存タイトル"
+                , SaveCurrentDocument
+                ]
+                s3Cancel
+            reqsAfterSave <- readIORef reqRef
+            reqsAfterSave `shouldSatisfy` any (\ r ->
+                r.method == MethodGet && r.url == "/api/documents/doc-mvu-rev/revisions")
+
+            -- 6. Close history panel
+            (s4, _) <- runActionQueue env [ToggleRevisionHistory] sSaved
+            s4.revisionHistory.isHistoryOpen `shouldBe` False
+
+        it "handles pagination (LoadMoreRevisions), 409 conflict, 401 expiry, and in-flight restore doc-switch race safely" $ do
+            baseState <- mkAuthenticatedState
+            doc1 <- mkSampleDocument "doc-page" "ページ文書"
+            doc2 <- mkSampleDocument "doc-other" "別文書"
+            rev2 <- expectRight (mkRevisionNumber 2)
+            rev3 <- expectRight (mkRevisionNumber 3)
+            revId1 <- expectRight (mkRevisionId "rev-pg1")
+            revId2 <- expectRight (mkRevisionId "rev-pg2")
+            hash1  <- expectRight (mkContentHash (Txt.replicate 64 "e"))
+            hash2  <- expectRight (mkContentHash (Txt.replicate 64 "f"))
+            let doc1V2 :: Document
+                doc1V2 = withDocRevision rev2 doc1
+
+                detail1 :: RevisionDetail
+                detail1 = RevisionDetail
+                    { id               = revId1
+                    , documentId       = doc1.id
+                    , revision         = initialRevisionNumber
+                    , parentRevisionId = Nothing
+                    , title            = doc1.title
+                    , body             = DocumentBody "v1-no-nl"
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "" "v1-no-nl"
+                    , contentHash      = hash1
+                    , createdAt        = sampleUtcTime
+                    }
+
+                detail2 :: RevisionDetail
+                detail2 = RevisionDetail
+                    { id               = revId2
+                    , documentId       = doc1.id
+                    , revision         = rev2
+                    , parentRevisionId = Just revId1
+                    , title            = doc1.title
+                    , body             = DocumentBody "lineA\nv2"
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "lineA\nv1" "lineA\nv2"
+                    , contentHash      = hash2
+                    , createdAt        = sampleLaterUtcTime
+                    }
+
+                page1 :: RevisionListResponse
+                page1 = RevisionListResponse { revisions = [toRevisionSummary detail2], total = 2 }
+
+                page2 :: RevisionListResponse
+                page2 = RevisionListResponse { revisions = [toRevisionSummary detail1], total = 2 }
+
+                conflictErr :: ApiError
+                conflictErr = ApiError ErrConflict "base_revision mismatch" Nothing
+
+                unauthErr :: ApiError
+                unauthErr = ApiError ErrUnauthorized "session expired" Nothing
+
+            let pageHandler :: HttpRequest -> IO (Either Text HttpResponse)
+                pageHandler req
+                    | req.method == MethodGet && req.url == "/api/documents/doc-page/revisions" =
+                        pure (Right (HttpResponse 200 (encodeStrict page1)))
+                    | req.method == MethodGet && req.url == "/api/documents/doc-page/revisions?offset=1" =
+                        pure (Right (HttpResponse 200 (encodeStrict page2)))
+                    | req.method == MethodGet && req.url == "/api/documents/doc-page/revisions/2" =
+                        pure (Right (HttpResponse 200 (encodeStrict detail2)))
+                    | req.method == MethodPost && req.url == "/api/documents/doc-page/revisions/1/restore" =
+                        pure (Right (HttpResponse 409 (encodeStrict conflictErr)))
+                    | otherwise =
+                        pure (Right (HttpResponse 401 (encodeStrict unauthErr)))
+
+            (env, _, cmdRef, _, _, _) <- mkFullMockClientEnv pageHandler (pure (Right [])) (pure FilePickCancelled)
+
+            let s0 :: ClientState
+                s0 = baseState
+                    { selectedDocument = Just doc1V2
+                    , draft            = draftFromDocument doc1V2
+                    }
+
+            -- Page 1 loads 1/2 revisions and renders load-more button + diff lines (ctx/del/add)
+            (s1, _) <- runActionQueue env [ToggleRevisionHistory, SetRevisionDetailTab RevTabDiff] s0
+            length s1.revisionHistory.revisions `shouldBe` 1
+            let htmlPage1 :: Text
+                htmlPage1 = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () s1 (viewClient jaMessages s1)))
+            htmlPage1 `shouldSatisfy` Txt.isInfixOf "1 / 2件"
+            htmlPage1 `shouldSatisfy` Txt.isInfixOf jaMessages.actionLoadMoreHistory
+            htmlPage1 `shouldSatisfy` Txt.isInfixOf "tt-diff-ctx"
+            htmlPage1 `shouldSatisfy` Txt.isInfixOf "tt-diff-del"
+            htmlPage1 `shouldSatisfy` Txt.isInfixOf "tt-diff-add"
+            htmlPage1 `shouldSatisfy` Txt.isInfixOf "\\ No newline at end of file"
+
+            -- LoadMoreRevisions appends page 2
+            (s2, _) <- runActionQueue env [LoadMoreRevisions] s1
+            length s2.revisionHistory.revisions `shouldBe` 2
+            s2.revisionHistory.totalRevisions `shouldBe` 2
+
+            -- 409 Conflict clears restoringRevisionDoc and reports conflict error
+            (sConflict, _) <- runActionQueue env [ConfirmRestoreRevision initialRevisionNumber] s2
+            sConflict.restoringRevisionDoc `shouldBe` Nothing
+            sConflict.lastError `shouldBe` Just jaMessages.errConflictMessage
+
+            -- In-flight restore arriving after switching to doc2 must NOT reset doc2's editor history
+            writeIORef cmdRef []
+            let sSwitched :: ClientState
+                sSwitched = baseState
+                    { selectedDocument     = Just doc2
+                    , draft                = draftFromDocument doc2
+                    , restoringRevisionDoc = Just doc1.id
+                    }
+                doc1V3 :: Document
+                doc1V3 = withDocRevision rev3 doc1
+            (sAfterLateRestore, _) <- runUpdateStep env (RevisionRestored baseState.authSessionSeq doc1.id (Right doc1V3)) sSwitched
+            sAfterLateRestore.restoringRevisionDoc `shouldBe` Nothing
+            fmap (.id) sAfterLateRestore.selectedDocument `shouldBe` Just doc2.id
+            cmdsAfterLate <- readIORef cmdRef
+            cmdsAfterLate `shouldBe` []
+
+            -- 401 Unauthorized on revision detail expires session
+            (s401, _) <- runActionQueue env [SelectRevision initialRevisionNumber] s2
+            currentUserId s401 `shouldBe` Nothing
+            s401.lastError `shouldBe` Just jaMessages.errSessionExpired
+
+            -- Empty diff and malformed diff fallback rendering
+            let detailEmptyDiff :: RevisionDetail
+                detailEmptyDiff = detail2 { diff = emptyUnifiedDiff }
+
+                detailBadDiff :: RevisionDetail
+                detailBadDiff = detail2 { diff = UnifiedDiff "not-a-valid-unified-diff" }
+
+                stEmptyDiff :: ClientState
+                stEmptyDiff = s1 { revisionHistory = s1.revisionHistory { revisionDetail = Just detailEmptyDiff, activeTab = RevTabDiff } }
+
+                stBadDiff :: ClientState
+                stBadDiff = s1 { revisionHistory = s1.revisionHistory { revisionDetail = Just detailBadDiff, activeTab = RevTabDiff } }
+
+                htmlEmptyDiff :: Text
+                htmlEmptyDiff = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () stEmptyDiff (viewClient jaMessages stEmptyDiff)))
+
+                htmlBadDiff :: Text
+                htmlBadDiff = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () stBadDiff (viewClient jaMessages stBadDiff)))
+            htmlEmptyDiff `shouldSatisfy` Txt.isInfixOf jaMessages.historyDiffEmpty
+            htmlBadDiff `shouldSatisfy` Txt.isInfixOf "tt-diff-raw"
+
+        it "shows read-only restore hint for trashed documents in revision history view" $ do
+            baseState <- mkAuthenticatedState
+            doc <- mkSampleDocument "doc-rev-trash" "ゴミ箱文書"
+            rev2 <- expectRight (mkRevisionNumber 2)
+            revId1 <- expectRight (mkRevisionId "rev-t1")
+            hash1  <- expectRight (mkContentHash (Txt.replicate 64 "d"))
+            let trashedDoc :: Document
+                trashedDoc = withDocRevision rev2 (withDocDeletedAt (Just sampleUtcTime) doc)
+
+                detail1 :: RevisionDetail
+                detail1 = RevisionDetail
+                    { id               = revId1
+                    , documentId       = doc.id
+                    , revision         = initialRevisionNumber
+                    , parentRevisionId = Nothing
+                    , title            = doc.title
+                    , body             = doc.body
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "" (toText doc.body)
+                    , contentHash      = hash1
+                    , createdAt        = sampleUtcTime
+                    }
+
+                st :: ClientState
+                st = baseState
+                    { selectedDocument = Just trashedDoc
+                    , draft            = draftFromDocument trashedDoc
+                    , revisionHistory  = emptyRevisionHistoryState
+                        { isHistoryOpen    = True
+                        , documentId       = Just doc.id
+                        , revisions        = [toRevisionSummary detail1]
+                        , totalRevisions   = 1
+                        , selectedRevision = Just initialRevisionNumber
+                        , revisionDetail   = Just detail1
+                        }
+                    }
+
+                htmlText :: Text
+                htmlText =
+                    TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () st (viewClient jaMessages st)))
+            htmlText `shouldSatisfy` Txt.isInfixOf jaMessages.historyTrashedRestoreHint
+            htmlText `shouldSatisfy` (not . Txt.isInfixOf jaMessages.actionRestoreRevision)
+
 recordingTransport ::
        IORef (Maybe HttpRequest)
     -> Either Text HttpResponse
@@ -2412,6 +3014,20 @@ withDocUpdatedAt ts doc = Document
     , revision  = doc.revision
     , createdAt = doc.createdAt
     , updatedAt = ts
+    , deletedAt = doc.deletedAt
+    }
+
+withDocRevision :: RevisionNumber -> Document -> Document
+withDocRevision rev doc = Document
+    { id        = doc.id
+    , title     = doc.title
+    , body      = doc.body
+    , format    = doc.format
+    , folder    = doc.folder
+    , tags      = doc.tags
+    , revision  = rev
+    , createdAt = doc.createdAt
+    , updatedAt = doc.updatedAt
     , deletedAt = doc.deletedAt
     }
 

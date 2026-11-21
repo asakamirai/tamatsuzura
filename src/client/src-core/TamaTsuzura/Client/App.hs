@@ -29,6 +29,10 @@ module TamaTsuzura.Client.App
     , buildRecoveryRequestFromStoredDraft
     , SearchPanelState(..)
     , emptySearchPanelState
+    , RevisionDetailTab(..)
+    , RevisionHistoryState(..)
+    , emptyRevisionHistoryState
+    , resetRevisionHistory
     , ClientState(..)
     , ClientAction(..)
       -- * 純粋な変換・検証・判定関数
@@ -64,6 +68,9 @@ module TamaTsuzura.Client.App
     , applyDocumentSoftDeleted
     , applyDocumentRestored
     , applyDocumentPermanentlyDeleted
+    , applyRevisionListLoaded
+    , applyRevisionDetailLoaded
+    , applyRevisionRestored
     , applyEditorEvent
     , dismissError
     , dismissNotice
@@ -91,7 +98,9 @@ import           TamaTsuzura.Client.Api
     , fetchHealth
     , getCurrentUser
     , getDocument
+    , getDocumentRevision
     , isUnauthorizedError
+    , listDocumentRevisions
     , listDocuments
     , listFolders
     , listTags
@@ -100,6 +109,7 @@ import           TamaTsuzura.Client.Api
     , permanentDeleteDocument
     , registerUser
     , restoreDocument
+    , restoreDocumentRevision
     , softDeleteDocument
     , updateDocument
     )
@@ -148,10 +158,12 @@ import           TamaTsuzura.Common.Api
     , DocumentStatusFilter(..)
     , FolderListResponse(..)
     , HealthStatus
+    , ListOffset
     , TagListResponse(..)
     , UpdateDocumentRequest(..)
     , defaultCreateDocumentRequest
     , defaultDocumentListQuery
+    , mkListOffset
     , mkSearchQuery
     )
 import           TamaTsuzura.Common.Auth
@@ -175,6 +187,7 @@ import           TamaTsuzura.Common.Document
     , DocumentSummary(..)
     , DocumentTitle
     , FolderPath
+    , RevisionNumber
     , Tag
     , TagSet
     , defaultDocumentFormat
@@ -188,6 +201,12 @@ import           TamaTsuzura.Common.Document
     , tagSetToList
     , toDocumentSummary
     , validateDocumentBody
+    )
+import           TamaTsuzura.Common.Revision
+    ( RestoreRevisionRequest(..)
+    , RevisionDetail(..)
+    , RevisionListResponse(..)
+    , RevisionSummary(..)
     )
 import           TamaTsuzura.Common.Text         (ToText(..))
 import           TamaTsuzura.Common.Validation   (ValidationError)
@@ -498,6 +517,71 @@ emptySearchPanelState = SearchPanelState
     , regexError    = Nothing
     }
 
+-- | リビジョン詳細ビューの表示タブ。
+data RevisionDetailTab
+    = RevTabBody
+      -- ^ 再構成済み本文スナップショット表示
+    | RevTabDiff
+      -- ^ 親リビジョンからの unified diff 表示
+    deriving (Eq, Show)
+
+-- | 編集履歴パネル (過去リビジョン一覧・詳細閲覧・復元) の状態。
+-- 文書切替やログアウト時に 'resetRevisionHistory' で世代番号を進めつつ初期化することで、
+-- 旧文書の遅延 API 応答による履歴混入を構造的に防ぐ。
+data RevisionHistoryState = RevisionHistoryState
+    { isHistoryOpen     :: !Bool
+      -- ^ 履歴パネルを開いているか
+    , documentId        :: !(Maybe DocumentId)
+      -- ^ 履歴を保持している対象文書 ID
+    , listRequestSeq    :: !Int
+      -- ^ 履歴一覧取得の世代番号
+    , isLoadingList     :: !Bool
+      -- ^ 履歴一覧取得中フラグ
+    , isLoadingMore     :: !Bool
+      -- ^ 追加ページ取得中フラグ
+    , revisions         :: ![RevisionSummary]
+      -- ^ リビジョンサマリ一覧 (リビジョン番号降順)
+    , totalRevisions    :: !Int
+      -- ^ サーバ側の総リビジョン件数
+    , selectedRevision  :: !(Maybe RevisionNumber)
+      -- ^ 選択中のリビジョン番号
+    , detailRequestSeq  :: !Int
+      -- ^ リビジョン詳細取得の世代番号
+    , isLoadingDetail   :: !Bool
+      -- ^ リビジョン詳細取得中フラグ
+    , revisionDetail    :: !(Maybe RevisionDetail)
+      -- ^ 取得済みの選択リビジョン詳細
+    , activeTab         :: !RevisionDetailTab
+      -- ^ 詳細ビューの表示タブ (本文 / 差分)
+    , confirmRestoreRev :: !(Maybe RevisionNumber)
+      -- ^ 復元確認モーダル表示中の対象リビジョン番号
+    } deriving (Eq, Show)
+
+-- | 閉じた状態の初期リビジョン履歴状態。
+emptyRevisionHistoryState :: RevisionHistoryState
+emptyRevisionHistoryState = RevisionHistoryState
+    { isHistoryOpen     = False
+    , documentId        = Nothing
+    , listRequestSeq    = 0
+    , isLoadingList     = False
+    , isLoadingMore     = False
+    , revisions         = []
+    , totalRevisions    = 0
+    , selectedRevision  = Nothing
+    , detailRequestSeq  = 0
+    , isLoadingDetail   = False
+    , revisionDetail    = Nothing
+    , activeTab         = RevTabBody
+    , confirmRestoreRev = Nothing
+    }
+
+-- | 履歴パネルを閉じ、進行中の非同期応答を無効化するよう世代番号を進めて初期化する。
+resetRevisionHistory :: RevisionHistoryState -> RevisionHistoryState
+resetRevisionHistory rh = emptyRevisionHistoryState
+    { listRequestSeq   = rh.listRequestSeq + 1
+    , detailRequestSeq = rh.detailRequestSeq + 1
+    }
+
 -- | クライアントコアの状態モデル (Miso Model)。
 -- 本モジュールは 'tamatsuzura-common' と 'tamatsuzura-extension-api' のみに依存し、
 -- 同梱拡張の具体実装には依存しない。
@@ -544,6 +628,8 @@ data ClientState = ClientState
       -- ^ 現在 PUT 保存中の (文書 ID, 送信時点のドラフト) (二重送信防止および保存中追加入力の保持)
     , mutatingDocumentId           :: !(Maybe DocumentId)
       -- ^ 現在ゴミ箱移動・復元・完全削除中の文書 ID
+    , restoringRevisionDoc         :: !(Maybe DocumentId)
+      -- ^ 現在過去リビジョン復元中の文書 ID (パネル開閉・文書切替を跨いで二重送信と競合を防止)
     , selectedDocument             :: !(Maybe Document)
       -- ^ 現在開いている保存済み文書スナップショット
     , draft                        :: !EditorDraft
@@ -570,6 +656,8 @@ data ClientState = ClientState
       -- ^ フォルダ・タグ・形式の整理パネルを開いているか
     , searchPanel                  :: !SearchPanelState
       -- ^ エディタ内検索・置換パネルの状態
+    , revisionHistory              :: !RevisionHistoryState
+      -- ^ 過去リビジョン履歴閲覧・復元パネルの状態
     , pendingNavigation            :: !(Maybe PendingNavigation)
       -- ^ 未保存変更破棄の確認ダイアログ待ち遷移
     , confirmPermanentDelete       :: !(Maybe DocumentId)
@@ -730,6 +818,28 @@ data ClientAction
       -- ^ ファイル選択ダイアログからの読み込み結果受信
     | DocumentImported !Int !Text !(Either ApiClientError Document)
       -- ^ インポートに伴う @POST /api/documents@ の結果受信 (認証セッション世代番号, 元ファイル名, 結果)
+    | ToggleRevisionHistory
+      -- ^ リビジョン履歴パネルの開閉
+    | RefreshRevisionHistory
+      -- ^ 現在開いている文書のリビジョン履歴一覧を再取得する
+    | LoadMoreRevisions
+      -- ^ 現在開いている文書のリビジョン履歴の次ページを追加取得する
+    | RevisionListLoaded !Int !Int !DocumentId !Bool !(Either ApiClientError RevisionListResponse)
+      -- ^ @GET /api/documents/{id}/revisions@ の結果受信 (認証世代, 一覧世代, 文書 ID, 追加読み込みフラグ, 結果)
+    | SelectRevision !RevisionNumber
+      -- ^ 履歴一覧から特定リビジョンを選択し詳細を取得する
+    | RevisionDetailLoaded !Int !Int !DocumentId !RevisionNumber !(Either ApiClientError RevisionDetail)
+      -- ^ @GET /api/documents/{id}/revisions/{revision}@ の結果受信 (認証世代, 詳細世代, 文書 ID, リビジョン番号, 結果)
+    | SetRevisionDetailTab !RevisionDetailTab
+      -- ^ リビジョン詳細ビューの本文 / 差分タブ切替
+    | RequestRestoreRevision !RevisionNumber
+      -- ^ 選択リビジョンへの復元確認ダイアログを表示する
+    | CancelRestoreRevision
+      -- ^ 過去リビジョン復元の確認ダイアログを閉じる
+    | ConfirmRestoreRevision !RevisionNumber
+      -- ^ 過去リビジョンへの復元を確定実行する (@POST /api/documents/{id}/revisions/{revision}/restore@)
+    | RevisionRestored !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ 過去リビジョン復元の結果受信 (認証世代, 文書 ID, 結果)
     | DismissError
       -- ^ 表示中のエラーバナーを閉じる
     | DismissNotice
@@ -760,6 +870,7 @@ initialClientState exts = ClientState
     , autoOpeningDraftId           = Nothing
     , savingDocument               = Nothing
     , mutatingDocumentId           = Nothing
+    , restoringRevisionDoc         = Nothing
     , selectedDocument             = Nothing
     , draft                        = emptyEditorDraft
     , storedDrafts                 = Map.empty
@@ -773,6 +884,7 @@ initialClientState exts = ClientState
     , canRedo                      = False
     , metadataPanelOpen            = False
     , searchPanel                  = emptySearchPanelState
+    , revisionHistory              = emptyRevisionHistoryState
     , pendingNavigation            = Nothing
     , confirmPermanentDelete       = Nothing
     , lastError                    = Nothing
@@ -811,6 +923,7 @@ resetWorkspaceForUnauthenticated nextForm mErr mNotice state = state
     , autoOpeningDraftId           = Nothing
     , savingDocument               = Nothing
     , mutatingDocumentId           = Nothing
+    , restoringRevisionDoc         = Nothing
     , selectedDocument             = Nothing
     , draft                        = emptyEditorDraft
     , storedDrafts                 = Map.empty
@@ -824,6 +937,7 @@ resetWorkspaceForUnauthenticated nextForm mErr mNotice state = state
     , canRedo                      = False
     , metadataPanelOpen            = False
     , searchPanel                  = emptySearchPanelState
+    , revisionHistory              = resetRevisionHistory state.revisionHistory
     , pendingNavigation            = Nothing
     , confirmPermanentDelete       = Nothing
     , lastError                    = mErr
@@ -1239,6 +1353,7 @@ applyDocumentLoaded msgs reqId result state
                         , editorViewMode     = normalizeViewMode sd.format state.editorViewMode
                         , canUndo            = False
                         , canRedo            = False
+                        , revisionHistory    = resetRevisionHistory state.revisionHistory
                         , mobilePane         = PaneEditor
                         , lastError          = Nothing
                         , statusNotice       = Just msgs.noticeDraftRestored
@@ -1257,6 +1372,7 @@ applyDocumentLoaded msgs reqId result state
                         , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
                         , canUndo            = False
                         , canRedo            = False
+                        , revisionHistory    = resetRevisionHistory state.revisionHistory
                         , mobilePane         = PaneEditor
                         , lastError          = Nothing
                         , statusNotice       = Nothing
@@ -1276,6 +1392,7 @@ applyDocumentLoaded msgs reqId result state
                         , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
                         , canUndo            = False
                         , canRedo            = False
+                        , revisionHistory    = resetRevisionHistory state.revisionHistory
                         , mobilePane         = PaneEditor
                         , lastError          = Nothing
                         , statusNotice       = Nothing
@@ -1294,6 +1411,7 @@ applyDocumentLoaded msgs reqId result state
                         , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
                         , canUndo            = False
                         , canRedo            = False
+                        , revisionHistory    = resetRevisionHistory state.revisionHistory
                         , mobilePane         = PaneEditor
                         , lastError          = Nothing
                         , statusNotice       = Nothing
@@ -1355,6 +1473,7 @@ applyDocumentCreated _ (Right doc) state =
             , editorViewMode     = ModeEdit
             , canUndo            = False
             , canRedo            = False
+            , revisionHistory    = resetRevisionHistory state.revisionHistory
             , mobilePane         = PaneEditor
             , lastError          = Nothing
             , statusNotice       = Nothing
@@ -1479,6 +1598,7 @@ applyDocumentSoftDeleted msgs targetId result state = case result of
                 , editorStats        = if wasSelected then emptyEditorStats else state.editorStats
                 , canUndo            = not wasSelected && state.canUndo
                 , canRedo            = not wasSelected && state.canRedo
+                , revisionHistory    = if wasSelected then resetRevisionHistory state.revisionHistory else state.revisionHistory
                 , mobilePane         = if wasSelected then PaneList else state.mobilePane
                 , lastError          = Nothing
                 , statusNotice       = Just msgs.noticeMovedToTrash
@@ -1561,6 +1681,7 @@ applyDocumentPermanentlyDeleted msgs targetId result state = case result of
                 , editorStats            = if wasSelected then emptyEditorStats else state.editorStats
                 , canUndo                = not wasSelected && state.canUndo
                 , canRedo                = not wasSelected && state.canRedo
+                , revisionHistory        = if wasSelected then resetRevisionHistory state.revisionHistory else state.revisionHistory
                 , mobilePane             = if wasSelected then PaneList else state.mobilePane
                 , lastError              = Nothing
                 , statusNotice           = Just msgs.noticePermanentlyDeleted
@@ -1571,6 +1692,165 @@ applyDocumentPermanentlyDeleted msgs targetId result state = case result of
             , confirmPermanentDelete = Nothing
             , lastError              = Just (formatApiClientError msgs err)
             }
+
+-- | リビジョン履歴一覧 (@GET /api/documents/{id}/revisions@) の応答をクライアント状態へ反映する。
+-- パネルが閉じられている場合・対象文書が変わっていた場合・一覧世代番号が一致しない陳腐応答は無視する。
+applyRevisionListLoaded ::
+       UiMessages
+    -> Int
+    -> DocumentId
+    -> Bool
+    -> Either ApiClientError RevisionListResponse
+    -> ClientState
+    -> ClientState
+applyRevisionListLoaded msgs reqSeq docId isAppend result state
+    | not state.revisionHistory.isHistoryOpen         = state
+    | reqSeq /= state.revisionHistory.listRequestSeq  = state
+    | state.revisionHistory.documentId /= Just docId  = state
+    | fmap (.id) state.selectedDocument /= Just docId = state
+    | otherwise = case result of
+        Right res ->
+            let rh :: RevisionHistoryState
+                rh = state.revisionHistory
+
+                mergedRevisions :: [RevisionSummary]
+                mergedRevisions
+                    | isAppend =
+                        let existingNums :: [RevisionNumber]
+                            existingNums = map (.revision) rh.revisions
+                        in  rh.revisions <> filter (\ item -> item.revision `notElem` existingNums) res.revisions
+                    | otherwise = res.revisions
+
+                stillHasSelected :: Bool
+                stillHasSelected = case rh.selectedRevision of
+                    Nothing  -> False
+                    Just rev -> any (\ item -> item.revision == rev) mergedRevisions
+
+                nextSelected :: Maybe RevisionNumber
+                nextSelected
+                    | stillHasSelected = rh.selectedRevision
+                    | otherwise        = case mergedRevisions of
+                        firstRev : _ -> Just firstRev.revision
+                        []           -> Nothing
+
+                nextDetail :: Maybe RevisionDetail
+                nextDetail = case (nextSelected, rh.revisionDetail) of
+                    (Just sel, Just detail)
+                        | detail.documentId == docId && detail.revision == sel -> Just detail
+                    _ -> Nothing
+            in  state
+                    { revisionHistory = rh
+                        { isLoadingList    = False
+                        , isLoadingMore    = False
+                        , revisions        = mergedRevisions
+                        , totalRevisions   = res.total
+                        , selectedRevision = nextSelected
+                        , revisionDetail   = nextDetail
+                        }
+                    , lastError = Nothing
+                    }
+        Left err ->
+            state
+                { revisionHistory = state.revisionHistory
+                    { isLoadingList = False
+                    , isLoadingMore = False
+                    }
+                , lastError = Just (formatApiClientError msgs err)
+                }
+
+-- | 特定リビジョン詳細 (@GET /api/documents/{id}/revisions/{revision}@) の応答を状態へ反映する。
+-- パネルが閉じられている場合・詳細世代番号・対象文書 ID・選択中リビジョン番号が一致しない陳腐応答は無視する。
+applyRevisionDetailLoaded ::
+       UiMessages
+    -> Int
+    -> DocumentId
+    -> RevisionNumber
+    -> Either ApiClientError RevisionDetail
+    -> ClientState
+    -> ClientState
+applyRevisionDetailLoaded msgs reqSeq docId revNo result state
+    | not state.revisionHistory.isHistoryOpen              = state
+    | reqSeq /= state.revisionHistory.detailRequestSeq     = state
+    | state.revisionHistory.documentId /= Just docId       = state
+    | state.revisionHistory.selectedRevision /= Just revNo = state
+    | otherwise = case result of
+        Right detail ->
+            state
+                { revisionHistory = state.revisionHistory
+                    { isLoadingDetail = False
+                    , revisionDetail  = Just detail
+                    }
+                , lastError = Nothing
+                }
+        Left err ->
+            state
+                { revisionHistory = state.revisionHistory
+                    { isLoadingDetail = False
+                    , revisionDetail  = Nothing
+                    }
+                , lastError = Just (formatApiClientError msgs err)
+                }
+
+-- | 過去リビジョン復元 (@POST /api/documents/{id}/revisions/{revision}/restore@) の応答を状態へ反映する。
+-- 進行中の復元対象文書 ID ('restoringRevisionDoc') と一致しない陳腐応答は無視する。
+-- 成功時は本文・タイトル・形式を復元済み最新文書へ同期し、未保存ローカルドラフトを破棄する。
+applyRevisionRestored ::
+       UiMessages
+    -> DocumentId
+    -> Either ApiClientError Document
+    -> ClientState
+    -> ClientState
+applyRevisionRestored msgs targetId result state
+    | state.restoringRevisionDoc /= Just targetId = state
+    | otherwise = case result of
+        Right doc ->
+            let summary :: DocumentSummary
+                summary = toDocumentSummary doc
+
+                nextSummaries :: [DocumentSummary]
+                nextSummaries = case state.filterState.status of
+                    StatusTrashed -> state.documentSummaries
+                    _             ->
+                        if any (\ item -> item.id == doc.id) state.documentSummaries
+                            then summary : filter (\ item -> item.id /= doc.id) state.documentSummaries
+                            else state.documentSummaries
+
+                isSameSelected :: Bool
+                isSameSelected = fmap (.id) state.selectedDocument == Just targetId
+
+                restoredDraft :: EditorDraft
+                restoredDraft = draftFromDocument doc
+
+                nextRevisionHistory :: RevisionHistoryState
+                nextRevisionHistory = state.revisionHistory
+                    { confirmRestoreRev = Nothing
+                    , selectedRevision  = if isSameSelected then Just doc.revision else state.revisionHistory.selectedRevision
+                    , revisionDetail    = if isSameSelected then Nothing else state.revisionHistory.revisionDetail
+                    }
+            in  state
+                    { restoringRevisionDoc = Nothing
+                    , documentSummaries    = nextSummaries
+                    , selectedDocument     = if isSameSelected then Just doc else state.selectedDocument
+                    , draft                = if isSameSelected then restoredDraft else state.draft
+                    , storedDrafts         = Map.delete targetId state.storedDrafts
+                    , draftSyncState       = if isSameSelected then DraftSyncIdle else state.draftSyncState
+                    , restoredDraftDocId   = if isSameSelected then Nothing else state.restoredDraftDocId
+                    , staleDraftPrompt     = if isSameSelected then Nothing else state.staleDraftPrompt
+                    , editorSyncVersion    = if isSameSelected then state.editorSyncVersion + 1 else state.editorSyncVersion
+                    , editorStats          = if isSameSelected then computeTextStats (toText doc.body) else state.editorStats
+                    , editorViewMode       = if isSameSelected then normalizeViewMode doc.format state.editorViewMode else state.editorViewMode
+                    , canUndo              = not isSameSelected && state.canUndo
+                    , canRedo              = not isSameSelected && state.canRedo
+                    , revisionHistory      = nextRevisionHistory
+                    , lastError            = Nothing
+                    , statusNotice         = Just msgs.noticeRevisionRestored
+                    }
+        Left err ->
+            state
+                { restoringRevisionDoc = Nothing
+                , revisionHistory      = state.revisionHistory { confirmRestoreRev = Nothing }
+                , lastError            = Just (formatApiClientError msgs err)
+                }
 
 -- | CodeMirror 6 から受信したイベントを状態へ純粋に反映する (保存ショートカット実行は MVU 側で処理)。
 applyEditorEvent :: EditorEvent -> ClientState -> ClientState
@@ -1900,6 +2180,8 @@ updateClient env action = case action of
                     if fmap (.id) stAfter.selectedDocument == Just doc.id && isDraftDirty doc stAfter.draft
                         then syncLocalDraftForCurrentState
                         else io_ (env.draftStorage.deleteStoredDraft doc.id)
+                    when (stAfter.revisionHistory.isHistoryOpen && stAfter.revisionHistory.documentId == Just doc.id) $
+                        loadRevisionListForDocument doc.id False
                     io (TagsLoaded seqNo <$> listTags env.apiClient)
                     io (FoldersLoaded seqNo <$> listFolders env.apiClient)
                 Left _ -> pure ()
@@ -1964,7 +2246,9 @@ updateClient env action = case action of
         st <- get
         case currentAuthSession st of
             Just session
-                | isNothing st.mutatingDocumentId && isNothing st.savingDocument -> do
+                | isNothing st.mutatingDocumentId
+                    && isNothing st.savingDocument
+                    && isNothing st.restoringRevisionDoc -> do
                     modify $ \ s -> s
                         { mutatingDocumentId = Just docId
                         , lastError          = Nothing
@@ -1988,7 +2272,7 @@ updateClient env action = case action of
         st <- get
         case currentAuthSession st of
             Just session
-                | isNothing st.mutatingDocumentId -> do
+                | isNothing st.mutatingDocumentId && isNothing st.restoringRevisionDoc -> do
                     modify $ \ s -> s
                         { mutatingDocumentId = Just docId
                         , lastError          = Nothing
@@ -2012,7 +2296,7 @@ updateClient env action = case action of
         st <- get
         case currentAuthSession st of
             Just session
-                | isNothing st.mutatingDocumentId -> do
+                | isNothing st.mutatingDocumentId && isNothing st.restoringRevisionDoc -> do
                     modify $ \ s -> s
                         { mutatingDocumentId = Just docId
                         , lastError          = Nothing
@@ -2035,7 +2319,7 @@ updateClient env action = case action of
         let hasExt :: Bool
             hasExt = any (\ ext -> ext.metadata.extensionId == extId) env.extensions
         case st.selectedDocument of
-            Just doc | not (isTrashed doc) && hasExt -> do
+            Just doc | not (isTrashed doc) && hasExt && isNothing st.restoringRevisionDoc -> do
                 modify $ \ s ->
                     (applyExtensionById env.extensions extId s)
                         { statusNotice = Just env.messages.noticeExtensionApplied
@@ -2265,6 +2549,128 @@ updateClient env action = case action of
                     io (FoldersLoaded seqNo <$> listFolders env.apiClient)
                     io_ (env.sendEditorCmd CmdFocus)
                 Left _ -> pure ()
+    ToggleRevisionHistory -> do
+        st <- get
+        case st.selectedDocument of
+            Nothing -> pure ()
+            Just doc ->
+                if st.revisionHistory.isHistoryOpen
+                    then modify $ \ s -> s
+                        { revisionHistory = resetRevisionHistory s.revisionHistory
+                        }
+                    else do
+                        modify $ \ s -> s
+                            { revisionHistory = (resetRevisionHistory s.revisionHistory)
+                                { isHistoryOpen = True
+                                , documentId    = Just doc.id
+                                }
+                            , lastError = Nothing
+                            }
+                        loadRevisionListForDocument doc.id False
+    RefreshRevisionHistory -> do
+        st <- get
+        case st.selectedDocument of
+            Just doc | st.revisionHistory.isHistoryOpen ->
+                loadRevisionListForDocument doc.id False
+            _ -> pure ()
+    LoadMoreRevisions -> do
+        st <- get
+        case st.selectedDocument of
+            Just doc
+                | st.revisionHistory.isHistoryOpen
+                    && not st.revisionHistory.isLoadingList
+                    && not st.revisionHistory.isLoadingMore
+                    && length st.revisionHistory.revisions < st.revisionHistory.totalRevisions ->
+                    loadRevisionListForDocument doc.id True
+            _ -> pure ()
+    RevisionListLoaded seqNo reqSeq docId isAppend eList ->
+        guardAuthResponse seqNo eList $ do
+            stBefore <- get
+            let prevDetail :: Maybe RevisionDetail
+                prevDetail = stBefore.revisionHistory.revisionDetail
+            modify (applyRevisionListLoaded env.messages reqSeq docId isAppend eList)
+            stAfter <- get
+            case eList of
+                Right _
+                    | stAfter.revisionHistory.isHistoryOpen
+                        && stAfter.revisionHistory.documentId == Just docId ->
+                        case stAfter.revisionHistory.selectedRevision of
+                            Just revNo
+                                | fmap (\ d -> (d.documentId, d.revision)) prevDetail /= Just (docId, revNo)
+                                    || isNothing stAfter.revisionHistory.revisionDetail ->
+                                    loadRevisionDetailForDocument docId revNo
+                            _ -> pure ()
+                _ -> pure ()
+    SelectRevision revNo -> do
+        st <- get
+        case st.selectedDocument of
+            Just doc | st.revisionHistory.isHistoryOpen -> do
+                modify $ \ s -> s
+                    { revisionHistory = s.revisionHistory
+                        { selectedRevision  = Just revNo
+                        , confirmRestoreRev = Nothing
+                        }
+                    }
+                loadRevisionDetailForDocument doc.id revNo
+            _ -> pure ()
+    RevisionDetailLoaded seqNo reqSeq docId revNo eDetail ->
+        guardAuthResponse seqNo eDetail $
+            modify (applyRevisionDetailLoaded env.messages reqSeq docId revNo eDetail)
+    SetRevisionDetailTab nextTab ->
+        modify $ \ s -> s
+            { revisionHistory = s.revisionHistory { activeTab = nextTab }
+            }
+    RequestRestoreRevision revNo -> do
+        st <- get
+        case st.selectedDocument of
+            Just doc
+                | not (isTrashed doc)
+                    && isNothing st.restoringRevisionDoc
+                    && isNothing st.mutatingDocumentId
+                    && isNothing st.savingDocument
+                    && revNo /= doc.revision ->
+                    modify $ \ s -> s
+                        { revisionHistory = s.revisionHistory { confirmRestoreRev = Just revNo }
+                        }
+            _ -> pure ()
+    CancelRestoreRevision ->
+        modify $ \ s -> s
+            { revisionHistory = s.revisionHistory { confirmRestoreRev = Nothing }
+            }
+    ConfirmRestoreRevision revNo -> do
+        st <- get
+        case (currentAuthSession st, st.selectedDocument) of
+            (Just session, Just doc)
+                | not (isTrashed doc)
+                    && isNothing st.restoringRevisionDoc
+                    && isNothing st.mutatingDocumentId
+                    && isNothing st.savingDocument -> do
+                    let req :: RestoreRevisionRequest
+                        req = RestoreRevisionRequest
+                            { baseRevision = Just doc.revision
+                            }
+                    modify $ \ s -> s
+                        { restoringRevisionDoc = Just doc.id
+                        , revisionHistory      = s.revisionHistory { confirmRestoreRev = Nothing }
+                        , lastError            = Nothing
+                        , statusNotice         = Nothing
+                        }
+                    io (RevisionRestored st.authSessionSeq doc.id <$> restoreDocumentRevision env.apiClient session.csrfToken doc.id revNo req)
+            _ -> pure ()
+    RevisionRestored seqNo docId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            when (stBefore.restoringRevisionDoc == Just docId) $ do
+                modify (applyRevisionRestored env.messages docId eDoc)
+                case eDoc of
+                    Right doc -> do
+                        io_ (env.draftStorage.deleteStoredDraft doc.id)
+                        stAfter <- get
+                        when (fmap (.id) stAfter.selectedDocument == Just doc.id) $ do
+                            syncEditorFromCurrentState True
+                            when (stAfter.revisionHistory.isHistoryOpen && stAfter.revisionHistory.documentId == Just doc.id) $
+                                loadRevisionListForDocument doc.id False
+                    Left _ -> pure ()
     DismissError ->
         modify dismissError
     DismissNotice ->
@@ -2428,6 +2834,7 @@ updateClient env action = case action of
                 , editorStats        = emptyEditorStats
                 , canUndo            = False
                 , canRedo            = False
+                , revisionHistory    = resetRevisionHistory s.revisionHistory
                 , mobilePane         = PaneList
                 , statusNotice       = Nothing
                 }
@@ -2505,7 +2912,9 @@ updateClient env action = case action of
         st <- get
         case (currentAuthSession st, st.selectedDocument) of
             (Just session, Just doc)
-                | not (isTrashed doc) && isNothing st.savingDocument ->
+                | not (isTrashed doc)
+                    && isNothing st.savingDocument
+                    && isNothing st.restoringRevisionDoc ->
                     case validateEditorDraft st.draft of
                         Left vErr ->
                             modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
@@ -2524,6 +2933,54 @@ updateClient env action = case action of
         case buildEditorSyncPayload env.messages shouldResetHistory st of
             Nothing      -> pure ()
             Just payload -> io_ (env.sendEditorCmd (CmdSyncDocument payload))
+
+    loadRevisionListForDocument :: DocumentId -> Bool -> Effect () () ClientState ClientAction
+    loadRevisionListForDocument docId isAppend = do
+        st <- get
+        case currentAuthSession st of
+            Nothing -> pure ()
+            Just _ -> do
+                let authSeq :: Int
+                    authSeq = st.authSessionSeq
+
+                    nextListSeq :: Int
+                    nextListSeq = st.revisionHistory.listRequestSeq + 1
+
+                    mOffset :: Maybe ListOffset
+                    mOffset =
+                        if isAppend
+                            then either (const Nothing) Just (mkListOffset (length st.revisionHistory.revisions))
+                            else Nothing
+                modify $ \ s -> s
+                    { revisionHistory = s.revisionHistory
+                        { documentId     = Just docId
+                        , listRequestSeq = nextListSeq
+                        , isLoadingList  = not isAppend
+                        , isLoadingMore  = isAppend
+                        }
+                    }
+                io (RevisionListLoaded authSeq nextListSeq docId isAppend <$> listDocumentRevisions env.apiClient docId Nothing mOffset)
+
+    loadRevisionDetailForDocument :: DocumentId -> RevisionNumber -> Effect () () ClientState ClientAction
+    loadRevisionDetailForDocument docId revNo = do
+        st <- get
+        case currentAuthSession st of
+            Nothing -> pure ()
+            Just _ -> do
+                let authSeq :: Int
+                    authSeq = st.authSessionSeq
+
+                    nextDetailSeq :: Int
+                    nextDetailSeq = st.revisionHistory.detailRequestSeq + 1
+                modify $ \ s -> s
+                    { revisionHistory = s.revisionHistory
+                        { documentId       = Just docId
+                        , selectedRevision = Just revNo
+                        , detailRequestSeq = nextDetailSeq
+                        , isLoadingDetail  = True
+                        }
+                    }
+                io (RevisionDetailLoaded authSeq nextDetailSeq docId revNo <$> getDocumentRevision env.apiClient docId revNo)
 
     dispatchCurrentSearch :: Effect () () ClientState ClientAction
     dispatchCurrentSearch = do
@@ -2565,6 +3022,7 @@ resetWorkspaceForAuthenticated session mNotice state = state
     , autoOpeningDraftId           = Nothing
     , savingDocument               = Nothing
     , mutatingDocumentId           = Nothing
+    , restoringRevisionDoc         = Nothing
     , selectedDocument             = Nothing
     , draft                        = emptyEditorDraft
     , storedDrafts                 = Map.empty
@@ -2578,6 +3036,7 @@ resetWorkspaceForAuthenticated session mNotice state = state
     , canRedo                      = False
     , metadataPanelOpen            = False
     , searchPanel                  = emptySearchPanelState
+    , revisionHistory              = resetRevisionHistory state.revisionHistory
     , pendingNavigation            = Nothing
     , confirmPermanentDelete       = Nothing
     , lastError                    = Nothing

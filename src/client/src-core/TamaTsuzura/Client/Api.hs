@@ -37,6 +37,10 @@ module TamaTsuzura.Client.Api
     , buildPermanentDeleteDocumentRequest
     , buildListTagsRequest
     , buildListFoldersRequest
+    , buildRevisionListQueryString
+    , buildListRevisionsRequest
+    , buildGetRevisionRequest
+    , buildRestoreRevisionRequest
     , parseJsonResponse
     , parseNoContentResponse
       -- * 認証 REST API クライアント操作
@@ -55,6 +59,10 @@ module TamaTsuzura.Client.Api
     , permanentDeleteDocument
     , listTags
     , listFolders
+      -- * リビジョン履歴 REST API クライアント操作
+    , listDocumentRevisions
+    , getDocumentRevision
+    , restoreDocumentRevision
     ) where
 
 import           Data.Aeson                    (FromJSON, ToJSON)
@@ -78,6 +86,8 @@ import           TamaTsuzura.Common.Api
     , DocumentStatusFilter(..)
     , FolderListResponse
     , HealthStatus
+    , ListLimit
+    , ListOffset
     , TagListResponse
     , UpdateDocumentRequest
     , defaultListLimitValue
@@ -92,7 +102,12 @@ import           TamaTsuzura.Common.Auth
     , RegisterRequest
     , validateRegisterRequest
     )
-import           TamaTsuzura.Common.Document   (Document, DocumentId)
+import           TamaTsuzura.Common.Document   (Document, DocumentId, RevisionNumber)
+import           TamaTsuzura.Common.Revision
+    ( RestoreRevisionRequest
+    , RevisionDetail
+    , RevisionListResponse
+    )
 import           TamaTsuzura.Common.Text       (ToText(..))
 import           TamaTsuzura.Common.Validation (ValidationError)
 
@@ -433,6 +448,60 @@ buildListFoldersRequest base = HttpRequest
     , body    = Nothing
     }
 
+-- | リビジョン一覧取得用のクエリ文字列を構築する (指定なしまたは既定値のみなら空文字)。
+buildRevisionListQueryString :: Maybe ListLimit -> Maybe ListOffset -> Text
+buildRevisionListQueryString mLimit mOffset =
+    case queryPairs of
+        []    -> ""
+        pairs -> "?" <> Txt.intercalate "&" (map formatPair pairs)
+  where
+    queryPairs :: [(Text, Text)]
+    queryPairs =
+        [ ("limit", toText l) | Just l <- [mLimit], l /= defaultListLimitValue ]
+            <> [ ("offset", toText o) | Just o <- [mOffset], o /= defaultListOffsetValue ]
+
+    formatPair :: (Text, Text) -> Text
+    formatPair (k, v) =
+        percentEncodeQueryComponent k <> "=" <> percentEncodeQueryComponent v
+
+-- | @GET /api/documents/{id}/revisions@ のリクエストを構築する。
+buildListRevisionsRequest ::
+       ApiBaseUrl
+    -> DocumentId
+    -> Maybe ListLimit
+    -> Maybe ListOffset
+    -> HttpRequest
+buildListRevisionsRequest base docId mLimit mOffset = HttpRequest
+    { method  = MethodGet
+    , url     = documentEndpointUrl base docId ("/revisions" <> buildRevisionListQueryString mLimit mOffset)
+    , headers = acceptJsonHeaders
+    , body    = Nothing
+    }
+
+-- | @GET /api/documents/{id}/revisions/{revision}@ のリクエストを構築する。
+buildGetRevisionRequest :: ApiBaseUrl -> DocumentId -> RevisionNumber -> HttpRequest
+buildGetRevisionRequest base docId revNo = HttpRequest
+    { method  = MethodGet
+    , url     = documentEndpointUrl base docId ("/revisions/" <> toText revNo)
+    , headers = acceptJsonHeaders
+    , body    = Nothing
+    }
+
+-- | @POST /api/documents/{id}/revisions/{revision}/restore@ のリクエストを CSRF ヘッダ付きで構築する。
+buildRestoreRevisionRequest ::
+       ApiBaseUrl
+    -> CsrfToken
+    -> DocumentId
+    -> RevisionNumber
+    -> RestoreRevisionRequest
+    -> HttpRequest
+buildRestoreRevisionRequest base csrf docId revNo req = HttpRequest
+    { method  = MethodPost
+    , url     = documentEndpointUrl base docId ("/revisions/" <> toText revNo <> "/restore")
+    , headers = withCsrfHeader csrf jsonBodyHeaders
+    , body    = Just (encodeJsonBody req)
+    }
+
 -- | 期待する HTTP ステータスコードの JSON レスポンスを解析する。
 -- 4xx/5xx の場合は構造化 'ApiError' としてのデコードを優先し、非 JSON 応答は 'ClientHttpError' へフォールバックする。
 parseJsonResponse :: FromJSON a => Int -> HttpResponse -> Either ApiClientError a
@@ -530,6 +599,36 @@ listTags client =
 listFolders :: ApiClient -> IO (Either ApiClientError FolderListResponse)
 listFolders client =
     executeRequest client (buildListFoldersRequest client.baseUrl) (parseJsonResponse 200)
+
+-- | 文書のリビジョン履歴サマリ一覧 (@GET /api/documents/{id}/revisions@) を取得する。
+listDocumentRevisions ::
+       ApiClient
+    -> DocumentId
+    -> Maybe ListLimit
+    -> Maybe ListOffset
+    -> IO (Either ApiClientError RevisionListResponse)
+listDocumentRevisions client docId mLimit mOffset =
+    executeRequest client (buildListRevisionsRequest client.baseUrl docId mLimit mOffset) (parseJsonResponse 200)
+
+-- | 特定リビジョンの再構成済み詳細 (@GET /api/documents/{id}/revisions/{revision}@) を取得する。
+getDocumentRevision ::
+       ApiClient
+    -> DocumentId
+    -> RevisionNumber
+    -> IO (Either ApiClientError RevisionDetail)
+getDocumentRevision client docId revNo =
+    executeRequest client (buildGetRevisionRequest client.baseUrl docId revNo) (parseJsonResponse 200)
+
+-- | 稼働中文書を過去リビジョンへ復元 (@POST /api/documents/{id}/revisions/{revision}/restore@) する。
+restoreDocumentRevision ::
+       ApiClient
+    -> CsrfToken
+    -> DocumentId
+    -> RevisionNumber
+    -> RestoreRevisionRequest
+    -> IO (Either ApiClientError Document)
+restoreDocumentRevision client csrf docId revNo req =
+    executeRequest client (buildRestoreRevisionRequest client.baseUrl csrf docId revNo req) (parseJsonResponse 200)
 
 executeRequest ::
        ApiClient

@@ -58,6 +58,48 @@ data UiMessages = UiMessages
       -- ^ エディタ内検索/置換パネル切替ボタンラベル
     , actionMetadataToggle       :: !Text
       -- ^ 整理設定 (フォルダ・タグ・形式) 折りたたみ切替ラベル
+    , actionHistoryToggle        :: !Text
+      -- ^ リビジョン履歴パネル開閉ボタンラベル
+    , actionRefreshHistory       :: !Text
+      -- ^ リビジョン履歴再読込ボタンラベル
+    , actionLoadMoreHistory      :: !Text
+      -- ^ リビジョン履歴の追加読み込みボタンラベル
+    , actionCloseHistory         :: !Text
+      -- ^ リビジョン履歴パネルを閉じるボタンラベル
+    , actionRestoreRevision      :: !Text
+      -- ^ 選択リビジョンへ復元するボタンラベル
+    , actionRestoringRevision    :: !Text
+      -- ^ 過去リビジョン復元実行中のボタンラベル
+    , actionConfirmRestoreRev    :: !Text
+      -- ^ 過去リビジョン復元を確定するボタンラベル
+    , historyHeading             :: !Text
+      -- ^ リビジョン履歴パネル見出し
+    , historyCurrentBadge        :: !Text
+      -- ^ 最新リビジョンを示すバッジ文言
+    , historyLoadingList         :: !Text
+      -- ^ リビジョン履歴一覧読み込み中メッセージ
+    , historyLoadingDetail       :: !Text
+      -- ^ リビジョン詳細読み込み中メッセージ
+    , historyEmpty               :: !Text
+      -- ^ 履歴が空のときのメッセージ
+    , historySelectPrompt        :: !Text
+      -- ^ リビジョン未選択時の案内メッセージ
+    , historyTabBody             :: !Text
+      -- ^ リビジョン詳細の本文タブラベル
+    , historyTabDiff             :: !Text
+      -- ^ リビジョン詳細の差分タブラベル
+    , historyDiffEmpty           :: !Text
+      -- ^ 親リビジョンからの本文差分が空のときの案内文言
+    , historyTrashedRestoreHint  :: !Text
+      -- ^ ゴミ箱内文書でリビジョン復元が不可である旨の案内
+    , historyCurrentVersionHint  :: !Text
+      -- ^ 現在表示中の最新リビジョンである旨の案内
+    , confirmRestoreRevTitle     :: !Text
+      -- ^ 過去リビジョン復元確認モーダル見出し
+    , confirmRestoreRevBody      :: !Text
+      -- ^ 過去リビジョン復元確認モーダル本文
+    , noticeRevisionRestored     :: !Text
+      -- ^ 過去リビジョン復元完了通知
     , actionMoveToTrash          :: !Text
       -- ^ ゴミ箱へ移動ボタンラベル
     , actionRestore              :: !Text
@@ -383,6 +425,27 @@ jaMessages = UiMessages
     , actionRedo                 = "やり直す"
     , actionSearchToggle         = "検索・置換"
     , actionMetadataToggle       = "整理"
+    , actionHistoryToggle        = "履歴"
+    , actionRefreshHistory       = "再読込"
+    , actionLoadMoreHistory      = "さらに読み込む"
+    , actionCloseHistory         = "閉じる"
+    , actionRestoreRevision      = "この版へ復元"
+    , actionRestoringRevision    = "復元中..."
+    , actionConfirmRestoreRev    = "この版へ復元する"
+    , historyHeading             = "編集履歴"
+    , historyCurrentBadge        = "現在"
+    , historyLoadingList         = "編集履歴を読み込んでいます..."
+    , historyLoadingDetail       = "リビジョン内容を読み込んでいます..."
+    , historyEmpty               = "編集履歴はまだありません。"
+    , historySelectPrompt        = "一覧からリビジョンを選ぶと、本文と差分を確認できます。"
+    , historyTabBody             = "本文"
+    , historyTabDiff             = "差分"
+    , historyDiffEmpty           = "前の版からの本文差分はありません（タイトル・形式のみの変更、または空本文です）。"
+    , historyTrashedRestoreHint  = "ゴミ箱内の文書は過去リビジョンへ復元できません。先に文書を復元してください。"
+    , historyCurrentVersionHint  = "現在表示中の最新リビジョンです。"
+    , confirmRestoreRevTitle     = "過去のリビジョンへ復元しますか？"
+    , confirmRestoreRevBody      = "選択したリビジョンのタイトル・形式・本文を最新の内容として復元します（履歴は追記保存されます）。現在の未保存変更がある場合は破棄されます。"
+    , noticeRevisionRestored     = "選択したリビジョンへ復元しました。"
     , actionMoveToTrash          = "ゴミ箱へ"
     , actionRestore              = "復元"
     , actionPermanentDelete      = "完全削除"

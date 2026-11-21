@@ -35,6 +35,8 @@ import           TamaTsuzura.Client.App
     , FilterState(..)
     , MobilePane(..)
     , PendingNavigation(..)
+    , RevisionDetailTab(..)
+    , RevisionHistoryState(..)
     , SearchPanelState(..)
     , hasActiveFilters
     , isCurrentDocumentDirty
@@ -45,6 +47,14 @@ import           TamaTsuzura.Client.I18n         (UiMessages(..), formatDocument
 import           TamaTsuzura.Client.Markdown     (renderMarkdownView)
 import           TamaTsuzura.Common.Api          (DocumentStatusFilter(..))
 import           TamaTsuzura.Common.Auth         (AuthSessionResponse(..), UserProfile(..))
+import           TamaTsuzura.Common.Diff
+    ( DiffHunk(..)
+    , DiffLine(..)
+    , DiffLineKind(..)
+    , ParsedDiff(..)
+    , UnifiedDiff
+    , parseUnifiedDiff
+    )
 import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentFormat(..)
@@ -60,6 +70,7 @@ import           TamaTsuzura.Common.Document
     , parseDocumentFormat
     , tagSetToList
     )
+import           TamaTsuzura.Common.Revision     (RevisionDetail(..), RevisionSummary(..))
 import           TamaTsuzura.Common.Text         (ToText(..))
 import           TamaTsuzura.ExtensionApi        (ExtensionMetadata(..))
 
@@ -674,7 +685,7 @@ viewEditorPane msgs state =
 
 viewActiveEditor :: UiMessages -> ClientState -> Document -> View () () ClientState ClientAction
 viewActiveEditor msgs state doc =
-    H.div_ [ HP.class_ "tt-editor-shell" ]
+    H.div_ [ HP.class_ (ms shellClass) ]
         [ viewEditorToolbar msgs state doc
         , if readOnly
             then H.div_ [ HP.class_ "tt-banner tt-banner-warn", HP.role_ "status" ]
@@ -685,12 +696,21 @@ viewActiveEditor msgs state doc =
         , if state.searchPanel.isOpen
             then viewSearchPanel msgs state.searchPanel readOnly
             else H.div_ [ HP.class_ "tt-slot-empty" ] []
+        , if state.revisionHistory.isHistoryOpen
+            then viewRevisionHistoryPanel msgs state doc readOnly
+            else H.div_ [ HP.class_ "tt-slot-empty" ] []
         , viewEditorWorkspace msgs state
         , viewEditorStatusBar msgs state readOnly
         ]
   where
     readOnly :: Bool
     readOnly = isTrashed doc
+
+    shellClass :: Text
+    shellClass =
+        if state.revisionHistory.isHistoryOpen
+            then "tt-editor-shell tt-history-open"
+            else "tt-editor-shell"
 
 viewDraftRecoveryBanner ::
        UiMessages
@@ -785,6 +805,12 @@ viewEditorToolbar msgs state doc =
                         [ text (ms msgs.actionMetadataToggle) ]
                    , H.button_
                         [ HP.type_ "button"
+                        , HP.class_ (ms historyBtnClass)
+                        , HE.onClick ToggleRevisionHistory
+                        ]
+                        [ text (ms msgs.actionHistoryToggle) ]
+                   , H.button_
+                        [ HP.type_ "button"
                         , HP.class_ "tt-btn tt-btn-secondary tt-btn-compact"
                         , HE.onClick ExportCurrentDocument
                         ]
@@ -823,6 +849,12 @@ viewEditorToolbar msgs state doc =
     metaBtnClass :: Text
     metaBtnClass =
         if state.metadataPanelOpen
+            then "tt-btn tt-btn-secondary tt-btn-compact tt-btn-active"
+            else "tt-btn tt-btn-secondary tt-btn-compact"
+
+    historyBtnClass :: Text
+    historyBtnClass =
+        if state.revisionHistory.isHistoryOpen
             then "tt-btn tt-btn-secondary tt-btn-compact tt-btn-active"
             else "tt-btn tt-btn-secondary tt-btn-compact"
 
@@ -1050,6 +1082,263 @@ viewSearchPanel msgs sp readOnly =
     toggleBtnClass True  = "tt-btn tt-btn-secondary tt-btn-xs tt-btn-active"
     toggleBtnClass False = "tt-btn tt-btn-secondary tt-btn-xs"
 
+viewRevisionHistoryPanel ::
+       UiMessages
+    -> ClientState
+    -> Document
+    -> Bool
+    -> View () () ClientState ClientAction
+viewRevisionHistoryPanel msgs state doc readOnly =
+    H.section_ [ HP.class_ "tt-history-panel", HP.aria_ "label" (ms msgs.historyHeading) ]
+        [ H.div_ [ HP.class_ "tt-history-header" ]
+            [ H.div_ [ HP.class_ "tt-section-header" ]
+                [ H.h2_ [ HP.class_ "tt-section-heading" ] [ text (ms msgs.historyHeading) ]
+                , H.span_ [ HP.class_ "tt-count" ]
+                    [ text (ms countLabel) ]
+                ]
+            , H.div_ [ HP.class_ "tt-history-header-actions" ]
+                [ H.button_
+                    ( [ HP.type_ "button"
+                      , HP.class_ "tt-btn tt-btn-secondary tt-btn-xs"
+                      , HE.onClick RefreshRevisionHistory
+                      ] <> disabledAttr (rh.isLoadingList || rh.isLoadingMore || isRestoring)
+                    )
+                    [ text (ms msgs.actionRefreshHistory) ]
+                , H.button_
+                    [ HP.type_ "button"
+                    , HP.class_ "tt-btn tt-btn-ghost tt-btn-xs"
+                    , HE.onClick ToggleRevisionHistory
+                    ]
+                    [ text (ms msgs.actionCloseHistory) ]
+                ]
+            ]
+        , H.div_ [ HP.class_ "tt-history-body" ]
+            [ H.div_ [ HP.class_ "tt-history-list-col" ]
+                [ viewRevisionList
+                ]
+            , H.div_ [ HP.class_ "tt-history-detail-col" ]
+                [ viewRevisionDetailCol
+                ]
+            ]
+        ]
+  where
+    rh :: RevisionHistoryState
+    rh = state.revisionHistory
+
+    isSaving :: Bool
+    isSaving = isJust state.savingDocument
+
+    isRestoring :: Bool
+    isRestoring = isJust state.restoringRevisionDoc
+
+    isMutating :: Bool
+    isMutating = isJust state.mutatingDocumentId
+
+    loadedCount :: Int
+    loadedCount = length rh.revisions
+
+    hasMoreRevisions :: Bool
+    hasMoreRevisions = loadedCount < rh.totalRevisions
+
+    countLabel :: Text
+    countLabel
+        | hasMoreRevisions && loadedCount > 0 =
+            Txt.pack (show loadedCount) <> " / " <> Txt.pack (show rh.totalRevisions) <> msgs.documentsCountUnit
+        | otherwise =
+            Txt.pack (show rh.totalRevisions) <> msgs.documentsCountUnit
+
+    viewRevisionList :: View () () ClientState ClientAction
+    viewRevisionList
+        | rh.isLoadingList && null rh.revisions =
+            H.p_ [ HP.class_ "tt-empty" ] [ text (ms msgs.historyLoadingList) ]
+        | null rh.revisions =
+            H.p_ [ HP.class_ "tt-empty" ] [ text (ms msgs.historyEmpty) ]
+        | otherwise =
+            H.div_ []
+                ( H.ul_ [ HP.class_ "tt-rev-list" ]
+                    (map viewRevisionSummaryRow rh.revisions)
+                : [ H.button_
+                        ( [ HP.type_ "button"
+                          , HP.class_ "tt-btn tt-btn-secondary tt-btn-xs tt-auth-submit"
+                          , HE.onClick LoadMoreRevisions
+                          ] <> disabledAttr (rh.isLoadingList || rh.isLoadingMore || isRestoring)
+                        )
+                        [ text (ms (if rh.isLoadingMore then msgs.historyLoadingList else msgs.actionLoadMoreHistory)) ]
+                  | hasMoreRevisions
+                  ]
+                )
+
+    viewRevisionSummaryRow :: RevisionSummary -> View () () ClientState ClientAction
+    viewRevisionSummaryRow summary =
+        let isSelected :: Bool
+            isSelected = rh.selectedRevision == Just summary.revision
+
+            isCurrent :: Bool
+            isCurrent = summary.revision == doc.revision
+
+            itemClass :: Text
+            itemClass =
+                if isSelected
+                    then "tt-rev-item tt-rev-item-active"
+                    else "tt-rev-item"
+        in  H.li_ [ HP.class_ (ms itemClass) ]
+                [ H.button_
+                    [ HP.type_ "button"
+                    , HP.class_ "tt-rev-select-btn"
+                    , HE.onClick (SelectRevision summary.revision)
+                    ]
+                    [ H.div_ [ HP.class_ "tt-rev-row-top" ]
+                        ( [ H.span_ [ HP.class_ "tt-rev-num" ]
+                                [ text (ms ("r" <> toText summary.revision)) ]
+                          ]
+                            <> [ H.span_ [ HP.class_ "tt-rev-current-badge" ]
+                                    [ text (ms msgs.historyCurrentBadge) ]
+                               | isCurrent
+                               ]
+                            <> [ H.span_ [ HP.class_ "tt-rev-time" ]
+                                    [ text (ms (formatUtcTimestamp summary.createdAt)) ]
+                               ]
+                        )
+                    , H.div_ [ HP.class_ "tt-rev-title" ]
+                        [ text (ms (displayTitle msgs summary.title)) ]
+                    ]
+                ]
+
+    viewRevisionDetailCol :: View () () ClientState ClientAction
+    viewRevisionDetailCol
+        | isRestoring || rh.isLoadingDetail || (rh.isLoadingList && isNothing rh.revisionDetail) =
+            H.p_ [ HP.class_ "tt-empty" ] [ text (ms msgs.historyLoadingDetail) ]
+        | otherwise = case rh.revisionDetail of
+            Nothing ->
+                H.p_ [ HP.class_ "tt-empty" ] [ text (ms msgs.historySelectPrompt) ]
+            Just detail ->
+                let isCurrentRev :: Bool
+                    isCurrentRev = detail.revision == doc.revision
+
+                    restoreLabel :: Text
+                    restoreLabel =
+                        if isRestoring
+                            then msgs.actionRestoringRevision
+                            else msgs.actionRestoreRevision
+                in  H.div_ [ HP.class_ "tt-rev-detail" ]
+                        [ H.div_ [ HP.class_ "tt-rev-detail-head" ]
+                            [ H.div_ [ HP.class_ "tt-rev-detail-meta" ]
+                                [ H.span_ [ HP.class_ "tt-rev-num" ]
+                                    [ text (ms ("r" <> toText detail.revision)) ]
+                                , H.span_ [ HP.class_ "tt-doc-format" ]
+                                    [ text (ms (formatDocumentFormat msgs detail.format)) ]
+                                , H.span_ [ HP.class_ "tt-rev-time" ]
+                                    [ text (ms (formatUtcTimestamp detail.createdAt)) ]
+                                ]
+                            , H.div_ [ HP.class_ "tt-rev-detail-title" ]
+                                [ text (ms (displayTitle msgs detail.title)) ]
+                            , viewRestoreActionBar detail isCurrentRev restoreLabel
+                            ]
+                        , H.div_ [ HP.class_ "tt-segmented tt-rev-tabs", HP.role_ "tablist" ]
+                            [ detailTabButton RevTabBody msgs.historyTabBody
+                            , detailTabButton RevTabDiff msgs.historyTabDiff
+                            ]
+                        , H.div_ [ HP.class_ "tt-rev-content" ]
+                            [ case rh.activeTab of
+                                RevTabBody ->
+                                    H.pre_ [ HP.class_ "tt-rev-body-pre" ]
+                                        [ text (ms (toText detail.body)) ]
+                                RevTabDiff ->
+                                    viewUnifiedDiff msgs detail.diff
+                            ]
+                        ]
+
+    viewRestoreActionBar ::
+           RevisionDetail
+        -> Bool
+        -> Text
+        -> View () () ClientState ClientAction
+    viewRestoreActionBar detail isCurrentRev restoreLabel
+        | readOnly =
+            H.p_ [ HP.class_ "tt-rev-hint" ] [ text (ms msgs.historyTrashedRestoreHint) ]
+        | isCurrentRev =
+            H.p_ [ HP.class_ "tt-rev-hint" ] [ text (ms msgs.historyCurrentVersionHint) ]
+        | otherwise =
+            H.div_ [ HP.class_ "tt-rev-restore-bar" ]
+                [ H.button_
+                    ( [ HP.type_ "button"
+                      , HP.class_ "tt-btn tt-btn-primary tt-btn-compact"
+                      , HE.onClick (RequestRestoreRevision detail.revision)
+                      ] <> disabledAttr (isRestoring || isSaving || isMutating)
+                    )
+                    [ text (ms restoreLabel) ]
+                ]
+
+    detailTabButton :: RevisionDetailTab -> Text -> View () () ClientState ClientAction
+    detailTabButton tab labelText =
+        let isActive :: Bool
+            isActive = rh.activeTab == tab
+
+            btnClass :: Text
+            btnClass = if isActive then "tt-seg-btn tt-seg-btn-active" else "tt-seg-btn"
+        in  H.button_
+                [ HP.type_ "button"
+                , HP.class_ (ms btnClass)
+                , HP.role_ "tab"
+                , HP.aria_ "selected" (if isActive then "true" else "false")
+                , HE.onClick (SetRevisionDetailTab tab)
+                ]
+                [ text (ms labelText) ]
+
+viewUnifiedDiff :: UiMessages -> UnifiedDiff -> View () () ClientState ClientAction
+viewUnifiedDiff msgs diff
+    | Txt.null (toText diff) =
+        H.p_ [ HP.class_ "tt-empty" ] [ text (ms msgs.historyDiffEmpty) ]
+    | otherwise = case parseUnifiedDiff diff of
+        Left _ ->
+            H.pre_ [ HP.class_ "tt-diff-raw" ] [ text (ms (toText diff)) ]
+        Right parsed
+            | null parsed.hunks ->
+                H.p_ [ HP.class_ "tt-empty" ] [ text (ms msgs.historyDiffEmpty) ]
+            | otherwise ->
+                H.div_ [ HP.class_ "tt-diff-view" ]
+                    (map viewDiffHunk parsed.hunks)
+  where
+    viewDiffHunk :: DiffHunk -> View () () ClientState ClientAction
+    viewDiffHunk hunk =
+        let headerText :: Text
+            headerText =
+                "@@ -"
+                    <> formatRange hunk.oldStart hunk.oldCount
+                    <> " +"
+                    <> formatRange hunk.newStart hunk.newCount
+                    <> " @@"
+        in  H.div_ [ HP.class_ "tt-diff-hunk" ]
+                ( H.div_ [ HP.class_ "tt-diff-hunk-header" ] [ text (ms headerText) ]
+                : concatMap viewDiffLine hunk.lines
+                )
+
+    formatRange :: Int -> Int -> Text
+    formatRange start count
+        | count == 1 = Txt.pack (show start)
+        | otherwise  = Txt.pack (show start) <> "," <> Txt.pack (show count)
+
+    viewDiffLine :: DiffLine -> [View () () ClientState ClientAction]
+    viewDiffLine dl =
+        let (lineClass, prefix) = case dl.kind of
+                ContextLine -> ("tt-diff-line tt-diff-ctx", " ")
+                RemovedLine -> ("tt-diff-line tt-diff-del", "-")
+                AddedLine   -> ("tt-diff-line tt-diff-add", "+")
+
+            baseRow :: View () () ClientState ClientAction
+            baseRow =
+                H.div_ [ HP.class_ lineClass ]
+                    [ H.span_ [ HP.class_ "tt-diff-prefix" ] [ text prefix ]
+                    , H.span_ [ HP.class_ "tt-diff-text" ] [ text (ms dl.content) ]
+                    ]
+        in  if dl.hasNewline
+                then [baseRow]
+                else
+                    [ baseRow
+                    , H.div_ [ HP.class_ "tt-diff-line tt-diff-meta" ]
+                        [ text "\\ No newline at end of file" ]
+                    ]
+
 -- | CodeMirror 6 ホストと Markdown プレビューのワークスペース。
 -- 編集/プレビュー切替時も Custom Element @\<tt-codemirror-editor\>@ を DOM から破棄せず
 -- CSS クラスで可視性のみ切り替えることで、CodeMirror 6 の Undo 履歴とカーソル位置を保持する。
@@ -1092,13 +1381,14 @@ viewEditorStatusBar :: UiMessages -> ClientState -> Bool -> View () () ClientSta
 viewEditorStatusBar msgs state readOnly =
     H.footer_ [ HP.class_ "tt-statusbar" ]
         [ H.div_ [ HP.class_ "tt-status-metrics" ]
-            ( [ H.span_ []
-                    [ text (ms (showInt stats.lineCount <> msgs.statsLinesUnit)) ]
-              , H.span_ []
-                    [ text (ms (showInt stats.charCount <> msgs.statsCharsUnit)) ]
-              , H.span_ []
-                    [ text (ms (msgs.statsCursorPrefix <> " " <> showInt stats.cursorLine <> ":" <> showInt stats.cursorCol)) ]
-              ]
+            ( revisionBadge
+                <> [ H.span_ []
+                        [ text (ms (showInt stats.lineCount <> msgs.statsLinesUnit)) ]
+                   , H.span_ []
+                        [ text (ms (showInt stats.charCount <> msgs.statsCharsUnit)) ]
+                   , H.span_ []
+                        [ text (ms (msgs.statsCursorPrefix <> " " <> showInt stats.cursorLine <> ":" <> showInt stats.cursorCol)) ]
+                   ]
                 <> draftSyncIndicator
             )
         , viewExtensionQuickActions msgs state.extensionMetadatas readOnly
@@ -1109,6 +1399,14 @@ viewEditorStatusBar msgs state readOnly =
 
     showInt :: Int -> Text
     showInt = Txt.pack . show
+
+    revisionBadge :: [View () () ClientState ClientAction]
+    revisionBadge = case state.selectedDocument of
+        Nothing  -> []
+        Just doc ->
+            [ H.span_ [ HP.class_ "tt-rev-status-badge" ]
+                [ text (ms ("r" <> toText doc.revision)) ]
+            ]
 
     draftSyncIndicator :: [View () () ClientState ClientAction]
     draftSyncIndicator
@@ -1190,6 +1488,17 @@ viewModals msgs state = case state.authState of
                         (ConfirmPermanentDelete docId)
                         CancelPermanentDelete
                         "tt-btn tt-btn-danger"
+            , case state.revisionHistory.confirmRestoreRev of
+                Nothing    -> H.div_ [ HP.class_ "tt-slot-empty" ] []
+                Just revNo ->
+                    viewConfirmModal
+                        msgs.confirmRestoreRevTitle
+                        msgs.confirmRestoreRevBody
+                        msgs.actionConfirmRestoreRev
+                        msgs.actionCancel
+                        (ConfirmRestoreRevision revNo)
+                        CancelRestoreRevision
+                        "tt-btn tt-btn-primary"
             ]
     _ -> H.div_ [ HP.class_ "tt-slot-empty" ] []
 
