@@ -47,6 +47,13 @@ import           TamaTsuzura.Client.DraftStorage (DraftSyncState(..), StoredDraf
 import           TamaTsuzura.Client.EditorBridge (EditorStats(..))
 import           TamaTsuzura.Client.I18n         (UiMessages(..), formatDocumentFormat, formatExtensionCategory)
 import           TamaTsuzura.Client.Markdown     (renderMarkdownView)
+import           TamaTsuzura.Client.OfflineSync
+    ( NetworkStatus(..)
+    , PendingSyncSave(..)
+    , SyncConflict(..)
+    , SyncStatus(..)
+    , computeSyncStatus
+    )
 import           TamaTsuzura.Common.Api          (DocumentStatusFilter(..))
 import           TamaTsuzura.Common.Auth         (AuthSessionResponse(..), UserProfile(..))
 import           TamaTsuzura.Common.Diff
@@ -262,8 +269,9 @@ viewHeader msgs state =
             , H.p_ [ HP.class_ "tt-subtitle" ] [ text (ms msgs.appSubtitle) ]
             ]
         , H.div_ [ HP.class_ "tt-header-actions" ]
-            ( viewConnectionBadge msgs state.connectionStatus
-            : headerAuthActions
+            ( [ viewConnectionBadge msgs state.networkStatus state.connectionStatus ]
+                <> viewSyncStatusIndicator msgs state
+                <> headerAuthActions
             )
         ]
   where
@@ -343,23 +351,100 @@ viewHeader msgs state =
     isRefreshing :: Bool
     isRefreshing = state.isLoadingDocuments || state.connectionStatus == ConnChecking || state.isLoggingOut
 
-viewConnectionBadge :: UiMessages -> ConnectionStatus -> View () () ClientState ClientAction
-viewConnectionBadge msgs status =
-    let (badgeClass, labelText) = case status of
-            ConnChecking -> ("tt-badge tt-badge-checking", msgs.statusChecking)
-            ConnOnline   -> ("tt-badge tt-badge-online",   msgs.statusOnline)
-            ConnError{}  -> ("tt-badge tt-badge-error",    msgs.statusError)
+viewConnectionBadge ::
+       UiMessages
+    -> NetworkStatus
+    -> ConnectionStatus
+    -> View () () ClientState ClientAction
+viewConnectionBadge msgs netStatus connStatus =
+    let (badgeClass, labelText) = case netStatus of
+            NetworkOffline -> ("tt-badge tt-badge-offline", msgs.statusOffline)
+            NetworkOnline  -> case connStatus of
+                ConnChecking -> ("tt-badge tt-badge-checking", msgs.statusChecking)
+                ConnOnline   -> ("tt-badge tt-badge-online",   msgs.statusOnline)
+                ConnError{}  -> ("tt-badge tt-badge-error",    msgs.statusError)
     in  H.span_ [ HP.class_ badgeClass, HP.role_ "status" ]
             [ text (ms labelText) ]
+
+viewSyncStatusIndicator :: UiMessages -> ClientState -> [View () () ClientState ClientAction]
+viewSyncStatusIndicator msgs state = case state.authState of
+    AuthAuthenticated{} -> case computeSyncStatus state.syncingDocId state.pendingSaves state.syncConflicts of
+        SyncIdle -> []
+        SyncSyncing count ->
+            [ H.span_ [ HP.class_ "tt-badge tt-badge-syncing", HP.role_ "status" ]
+                [ text (ms (msgs.syncStatusSyncingPrefix <> Txt.pack (show count) <> msgs.documentsCountUnit)) ]
+            ]
+        SyncPending count ->
+            [ H.span_ [ HP.class_ "tt-badge tt-badge-pending", HP.role_ "status" ]
+                [ text (ms (msgs.syncStatusPendingPrefix <> Txt.pack (show count) <> msgs.documentsCountUnit)) ]
+            , H.button_
+                ( [ HP.type_ "button"
+                  , HP.class_ "tt-btn tt-btn-secondary tt-btn-compact"
+                  , HE.onClick TriggerSyncQueue
+                  ] <> disabledAttr (state.networkStatus == NetworkOffline || isJust state.savingDocument)
+                )
+                [ text (ms msgs.actionSyncNow) ]
+            ]
+        SyncConflictDetected count ->
+            [ H.span_ [ HP.class_ "tt-badge tt-badge-conflict", HP.role_ "alert" ]
+                [ text (ms (msgs.syncStatusConflictPrefix <> Txt.pack (show count) <> msgs.documentsCountUnit)) ]
+            ]
+    _ -> []
 
 viewNotifications :: UiMessages -> ClientState -> View () () ClientState ClientAction
 viewNotifications msgs state =
     H.div_ [ HP.class_ "tt-notifications" ]
-        [ viewErrorBanner msgs state.lastError
-        , viewNoticeBanner msgs state.statusNotice
-        , case state.authState of
-            AuthAuthenticated{} -> viewOrphanedDraftBanner msgs state state.orphanedDraft
-            _                   -> H.div_ [ HP.class_ "tt-slot-empty" ] []
+        ( [ viewErrorBanner msgs state.lastError
+          , viewNoticeBanner msgs state.statusNotice
+          , viewOfflineCacheBanner msgs state
+          ]
+            <> case state.authState of
+                AuthAuthenticated{} ->
+                    viewOrphanedDraftBanner msgs state state.orphanedDraft
+                        : map (viewSyncConflictBanner msgs state) (Map.elems state.syncConflicts)
+                _ -> []
+        )
+
+viewOfflineCacheBanner :: UiMessages -> ClientState -> View () () ClientState ClientAction
+viewOfflineCacheBanner msgs state
+    | state.isServingOfflineCache =
+        H.div_ [ HP.class_ "tt-banner tt-banner-info", HP.role_ "status" ]
+            [ H.span_ [ HP.class_ "tt-banner-text" ] [ text (ms msgs.offlineCacheBanner) ] ]
+    | otherwise =
+        H.div_ [ HP.class_ "tt-slot-empty" ] []
+
+viewSyncConflictBanner ::
+       UiMessages
+    -> ClientState
+    -> SyncConflict
+    -> View () () ClientState ClientAction
+viewSyncConflictBanner msgs state conflict =
+    H.div_ [ HP.class_ "tt-banner tt-banner-warn tt-conflict-banner", HP.role_ "alert" ]
+        [ H.span_ [ HP.class_ "tt-banner-text" ]
+            [ text (ms (msgs.conflictBannerPrefix <> displayTitle msgs conflict.localSave.title)) ]
+        , H.span_ [ HP.class_ "tt-conflict-meta" ]
+            [ text (ms (conflict.reason <> " (base r" <> toText conflict.localSave.baseRevision <> ")")) ]
+        , H.div_ [ HP.class_ "tt-banner-actions" ]
+            [ H.button_
+                ( [ HP.type_ "button"
+                  , HP.class_ "tt-btn tt-btn-primary tt-btn-xs"
+                  , HE.onClick (RecoverConflictAsNewDocument conflict.docId)
+                  ] <> disabledAttr (state.networkStatus == NetworkOffline || state.isCreatingDocument || state.isImportingDocument)
+                )
+                [ text (ms msgs.actionRecoverConflictAsNew) ]
+            , H.button_
+                [ HP.type_ "button"
+                , HP.class_ "tt-btn tt-btn-secondary tt-btn-xs"
+                , HE.onClick (ApplyConflictLocalCopy conflict.docId)
+                ]
+                [ text (ms msgs.actionApplyConflictLocal) ]
+            , H.button_
+                [ HP.type_ "button"
+                , HP.class_ "tt-btn tt-btn-ghost tt-btn-xs"
+                , HE.onClick (DismissSyncConflict conflict.docId)
+                ]
+                [ text (ms msgs.actionDismissConflict) ]
+            ]
         ]
 
 viewOrphanedDraftBanner ::
@@ -602,6 +687,7 @@ viewDocumentRow msgs state summary =
                         [ text (ms (formatDocumentFormat msgs summary.format)) ]
                   ]
                     <> draftIndicator
+                    <> syncRowBadges
                     <> folderBadge summary.folder
                     <> [ H.span_ [ HP.class_ "tt-doc-updated" ]
                             [ text (ms (formatUtcTimestamp summary.updatedAt)) ]
@@ -625,6 +711,15 @@ viewDocumentRow msgs state summary =
         | hasStoredDraft =
             [ H.span_ [ HP.class_ "tt-doc-draft-badge" ] [ text (ms msgs.badgeHasDraft) ] ]
         | otherwise = []
+
+    syncRowBadges :: [View () () ClientState ClientAction]
+    syncRowBadges =
+        [ H.span_ [ HP.class_ "tt-doc-sync-badge" ] [ text (ms msgs.badgePendingSync) ]
+        | Map.member summary.id state.pendingSaves
+        ] <>
+        [ H.span_ [ HP.class_ "tt-doc-conflict-badge" ] [ text (ms msgs.badgeSyncConflict) ]
+        | Map.member summary.id state.syncConflicts
+        ]
 
     rowClass :: Text
     rowClass = if isSelected then "tt-doc-item tt-doc-item-active" else "tt-doc-item"
@@ -846,7 +941,7 @@ viewEditorToolbar msgs state doc =
     isDirty = isCurrentDocumentDirty state
 
     isSaving :: Bool
-    isSaving = isJust state.savingDocument
+    isSaving = isJust state.savingDocument || state.syncingDocId == Just doc.id
 
     isBusy :: Bool
     isBusy = isJust state.mutatingDocumentId || isSaving

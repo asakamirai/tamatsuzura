@@ -1337,6 +1337,60 @@ body {
   gap: 0.5rem;
 }
 
+/* Offline / Sync status badges & conflict cards */
+.tt-badge-offline {
+  background: var(--tt-warn-bg);
+  color: var(--tt-warn-text);
+}
+
+.tt-badge-syncing {
+  background: var(--tt-primary-soft);
+  color: var(--tt-primary);
+}
+
+.tt-badge-pending {
+  background: var(--tt-warn-bg);
+  color: var(--tt-warn-text);
+}
+
+.tt-badge-conflict {
+  background: var(--tt-err-bg);
+  color: var(--tt-err-text);
+}
+
+.tt-doc-sync-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: var(--tt-primary-soft);
+  color: var(--tt-primary);
+}
+
+.tt-doc-conflict-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: var(--tt-err-bg);
+  color: var(--tt-err-text);
+}
+
+.tt-conflict-banner {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.tt-conflict-meta {
+  font-size: 0.82rem;
+  color: var(--tt-muted);
+}
+
 /* Desktop / Tablet Landscape (>= 900px) */
 @media (min-width: 900px) {
   .tt-app {

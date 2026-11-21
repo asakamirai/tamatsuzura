@@ -103,6 +103,8 @@ import           TamaTsuzura.Client.App
     , applyDocumentsResult
     , applyDraftStorageEvent
     , applyDraftsLoaded
+    , applyNetworkStatusChanged
+    , applyOfflineStoreLoaded
     , applyEditorEvent
     , applyExtensionById
     , applyExtensionCommand
@@ -201,6 +203,27 @@ import           TamaTsuzura.Client.I18n
     , formatValidationError
     , jaMessages
     )
+import           TamaTsuzura.Client.OfflineSync
+    ( CachedDocument(..)
+    , NetworkStatus(..)
+    , OfflineStore(..)
+    , PendingSyncSave(..)
+    , SyncConflict(..)
+    , SyncStatus(..)
+    , buildConflictRecoveryRequest
+    , buildSyncUpdateRequest
+    , computeSyncStatus
+    , decodeCachedDocumentListJson
+    , decodePendingSyncSaveListJson
+    , decodeSyncConflictListJson
+    , encodeCachedDocumentJson
+    , encodePendingSyncSaveJson
+    , encodeSyncConflictJson
+    , enqueuePendingSave
+    , filterCachedDocuments
+    , nextPendingSyncSave
+    , noopOfflineStore
+    )
 import           TamaTsuzura.Client.Markdown
     ( ListItem(..)
     , MarkdownBlock(..)
@@ -267,6 +290,7 @@ import           TamaTsuzura.Common.Document
     , mkRevisionNumber
     , mkTag
     , mkTagSet
+    , nextRevisionNumber
     , toDocumentSummary
     )
 import           TamaTsuzura.Common.Revision
@@ -2166,10 +2190,22 @@ spec = do
                     sampleUtcTime
 
                 sdLegacy :: StoredDraft
-                sdLegacy = (toStoredDraft aliceSession.user.id docLeg
-                    (withDraftBody (DocumentBody "旧未保存") (draftFromDocument docLeg))
-                    sampleLaterUtcTime)
-                    { ownerId = Nothing }
+                sdLegacy =
+                    let base :: StoredDraft
+                        base = toStoredDraft aliceSession.user.id docLeg
+                            (withDraftBody (DocumentBody "旧未保存") (draftFromDocument docLeg))
+                            sampleLaterUtcTime
+                    in  StoredDraft
+                            { docId         = base.docId
+                            , ownerId       = Nothing
+                            , titleInput    = base.titleInput
+                            , body          = base.body
+                            , format        = base.format
+                            , folderInput   = base.folderInput
+                            , tagsInput     = base.tagsInput
+                            , baseUpdatedAt = base.baseUpdatedAt
+                            , savedAt       = base.savedAt
+                            }
 
             (env, reqRef, cmdRef, _savedRef, deletedIdsRef, _exportsRef) <-
                 mkFullMockClientEnv
@@ -3120,6 +3156,406 @@ spec = do
             formatExtensionError jaMessages (ExtensionCommandFailed "boom")
                 `shouldBe` (jaMessages.errExtensionFailedPrefix <> " (boom)")
 
+    describe "TamaTsuzura.Client.OfflineSync pure logic and MVU offline sync orchestration" $ do
+        it "round-trips CachedDocument, PendingSyncSave, and SyncConflict JSON and preserves baseRevision on enqueue" $ do
+            uid <- mkSampleUserId "user-alice"
+            doc <- mkSampleDocument "doc-off-1" "オフラインメモ"
+            let rev1 :: RevisionNumber
+                rev1 = initialRevisionNumber
+
+                rev2 :: RevisionNumber
+                rev2 = nextRevisionNumber rev1
+
+                cached :: CachedDocument
+                cached = CachedDocument
+                    { ownerId  = uid
+                    , document = doc
+                    , cachedAt = sampleUtcTime
+                    }
+
+                pending1 :: PendingSyncSave
+                pending1 = PendingSyncSave
+                    { docId        = doc.id
+                    , ownerId      = uid
+                    , title        = doc.title
+                    , body         = DocumentBody "オフライン編集1"
+                    , format       = FormatMarkdown
+                    , folder       = Nothing
+                    , tags         = emptyTagSet
+                    , baseRevision = rev1
+                    , queuedAt     = sampleUtcTime
+                    }
+
+                pending2 :: PendingSyncSave
+                pending2 = PendingSyncSave
+                    { docId        = pending1.docId
+                    , ownerId      = pending1.ownerId
+                    , title        = pending1.title
+                    , body         = DocumentBody "オフライン編集2"
+                    , format       = pending1.format
+                    , folder       = pending1.folder
+                    , tags         = pending1.tags
+                    , baseRevision = rev2
+                    , queuedAt     = sampleLaterUtcTime
+                    }
+
+                conflict :: SyncConflict
+                conflict = SyncConflict
+                    { docId      = doc.id
+                    , ownerId    = uid
+                    , localSave  = pending1
+                    , detectedAt = sampleLaterUtcTime
+                    , reason     = jaMessages.errSyncConflictReason
+                    }
+
+            decodeCachedDocumentListJson ("{\"ok\":true,\"items\":[" <> encodeCachedDocumentJson cached <> "]}")
+                `shouldBe` Right [cached]
+            decodePendingSyncSaveListJson ("{\"ok\":true,\"items\":[" <> encodePendingSyncSaveJson pending1 <> "]}")
+                `shouldBe` Right [pending1]
+            decodeSyncConflictListJson ("{\"ok\":true,\"items\":[" <> encodeSyncConflictJson conflict <> "]}")
+                `shouldBe` Right [conflict]
+
+            -- Re-enqueuing the same docId updates content while preserving the original baseRevision
+            let queued :: Map.Map DocumentId PendingSyncSave
+                queued = enqueuePendingSave pending2 (enqueuePendingSave pending1 Map.empty)
+            fmap (.body) (Map.lookup doc.id queued) `shouldBe` Just (DocumentBody "オフライン編集2")
+            fmap (.baseRevision) (Map.lookup doc.id queued) `shouldBe` Just rev1
+            nextPendingSyncSave queued `shouldBe` Map.lookup doc.id queued
+
+            -- buildSyncUpdateRequest attaches base_revision for optimistic concurrency
+            let updReq :: UpdateDocumentRequest
+                updReq = buildSyncUpdateRequest pending1
+            updReq.baseRevision `shouldBe` Just rev1
+
+            -- buildConflictRecoveryRequest appends suffix safely
+            recReq <- expectRight (buildConflictRecoveryRequest jaMessages.conflictTitleSuffix conflict)
+            toText recReq.title `shouldBe` "オフラインメモ (競合退避)"
+            recReq.body `shouldBe` DocumentBody "オフライン編集1"
+
+            -- computeSyncStatus prioritizes conflict > syncing > pending > idle
+            computeSyncStatus Nothing Map.empty Map.empty `shouldBe` SyncIdle
+            computeSyncStatus Nothing queued Map.empty `shouldBe` SyncPending 1
+            computeSyncStatus (Just doc.id) queued Map.empty `shouldBe` SyncSyncing 1
+            computeSyncStatus (Just doc.id) queued (Map.singleton doc.id conflict) `shouldBe` SyncConflictDetected 1
+
+        it "filters cached documents by owner, status, folder, tag, and search query" $ do
+            aliceId <- mkSampleUserId "user-alice"
+            bobId   <- mkSampleUserId "user-bob"
+            workFp  <- expectRight (mkFolderPath "work")
+            subFp   <- expectRight (mkFolderPath "work/notes")
+            tagImp  <- expectRight (mkTag "重要")
+            docA    <- mkSampleDocument "doc-cache-a" "仕事メモ"
+            docB    <- mkSampleDocument "doc-cache-b" "他ユーザー文書"
+            let docAFull :: Document
+                docAFull = Document
+                    { id        = docA.id
+                    , title     = docA.title
+                    , body      = DocumentBody "オフライン検索対象キーワード"
+                    , format    = docA.format
+                    , folder    = Just subFp
+                    , tags      = expectPureTagSet tagImp
+                    , revision  = docA.revision
+                    , createdAt = docA.createdAt
+                    , updatedAt = sampleLaterUtcTime
+                    , deletedAt = docA.deletedAt
+                    }
+
+                cachedItems :: [CachedDocument]
+                cachedItems =
+                    [ CachedDocument aliceId docAFull sampleLaterUtcTime
+                    , CachedDocument bobId docB sampleUtcTime
+                    ]
+            map (.id) (filterCachedDocuments aliceId StatusActive "検索対象" (Just tagImp) (Just workFp) True cachedItems)
+                `shouldBe` [docA.id]
+            filterCachedDocuments aliceId StatusActive "" Nothing (Just workFp) False cachedItems
+                `shouldBe` []
+            map (.id) (filterCachedDocuments bobId StatusActive "" Nothing Nothing True cachedItems)
+                `shouldBe` [docB.id]
+
+        it "queues saves while offline, serves cached docs offline, and auto-syncs on reconnect" $ do
+            doc <- mkSampleDocument "doc-sync-ok" "同期テスト"
+            let syncedDoc :: Document
+                syncedDoc = Document
+                    { id        = doc.id
+                    , title     = doc.title
+                    , body      = DocumentBody "オフライン追記内容"
+                    , format    = doc.format
+                    , folder    = doc.folder
+                    , tags      = doc.tags
+                    , revision  = nextRevisionNumber doc.revision
+                    , createdAt = doc.createdAt
+                    , updatedAt = sampleLaterUtcTime
+                    , deletedAt = doc.deletedAt
+                    }
+            authBase <- mkAuthenticatedState
+            putPendingRef  <- newIORef []
+            delPendingRef  <- newIORef []
+            putCachedRef   <- newIORef []
+            (baseEnv, reqRef, _) <- mkMockClientEnv $ \ req ->
+                if req.method == MethodPut && req.url == "/api/documents/doc-sync-ok"
+                    then pure (Right (HttpResponse 200 (encodeStrict syncedDoc)))
+                    else if req.url == "/api/health"
+                        then pure (Right (HttpResponse 200 "{\"status\":\"ok\"}"))
+                        else if req.method == MethodGet && Txt.isPrefixOf "/api/documents" req.url
+                            then pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [toDocumentSummary syncedDoc] 1))))
+                            else if req.url == "/api/tags"
+                                then pure (Right (HttpResponse 200 "{\"tags\":[]}"))
+                                else if req.url == "/api/folders"
+                                    then pure (Right (HttpResponse 200 "{\"folders\":[]}"))
+                                    else pure (Left "unexpected request")
+            let env :: ClientEnv
+                env = baseEnv
+                    { offlineStore = noopOfflineStore
+                        { putPendingSave    = \ ps  -> modifyIORef' putPendingRef (\ xs -> xs <> [ps])
+                        , deletePendingSave = \ did -> modifyIORef' delPendingRef (\ xs -> xs <> [did])
+                        , putCachedDocument = \ cd  -> modifyIORef' putCachedRef (\ xs -> xs <> [cd])
+                        }
+                    }
+
+                offlineState :: ClientState
+                offlineState = authBase
+                    { networkStatus    = NetworkOffline
+                    , selectedDocument = Just doc
+                    , draft            = withDraftBody (DocumentBody "オフライン追記内容") (draftFromDocument doc)
+                    }
+
+            -- 1. Save while offline enqueues without making HTTP requests
+            (sQueued, actsOffline) <- runUpdateStep env SaveCurrentDocument offlineState
+            actsOffline `shouldBe` []
+            readIORef reqRef >>= (`shouldBe` [])
+            Map.member doc.id sQueued.pendingSaves `shouldBe` True
+            fmap (.revision) sQueued.selectedDocument `shouldBe` Just doc.revision
+            fmap (.body) sQueued.selectedDocument `shouldBe` Just (DocumentBody "オフライン追記内容")
+            sQueued.statusNotice `shouldBe` Just jaMessages.noticeSavedOffline
+            readIORef putPendingRef >>= (\ xs -> length xs `shouldBe` 1)
+            readIORef putCachedRef >>= (\ xs -> length xs `shouldBe` 1)
+
+            -- 2. Opening a cached document while offline succeeds from local cache without HTTP
+            let closedOffline :: ClientState
+                closedOffline = sQueued { selectedDocument = Nothing, draft = emptyEditorDraft }
+            (sReopened, actsReopen) <- runUpdateStep env (RequestOpenDocument doc.id) closedOffline
+            actsReopen `shouldBe` []
+            fmap (.body) sReopened.selectedDocument `shouldBe` Just (DocumentBody "オフライン追記内容")
+            sReopened.statusNotice `shouldBe` Just jaMessages.noticeOpenedFromCache
+
+            -- 3. Reconnecting triggers automatic sync with base_revision and clears queue
+            (sSynced, _) <- runActionQueue env [NetworkStatusChanged NetworkOnline] sQueued
+            sSynced.networkStatus `shouldBe` NetworkOnline
+            sSynced.pendingSaves `shouldBe` Map.empty
+            sSynced.syncConflicts `shouldBe` Map.empty
+            fmap (.revision) sSynced.selectedDocument `shouldBe` Just (nextRevisionNumber doc.revision)
+            readIORef delPendingRef >>= (`shouldBe` [doc.id])
+            reqs <- readIORef reqRef
+            let putReqs :: [HttpRequest]
+                putReqs = filter (\ r -> r.method == MethodPut) reqs
+            length putReqs `shouldBe` 1
+            case putReqs of
+                [putReq] -> case putReq.body of
+                    Just rawBody -> case Aeson.eitherDecodeStrict' rawBody :: Either String UpdateDocumentRequest of
+                        Right decoded -> decoded.baseRevision `shouldBe` Just doc.revision
+                        Left err      -> expectationFailure ("Failed to decode PUT body: " <> err)
+                    Nothing -> expectationFailure "Expected JSON body on sync PUT"
+                _ -> expectationFailure "Expected exactly one PUT request"
+
+        it "stashes 409 sync conflict safely without overwriting server and allows recovery as new document" $ do
+            doc <- mkSampleDocument "doc-sync-conflict" "競合文書"
+            recoveredDoc <- mkSampleDocument "doc-sync-recovered" "競合文書 (競合退避)"
+            authBase <- mkAuthenticatedState
+            putConflictRef <- newIORef []
+            delConflictRef <- newIORef []
+            (baseEnv, _, _) <- mkMockClientEnv $ \ req ->
+                if req.method == MethodPut && req.url == "/api/documents/doc-sync-conflict"
+                    then pure (Right (HttpResponse 409 "{\"error\":\"conflict\",\"message\":\"revision mismatch\"}"))
+                    else if req.method == MethodPost && req.url == "/api/documents"
+                        then pure (Right (HttpResponse 201 (encodeStrict recoveredDoc)))
+                        else if req.url == "/api/health"
+                            then pure (Right (HttpResponse 200 "{\"status\":\"ok\"}"))
+                            else if req.url == "/api/tags"
+                                then pure (Right (HttpResponse 200 "{\"tags\":[]}"))
+                                else if req.url == "/api/folders"
+                                    then pure (Right (HttpResponse 200 "{\"folders\":[]}"))
+                                    else pure (Left "unexpected request")
+            let env :: ClientEnv
+                env = baseEnv
+                    { offlineStore = noopOfflineStore
+                        { putSyncConflict    = \ sc  -> modifyIORef' putConflictRef (\ xs -> xs <> [sc])
+                        , deleteSyncConflict = \ did -> modifyIORef' delConflictRef (\ xs -> xs <> [did])
+                        }
+                    }
+
+                offlineState :: ClientState
+                offlineState = authBase
+                    { networkStatus    = NetworkOffline
+                    , selectedDocument = Just doc
+                    , draft            = withDraftBody (DocumentBody "ローカル競合本文") (draftFromDocument doc)
+                    }
+
+            -- Queue offline save, then reconnect into a 409 conflict
+            (sQueued, _) <- runUpdateStep env SaveCurrentDocument offlineState
+            (sConflicted, _) <- runActionQueue env [NetworkStatusChanged NetworkOnline] sQueued
+            sConflicted.pendingSaves `shouldBe` Map.empty
+            Map.member doc.id sConflicted.syncConflicts `shouldBe` True
+            readIORef putConflictRef >>= (\ xs -> length xs `shouldBe` 1)
+
+            -- Recover conflict as a new document clears the conflict record
+            (sRecovered, _) <- runActionQueue env [RecoverConflictAsNewDocument doc.id] sConflicted
+            sRecovered.syncConflicts `shouldBe` Map.empty
+            fmap (.id) sRecovered.selectedDocument `shouldBe` Just recoveredDoc.id
+            sRecovered.statusNotice `shouldBe` Just jaMessages.noticeConflictRecovered
+            readIORef delConflictRef >>= (`shouldBe` [doc.id])
+
+        it "isolates offline cache, pending saves, and sync conflicts across users" $ do
+            aliceId <- mkSampleUserId "user-alice"
+            bobId   <- mkSampleUserId "user-bob"
+            docA    <- mkSampleDocument "doc-iso-a" "Alice文書"
+            docB    <- mkSampleDocument "doc-iso-b" "Bob文書"
+            authAlice <- mkAuthenticatedState
+            let cachedAll :: [CachedDocument]
+                cachedAll =
+                    [ CachedDocument aliceId docA sampleUtcTime
+                    , CachedDocument bobId docB sampleUtcTime
+                    ]
+
+                pendingAll :: [PendingSyncSave]
+                pendingAll =
+                    [ PendingSyncSave docA.id aliceId docA.title docA.body docA.format Nothing emptyTagSet initialRevisionNumber sampleUtcTime
+                    , PendingSyncSave docB.id bobId docB.title docB.body docB.format Nothing emptyTagSet initialRevisionNumber sampleUtcTime
+                    ]
+
+                loaded :: ClientState
+                loaded = applyOfflineStoreLoaded (Right cachedAll) (Right pendingAll) (Right []) authAlice
+            Map.keys loaded.cachedDocuments `shouldBe` [docA.id]
+            Map.keys loaded.pendingSaves `shouldBe` [docA.id]
+
+            -- NetworkStatusChanged updates state cleanly
+            (applyNetworkStatusChanged NetworkOffline loaded).networkStatus `shouldBe` NetworkOffline
+
+        it "prevents self-409 on dirty SyncItemCompleted, blocks concurrent save during sync, and recovers NetworkOnline on HealthChecked" $ do
+            doc <- mkSampleDocument "doc-sync-edge" "エッジケース"
+            let rev2Doc :: Document
+                rev2Doc = Document
+                    { id        = doc.id
+                    , title     = doc.title
+                    , body      = DocumentBody "オフライン保存分"
+                    , format    = doc.format
+                    , folder    = doc.folder
+                    , tags      = doc.tags
+                    , revision  = nextRevisionNumber doc.revision
+                    , createdAt = doc.createdAt
+                    , updatedAt = sampleLaterUtcTime
+                    , deletedAt = doc.deletedAt
+                    }
+            authBase <- mkAuthenticatedState
+            (env, reqRef, _) <- mkMockClientEnv $ \ req ->
+                if req.method == MethodPut && req.url == "/api/documents/doc-sync-edge"
+                    then pure (Right (HttpResponse 200 (encodeStrict rev2Doc)))
+                    else if req.url == "/api/health"
+                        then pure (Right (HttpResponse 200 "{\"status\":\"ok\"}"))
+                        else if req.method == MethodGet && Txt.isPrefixOf "/api/documents" req.url
+                            then pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [toDocumentSummary rev2Doc] 1))))
+                            else if req.url == "/api/tags"
+                                then pure (Right (HttpResponse 200 "{\"tags\":[]}"))
+                                else if req.url == "/api/folders"
+                                    then pure (Right (HttpResponse 200 "{\"folders\":[]}"))
+                                    else pure (Left "unexpected request")
+
+            -- Queue offline save, then keep typing additional edits while syncing
+            let offlineState :: ClientState
+                offlineState = authBase
+                    { networkStatus    = NetworkOffline
+                    , selectedDocument = Just doc
+                    , draft            = withDraftBody (DocumentBody "オフライン保存分") (draftFromDocument doc)
+                    }
+            (sQueued, _) <- runUpdateStep env SaveCurrentDocument offlineState
+            let dirtyDuringSync :: ClientState
+                dirtyDuringSync = sQueued
+                    { networkStatus = NetworkOnline
+                    , syncingDocId  = Just doc.id
+                    , draft         = withDraftBody (DocumentBody "オフライン保存分 + 同期中の追記") sQueued.draft
+                    }
+
+            -- Concurrent SaveCurrentDocument is blocked while syncingDocId == Just doc.id
+            (sBlocked, actsBlocked) <- runUpdateStep env SaveCurrentDocument dirtyDuringSync
+            actsBlocked `shouldBe` []
+            sBlocked.savingDocument `shouldBe` Nothing
+
+            -- SyncItemCompleted updates selectedDocument.revision to r2 while keeping the extra draft edit
+            (sAfterSync, _) <- runUpdateStep env (SyncItemCompleted 1 doc.id (Right rev2Doc)) dirtyDuringSync
+            fmap (.revision) sAfterSync.selectedDocument `shouldBe` Just (nextRevisionNumber doc.revision)
+            sAfterSync.draft.body `shouldBe` DocumentBody "オフライン保存分 + 同期中の追記"
+
+            -- HealthChecked (Right _) recovers NetworkOnline and auto-syncs pending queue
+            writeIORef reqRef []
+            (sRecoveredNet, _) <- runActionQueue env [HealthChecked (Right healthOk)] sQueued
+            sRecoveredNet.networkStatus `shouldBe` NetworkOnline
+            sRecoveredNet.pendingSaves `shouldBe` Map.empty
+
+        it "fetches latest server revision on ApplyConflictLocalCopy, guards unsaved edits, and preserves error on ConnError cache fallback" $ do
+            doc <- mkSampleDocument "doc-conf-apply" "競合反映"
+            let serverLatest :: Document
+                serverLatest = Document
+                    { id        = doc.id
+                    , title     = doc.title
+                    , body      = DocumentBody "サーバ最新本文"
+                    , format    = doc.format
+                    , folder    = doc.folder
+                    , tags      = doc.tags
+                    , revision  = nextRevisionNumber doc.revision
+                    , createdAt = doc.createdAt
+                    , updatedAt = sampleLaterUtcTime
+                    , deletedAt = doc.deletedAt
+                    }
+            authBase <- mkAuthenticatedState
+            uid <- mkSampleUserId "user-alice"
+            (env, _, _) <- mkMockClientEnv $ \ req ->
+                if req.method == MethodGet && req.url == "/api/documents/doc-conf-apply"
+                    then pure (Right (HttpResponse 200 (encodeStrict serverLatest)))
+                    else pure (Left "unexpected request")
+
+            let conflict :: SyncConflict
+                conflict = SyncConflict
+                    { docId      = doc.id
+                    , ownerId    = uid
+                    , localSave  = PendingSyncSave doc.id uid doc.title (DocumentBody "退避ローカル本文") FormatMarkdown Nothing emptyTagSet doc.revision sampleUtcTime
+                    , detectedAt = sampleLaterUtcTime
+                    , reason     = jaMessages.errSyncConflictReason
+                    }
+
+                dirtyState :: ClientState
+                dirtyState = authBase
+                    { selectedDocument = Just doc
+                    , draft            = withDraftBody (DocumentBody "別の未保存編集") (draftFromDocument doc)
+                    , syncConflicts    = Map.singleton doc.id conflict
+                    }
+
+            -- Unsaved edits trigger pendingNavigation guard before applying conflict copy
+            (sGuarded, actsGuarded) <- runUpdateStep env (ApplyConflictLocalCopy doc.id) dirtyState
+            actsGuarded `shouldBe` []
+            sGuarded.pendingNavigation `shouldBe` Just (NavApplyConflictLocal doc.id)
+
+            -- Confirming discard fetches latest server revision r2 and loads local conflict body as dirty draft
+            (sApplied, _) <- runActionQueue env [ConfirmDiscardNavigation] sGuarded
+            fmap (.revision) sApplied.selectedDocument `shouldBe` Just (nextRevisionNumber doc.revision)
+            sApplied.draft.body `shouldBe` DocumentBody "退避ローカル本文"
+            isCurrentDocumentDirty sApplied `shouldBe` True
+
+            -- DismissSyncConflict clears the conflict record
+            (sDismissed, _) <- runUpdateStep env (DismissSyncConflict doc.id) sApplied
+            sDismissed.syncConflicts `shouldBe` Map.empty
+
+            -- Cache fallback preserves lastError when connectionStatus is ConnError
+            let errState :: ClientState
+                errState = authBase
+                    { connectionStatus = ConnError "サーバへ接続できませんでした (down)"
+                    , lastError        = Just "サーバへ接続できませんでした (down)"
+                    , cachedDocuments  = Map.singleton doc.id (CachedDocument uid doc sampleUtcTime)
+                    }
+
+                fallbackState :: ClientState
+                fallbackState = applyDocumentsResult jaMessages 0 (Left (ClientNetworkError "down")) errState
+            fallbackState.isServingOfflineCache `shouldBe` True
+            fallbackState.lastError `shouldBe` Just "サーバへ接続できませんでした (down)"
+
 recordingTransport ::
        IORef (Maybe HttpRequest)
     -> Either Text HttpResponse
@@ -3350,6 +3786,7 @@ mkFullMockClientEnv handler listDraftsIo pickFileIo = do
             , messages          = jaMessages
             , sendEditorCmd     = \ cmd -> modifyIORef' cmdRef (\ xs -> xs <> [cmd])
             , draftStorage      = storage
+            , offlineStore      = noopOfflineStore
             , fileTransfer      = transfer
             , getCurrentUtcTime = pure sampleLaterUtcTime
             }

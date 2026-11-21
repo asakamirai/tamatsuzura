@@ -65,6 +65,8 @@ module TamaTsuzura.Client.App
     , applyFoldersResult
     , applyDraftsLoaded
     , applyDraftStorageEvent
+    , applyOfflineStoreLoaded
+    , applyNetworkStatusChanged
     , applyDocumentLoaded
     , applyDocumentCreated
     , applyDocumentSaved
@@ -82,7 +84,7 @@ module TamaTsuzura.Client.App
     , mkClientComponent
     ) where
 
-import           Control.Monad                   (when)
+import           Control.Monad                   (unless, when)
 import           Control.Monad.State.Class       (get)
 import           Data.Either                     (fromRight)
 import           Data.Foldable                   (for_)
@@ -156,6 +158,23 @@ import           TamaTsuzura.Client.I18n
     , formatLoginApiError
     , formatRegisterApiError
     , formatValidationError
+    )
+import           TamaTsuzura.Client.OfflineSync
+    ( CachedDocument(..)
+    , NetworkStatus(..)
+    , OfflineStore(..)
+    , PendingSyncSave(..)
+    , SyncConflict(..)
+    , browserOfflineStore
+    , buildConflictRecoveryRequest
+    , buildSyncUpdateRequest
+    , enqueuePendingSave
+    , filterCachedDocuments
+    , isConflictError
+    , isNetworkError
+    , isNotFoundError
+    , networkStatusSub
+    , nextPendingSyncSave
     )
 import           TamaTsuzura.Common.Api
     ( CreateDocumentRequest(..)
@@ -244,6 +263,8 @@ data ClientEnv = ClientEnv
       -- ^ CodeMirror 6 ブリッジへのコマンド送出関数 (テスト時はモック注入可)
     , draftStorage      :: !DraftStorage
       -- ^ IndexedDB ドラフト自動退避クライアント (テスト時はインメモリ注入可)
+    , offlineStore      :: !OfflineStore
+      -- ^ IndexedDB オフライン文書キャッシュ・未同期保存キュー・競合退避ストア (テスト時はインメモリ注入可)
     , fileTransfer      :: !FileTransferClient
       -- ^ ローカルファイルのエクスポート・インポートクライアント (テスト時はモック注入可)
     , getCurrentUtcTime :: !(IO UTCTime)
@@ -258,6 +279,7 @@ defaultClientEnv client exts msgs = ClientEnv
     , messages          = msgs
     , sendEditorCmd     = dispatchEditorCommand
     , draftStorage      = browserDraftStorage
+    , offlineStore      = browserOfflineStore
     , fileTransfer      = browserFileTransferClient
     , getCurrentUtcTime = getCurrentTime
     }
@@ -366,6 +388,10 @@ data PendingNavigation
       -- ^ ローカルファイルから新規文書をインポートする
     | NavRecoverOrphanedDraft
       -- ^ 孤立ドラフトを新規文書として復元する
+    | NavApplyConflictLocal !DocumentId
+      -- ^ 競合退避されたローカル変更をエディタへ反映する
+    | NavRecoverConflictAsNew !DocumentId
+      -- ^ 競合退避されたローカル変更を別名の新規文書として保存する
     | NavLogout
       -- ^ 未保存変更を破棄してログアウトする
     deriving (Eq, Show)
@@ -623,6 +649,8 @@ defaultEnabledExtensions entries =
 data ClientState = ClientState
     { connectionStatus             :: !ConnectionStatus
       -- ^ API サーバの疎通状態
+    , networkStatus                :: !NetworkStatus
+      -- ^ ブラウザのネットワークオンライン / オフライン状態
     , authState                    :: !AuthState
       -- ^ 認証セッション状態 (確認中 / 未認証フォーム / 認証済み)
     , authSessionSeq               :: !Int
@@ -679,6 +707,16 @@ data ClientState = ClientState
       -- ^ サーバ側更新済みまたはゴミ箱内文書に残存する未適用ドラフト
     , orphanedDraft                :: !(Maybe StoredDraft)
       -- ^ サーバ側で 404 だった自動復元対象ドラフト (新規文書として救出可能)
+    , cachedDocuments              :: !(Map DocumentId CachedDocument)
+      -- ^ IndexedDB にキャッシュされている現在ログイン中ユーザーの文書 (文書 ID キー)
+    , pendingSaves                 :: !(Map DocumentId PendingSyncSave)
+      -- ^ オフライン中に保存された現在ログイン中ユーザーの未同期保存キュー (文書 ID キー)
+    , syncConflicts                :: !(Map DocumentId SyncConflict)
+      -- ^ 409 競合等でサーバを上書きせず安全退避されたローカル変更 (文書 ID キー)
+    , syncingDocId                 :: !(Maybe DocumentId)
+      -- ^ 現在バックグラウンド同期 PUT 実行中の文書 ID
+    , isServingOfflineCache        :: !Bool
+      -- ^ 現在の文書一覧がオフラインキャッシュから表示されているか
     , editorSyncVersion            :: !Int
       -- ^ CodeMirror 6 へ外部変更を同期するたびにインクリメントされるバージョン番号
     , editorStats                  :: !EditorStats
@@ -885,6 +923,24 @@ data ClientAction
       -- ^ 過去リビジョンへの復元を確定実行する (@POST /api/documents/{id}/revisions/{revision}/restore@)
     | RevisionRestored !Int !DocumentId !(Either ApiClientError Document)
       -- ^ 過去リビジョン復元の結果受信 (認証世代, 文書 ID, 結果)
+    | NetworkStatusChanged !NetworkStatus
+      -- ^ ブラウザのオンライン / オフライン状態変化通知
+    | OfflineStoreLoaded !Int !(Either Text [CachedDocument]) !(Either Text [PendingSyncSave]) !(Either Text [SyncConflict])
+      -- ^ IndexedDB オフラインキャッシュ・未同期保存キュー・競合退避レコードの読み込み結果 (認証世代, 各結果)
+    | TriggerSyncQueue
+      -- ^ 未同期保存キューの同期を手動または自動で開始する
+    | SyncItemCompleted !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ 未同期保存キュー 1 件分の @PUT /api/documents/{id}@ 結果受信 (認証世代, 文書 ID, 結果)
+    | ApplyConflictLocalCopy !DocumentId
+      -- ^ 競合退避されたローカル変更をエディタへ反映して確認・編集する
+    | ConflictLocalApplyLoaded !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ 競合退避反映前の最新サーバ文書取得応答 (認証世代, 文書 ID, 結果)
+    | RecoverConflictAsNewDocument !DocumentId
+      -- ^ 競合退避されたローカル変更を別名の新規文書としてサーバへ保存する
+    | ConflictRecoveredAsNew !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ 競合退避からの別文書作成応答 (認証世代, 元文書 ID, 結果)
+    | DismissSyncConflict !DocumentId
+      -- ^ 競合退避レコードをローカルから破棄する
     | DismissError
       -- ^ 表示中のエラーバナーを閉じる
     | DismissNotice
@@ -898,6 +954,7 @@ initialClientState exts =
         catalog = map toCatalogEntry exts
     in  ClientState
             { connectionStatus             = ConnChecking
+            , networkStatus                = NetworkOnline
             , authState                    = AuthChecking
             , authSessionSeq               = 0
             , isLoggingOut                 = False
@@ -926,6 +983,11 @@ initialClientState exts =
             , restoredDraftDocId           = Nothing
             , staleDraftPrompt             = Nothing
             , orphanedDraft                = Nothing
+            , cachedDocuments              = Map.empty
+            , pendingSaves                 = Map.empty
+            , syncConflicts                = Map.empty
+            , syncingDocId                 = Nothing
+            , isServingOfflineCache        = False
             , editorSyncVersion            = 0
             , editorStats                  = emptyEditorStats
             , canUndo                      = False
@@ -987,6 +1049,11 @@ resetWorkspaceForUnauthenticated nextForm mErr mNotice state = state
     , restoredDraftDocId           = Nothing
     , staleDraftPrompt             = Nothing
     , orphanedDraft                = Nothing
+    , cachedDocuments              = Map.empty
+    , pendingSaves                 = Map.empty
+    , syncConflicts                = Map.empty
+    , syncingDocId                 = Nothing
+    , isServingOfflineCache        = False
     , editorSyncVersion            = state.editorSyncVersion + 1
     , editorStats                  = emptyEditorStats
     , canUndo                      = False
@@ -1301,7 +1368,10 @@ applyHealthResult ::
     -> ClientState
     -> ClientState
 applyHealthResult _ (Right _health) state =
-    state { connectionStatus = ConnOnline }
+    state
+        { connectionStatus = ConnOnline
+        , networkStatus    = NetworkOnline
+        }
 applyHealthResult msgs (Left err) state =
     let formatted :: Text
         formatted = formatApiClientError msgs err
@@ -1327,16 +1397,42 @@ applyDocumentsResult msgs reqSeq result state
                     ConnError{} -> state.lastError
                     _           -> Nothing
             in  state
-                    { documentSummaries  = res.documents
-                    , totalDocuments     = res.total
-                    , isLoadingDocuments = False
-                    , lastError          = nextError
+                    { documentSummaries     = res.documents
+                    , totalDocuments        = res.total
+                    , isLoadingDocuments    = False
+                    , isServingOfflineCache = False
+                    , lastError             = nextError
                     }
-        Left err ->
-            state
-                { isLoadingDocuments = False
-                , lastError          = Just (formatApiClientError msgs err)
-                }
+        Left err
+            | isNetworkError err, Just uid <- currentUserId state, not (Map.null state.cachedDocuments) ->
+                let cachedSummaries :: [DocumentSummary]
+                    cachedSummaries = filterCachedDocuments
+                        uid
+                        state.filterState.status
+                        state.filterState.searchInput
+                        state.filterState.selectedTag
+                        state.filterState.selectedFolder
+                        state.filterState.includeSubfolders
+                        (Map.elems state.cachedDocuments)
+
+                    nextError :: Maybe Text
+                    nextError = case state.connectionStatus of
+                        ConnError{} -> state.lastError
+                        _
+                            | state.networkStatus == NetworkOffline -> Nothing
+                            | otherwise                             -> Just (formatApiClientError msgs err)
+                in  state
+                        { documentSummaries     = cachedSummaries
+                        , totalDocuments        = length cachedSummaries
+                        , isLoadingDocuments    = False
+                        , isServingOfflineCache = True
+                        , lastError             = nextError
+                        }
+            | otherwise ->
+                state
+                    { isLoadingDocuments = False
+                    , lastError          = Just (formatApiClientError msgs err)
+                    }
 
 -- | タグ一覧応答を反映する。失敗時は一覧表示を阻害しないよう既存タグを維持する。
 applyTagsResult :: Either ApiClientError TagListResponse -> ClientState -> ClientState
@@ -1415,6 +1511,43 @@ applyDraftStorageEvent evt state = case state.authState of
                     then state { draftSyncState = DraftSyncFailed errMsg }
                     else state
     _ -> state
+
+-- | IndexedDB のオフラインキャッシュ・未同期保存キュー・競合退避レコードの読み込み結果を状態へ純粋に反映する。
+-- マルチユーザー分離を保証するため、現在認証済みユーザー ('currentUserId') と 'ownerId' が一致するレコードのみを採用する。
+applyOfflineStoreLoaded ::
+       Either Text [CachedDocument]
+    -> Either Text [PendingSyncSave]
+    -> Either Text [SyncConflict]
+    -> ClientState
+    -> ClientState
+applyOfflineStoreLoaded eCached ePending eConflicts state = case currentUserId state of
+    Nothing  -> state
+    Just uid ->
+        let loadedCached :: Map DocumentId CachedDocument
+            loadedCached = case eCached of
+                Left _   -> Map.empty
+                Right xs -> Map.fromList [ (cd.document.id, cd) | cd <- xs, cd.ownerId == uid ]
+
+            loadedPending :: Map DocumentId PendingSyncSave
+            loadedPending = case ePending of
+                Left _   -> Map.empty
+                Right xs -> Map.fromList [ (ps.docId, ps) | ps <- xs, ps.ownerId == uid ]
+
+            loadedConflicts :: Map DocumentId SyncConflict
+            loadedConflicts = case eConflicts of
+                Left _   -> Map.empty
+                Right xs -> Map.fromList [ (sc.docId, sc) | sc <- xs, sc.ownerId == uid ]
+        in  state
+                { cachedDocuments = Map.union state.cachedDocuments loadedCached
+                , pendingSaves    = Map.union state.pendingSaves loadedPending
+                , syncConflicts   = Map.union state.syncConflicts loadedConflicts
+                }
+
+-- | ブラウザのオンライン / オフライン状態変化を状態へ純粋に反映する。
+applyNetworkStatusChanged :: NetworkStatus -> ClientState -> ClientState
+applyNetworkStatusChanged nextStatus state = state
+    { networkStatus = nextStatus
+    }
 
 -- | 単一文書取得応答を反映する。より新しい選択要求が発生済みの古い応答は無視する。
 -- ローカル IndexedDB に未保存ドラフトが存在する場合は 'reconcileDocumentWithDraft' に従って復元または警告提示する。
@@ -2007,8 +2140,14 @@ updateClient env action = case action of
             AuthUnauthenticated form
                 | form.isSubmitting -> pure ()
                 | otherwise         -> triggerSessionBootstrap
-    HealthChecked eHealth ->
+    HealthChecked eHealth -> do
         modify (applyHealthResult env.messages eHealth)
+        case eHealth of
+            Right _ -> do
+                st <- get
+                when (isJust (currentAuthSession st) && not (Map.null st.pendingSaves))
+                    triggerSyncNext
+            Left _ -> pure ()
     AuthSessionChecked seqNo eSession -> do
         stBefore <- get
         when (seqNo == stBefore.authSessionSeq) $ do
@@ -2155,15 +2294,26 @@ updateClient env action = case action of
     DocumentLoaded seqNo docId eDoc ->
         guardAuthResponse seqNo eDoc $ do
             stBefore <- get
-            let shouldCleanRedundant :: Bool
-                shouldCleanRedundant = case eDoc of
-                    Right doc
-                        | stBefore.openingDocumentId == Just docId ->
-                            reconcileDocumentWithDraft doc (Map.lookup doc.id stBefore.storedDrafts) == RedundantLocalDraft
-                    _ -> False
-            modify (applyDocumentLoaded env.messages docId eDoc)
-            when shouldCleanRedundant (io_ (env.draftStorage.deleteStoredDraft docId))
-            syncEditorFromCurrentState False
+            case eDoc of
+                Right doc -> do
+                    let shouldCleanRedundant :: Bool
+                        shouldCleanRedundant =
+                            stBefore.openingDocumentId == Just docId
+                                && reconcileDocumentWithDraft doc (Map.lookup doc.id stBefore.storedDrafts) == RedundantLocalDraft
+                    modify (applyDocumentLoaded env.messages docId (Right doc))
+                    cacheDocumentLocally doc
+                    when shouldCleanRedundant (io_ (env.draftStorage.deleteStoredDraft docId))
+                    syncEditorFromCurrentState False
+                Left err
+                    | isNetworkError err, Just cached <- Map.lookup docId stBefore.cachedDocuments -> do
+                        modify $ \ s ->
+                            (applyDocumentLoaded env.messages docId (Right cached.document) s)
+                                { statusNotice = Just env.messages.noticeOpenedFromCache
+                                }
+                        syncEditorFromCurrentState False
+                    | otherwise -> do
+                        modify (applyDocumentLoaded env.messages docId (Left err))
+                        syncEditorFromCurrentState False
     RequestCreateDocument -> do
         st <- get
         if isNothing (currentAuthSession st) || st.isCreatingDocument || st.isImportingDocument
@@ -2186,7 +2336,8 @@ updateClient env action = case action of
                         _                          -> base
             syncEditorFromCurrentState False
             case eDoc of
-                Right _ -> do
+                Right doc -> do
+                    cacheDocumentLocally doc
                     when shouldReloadList reloadDocumentsForCurrentFilter
                     io (TagsLoaded seqNo <$> listTags env.apiClient)
                     io (FoldersLoaded seqNo <$> listFolders env.apiClient)
@@ -2206,6 +2357,8 @@ updateClient env action = case action of
             shouldRevertDraft = case st.pendingNavigation of
                 Just NavImportDocument       -> True
                 Just NavRecoverOrphanedDraft -> True
+                Just NavApplyConflictLocal{} -> True
+                Just NavRecoverConflictAsNew{} -> True
                 Just NavLogout               -> True
                 _                            -> False
         modify $ \ s ->
@@ -2270,9 +2423,15 @@ updateClient env action = case action of
         triggerSaveCurrentDocument
     DocumentSaved seqNo docId eDoc ->
         guardAuthResponse seqNo eDoc $ do
-            modify (applyDocumentSaved env.messages docId eDoc)
+            stBefore <- get
             case eDoc of
                 Right doc -> do
+                    modify $ \ s ->
+                        (applyDocumentSaved env.messages docId (Right doc) s)
+                            { pendingSaves = Map.delete doc.id s.pendingSaves
+                            }
+                    cacheDocumentLocally doc
+                    io_ (env.offlineStore.deletePendingSave doc.id)
                     stAfter <- get
                     if fmap (.id) stAfter.selectedDocument == Just doc.id && isDraftDirty doc stAfter.draft
                         then syncLocalDraftForCurrentState
@@ -2281,7 +2440,18 @@ updateClient env action = case action of
                         loadRevisionListForDocument doc.id False
                     io (TagsLoaded seqNo <$> listTags env.apiClient)
                     io (FoldersLoaded seqNo <$> listFolders env.apiClient)
-                Left _ -> pure ()
+                Left err
+                    | isNetworkError err, Just (inFlightId, sentDraft) <- stBefore.savingDocument, inFlightId == docId -> do
+                        modify $ \ s -> s
+                            { savingDocument = Nothing
+                            , networkStatus  = NetworkOffline
+                            }
+                        queueOfflineDraftSave docId sentDraft
+                    | isConflictError err, Just (inFlightId, sentDraft) <- stBefore.savingDocument, inFlightId == docId -> do
+                        modify (\ s -> s { savingDocument = Nothing, lastError = Nothing })
+                        stashSaveConflictFromDraft docId sentDraft env.messages.errSyncConflictReason
+                    | otherwise ->
+                        modify (applyDocumentSaved env.messages docId (Left err))
     EditorUndoClicked ->
         io_ (env.sendEditorCmd CmdUndo)
     EditorRedoClicked ->
@@ -2345,7 +2515,8 @@ updateClient env action = case action of
             Just session
                 | isNothing st.mutatingDocumentId
                     && isNothing st.savingDocument
-                    && isNothing st.restoringRevisionDoc -> do
+                    && isNothing st.restoringRevisionDoc
+                    && st.syncingDocId /= Just docId -> do
                     modify $ \ s -> s
                         { mutatingDocumentId = Just docId
                         , lastError          = Nothing
@@ -2359,7 +2530,10 @@ updateClient env action = case action of
                 wasSelected = fmap (.id) stBefore.selectedDocument == Just docId
             modify (applyDocumentSoftDeleted env.messages docId eDoc)
             case eDoc of
-                Right _ -> do
+                Right doc -> do
+                    cacheDocumentLocally doc
+                    modify (\ s -> s { pendingSaves = Map.delete docId s.pendingSaves })
+                    io_ (env.offlineStore.deletePendingSave docId)
                     io_ (env.draftStorage.deleteStoredDraft docId)
                     when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
                     io (TagsLoaded seqNo <$> listTags env.apiClient)
@@ -2381,7 +2555,8 @@ updateClient env action = case action of
             modify (applyDocumentRestored env.messages docId eDoc)
             syncEditorFromCurrentState False
             case eDoc of
-                Right _ -> do
+                Right doc -> do
+                    cacheDocumentLocally doc
                     io (TagsLoaded seqNo <$> listTags env.apiClient)
                     io (FoldersLoaded seqNo <$> listFolders env.apiClient)
                 Left _ -> pure ()
@@ -2408,6 +2583,14 @@ updateClient env action = case action of
             modify (applyDocumentPermanentlyDeleted env.messages docId eUnit)
             case eUnit of
                 Right () -> do
+                    modify $ \ s -> s
+                        { cachedDocuments = Map.delete docId s.cachedDocuments
+                        , pendingSaves    = Map.delete docId s.pendingSaves
+                        , syncConflicts   = Map.delete docId s.syncConflicts
+                        }
+                    io_ (env.offlineStore.deleteCachedDocument docId)
+                    io_ (env.offlineStore.deletePendingSave docId)
+                    io_ (env.offlineStore.deleteSyncConflict docId)
                     io_ (env.draftStorage.deleteStoredDraft docId)
                     when wasSelected (io_ (env.sendEditorCmd CmdResetEditor))
                 Left _ -> pure ()
@@ -2697,7 +2880,8 @@ updateClient env action = case action of
                         Left _ -> base
             syncEditorFromCurrentState False
             case eDoc of
-                Right _ -> do
+                Right doc -> do
+                    cacheDocumentLocally doc
                     when shouldReloadList reloadDocumentsForCurrentFilter
                     io (TagsLoaded seqNo <$> listTags env.apiClient)
                     io (FoldersLoaded seqNo <$> listFolders env.apiClient)
@@ -2783,6 +2967,7 @@ updateClient env action = case action of
                     && isNothing st.restoringRevisionDoc
                     && isNothing st.mutatingDocumentId
                     && isNothing st.savingDocument
+                    && st.syncingDocId /= Just doc.id
                     && revNo /= doc.revision ->
                     modify $ \ s -> s
                         { revisionHistory = s.revisionHistory { confirmRestoreRev = Just revNo }
@@ -2799,7 +2984,8 @@ updateClient env action = case action of
                 | not (isTrashed doc)
                     && isNothing st.restoringRevisionDoc
                     && isNothing st.mutatingDocumentId
-                    && isNothing st.savingDocument -> do
+                    && isNothing st.savingDocument
+                    && st.syncingDocId /= Just doc.id -> do
                     let req :: RestoreRevisionRequest
                         req = RestoreRevisionRequest
                             { baseRevision = Just doc.revision
@@ -2819,6 +3005,7 @@ updateClient env action = case action of
                 modify (applyRevisionRestored env.messages docId eDoc)
                 case eDoc of
                     Right doc -> do
+                        cacheDocumentLocally doc
                         io_ (env.draftStorage.deleteStoredDraft doc.id)
                         stAfter <- get
                         when (fmap (.id) stAfter.selectedDocument == Just doc.id) $ do
@@ -2826,6 +3013,191 @@ updateClient env action = case action of
                             when (stAfter.revisionHistory.isHistoryOpen && stAfter.revisionHistory.documentId == Just doc.id) $
                                 loadRevisionListForDocument doc.id False
                     Left _ -> pure ()
+    NetworkStatusChanged nextStatus -> do
+        modify (applyNetworkStatusChanged nextStatus)
+        case nextStatus of
+            NetworkOffline -> pure ()
+            NetworkOnline -> do
+                io (HealthChecked <$> fetchHealth env.apiClient)
+                st <- get
+                when (isJust (currentAuthSession st) && not (Map.null st.pendingSaves))
+                    triggerSyncNext
+    OfflineStoreLoaded seqNo eCached ePending eConflicts -> do
+        st <- get
+        when (seqNo == st.authSessionSeq && isJust (currentAuthSession st)) $ do
+            modify (applyOfflineStoreLoaded eCached ePending eConflicts)
+            stAfter <- get
+            when (stAfter.networkStatus == NetworkOnline && not (Map.null stAfter.pendingSaves))
+                triggerSyncNext
+    TriggerSyncQueue ->
+        triggerSyncNext
+    SyncItemCompleted seqNo docId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            when (stBefore.syncingDocId == Just docId) $ case eDoc of
+                Right doc -> do
+                    let isSameSelected :: Bool
+                        isSameSelected = fmap (.id) stBefore.selectedDocument == Just doc.id
+
+                        sentDraft :: EditorDraft
+                        sentDraft = case Map.lookup doc.id stBefore.pendingSaves of
+                            Just ps -> draftFromPendingSave ps
+                            Nothing -> draftFromDocument doc
+
+                        mergedDraft :: EditorDraft
+                        mergedDraft =
+                            if isSameSelected
+                                then mergeDraftAfterSave sentDraft (draftFromDocument doc) stBefore.draft
+                                else stBefore.draft
+
+                        stillDirty :: Bool
+                        stillDirty = isSameSelected && isDraftDirty doc mergedDraft
+                    modify $ \ s ->
+                        let nextPending :: Map DocumentId PendingSyncSave
+                            nextPending = Map.delete doc.id s.pendingSaves
+
+                            summary :: DocumentSummary
+                            summary = toDocumentSummary doc
+
+                            nextSummaries :: [DocumentSummary]
+                            nextSummaries = case s.filterState.status of
+                                StatusTrashed -> s.documentSummaries
+                                _             ->
+                                    if any (\ item -> item.id == doc.id) s.documentSummaries
+                                        then summary : filter (\ item -> item.id /= doc.id) s.documentSummaries
+                                        else s.documentSummaries
+                        in  s
+                                { syncingDocId       = Nothing
+                                , pendingSaves       = nextPending
+                                , documentSummaries  = nextSummaries
+                                , selectedDocument   = if isSameSelected then Just doc else s.selectedDocument
+                                , draft              = mergedDraft
+                                , editorSyncVersion  = if isSameSelected && not stillDirty then s.editorSyncVersion + 1 else s.editorSyncVersion
+                                , editorStats        = if isSameSelected && not stillDirty then computeTextStats (toText doc.body) else s.editorStats
+                                , connectionStatus   = ConnOnline
+                                , networkStatus      = NetworkOnline
+                                , lastError          = Nothing
+                                , statusNotice       = if Map.null nextPending then Just env.messages.noticeSyncCompleted else s.statusNotice
+                                }
+                    cacheDocumentLocally doc
+                    io_ (env.offlineStore.deletePendingSave doc.id)
+                    when isSameSelected $
+                        if stillDirty
+                            then syncLocalDraftForCurrentState
+                            else syncEditorFromCurrentState False
+                    stAfter <- get
+                    if Map.null stAfter.pendingSaves
+                        then do
+                            reloadDocumentsForCurrentFilter
+                            io (TagsLoaded seqNo <$> listTags env.apiClient)
+                            io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                        else triggerSyncNext
+                Left err
+                    | isNetworkError err ->
+                        modify $ \ s -> s
+                            { syncingDocId  = Nothing
+                            , networkStatus = NetworkOffline
+                            }
+                    | isConflictError err || isNotFoundError err -> do
+                        let reasonText :: Text
+                            reasonText =
+                                if isNotFoundError err
+                                    then env.messages.errSyncNotFoundReason
+                                    else env.messages.errSyncConflictReason
+                        case Map.lookup docId stBefore.pendingSaves of
+                            Nothing ->
+                                modify (\ s -> s { syncingDocId = Nothing })
+                            Just pendingItem -> do
+                                let provisionalConflict :: SyncConflict
+                                    provisionalConflict = SyncConflict
+                                        { docId      = docId
+                                        , ownerId    = pendingItem.ownerId
+                                        , localSave  = pendingItem
+                                        , detectedAt = pendingItem.queuedAt
+                                        , reason     = reasonText
+                                        }
+                                modify $ \ s -> s
+                                    { syncingDocId  = Nothing
+                                    , pendingSaves  = Map.delete docId s.pendingSaves
+                                    , syncConflicts = Map.insert docId provisionalConflict s.syncConflicts
+                                    , lastError     = Nothing
+                                    }
+                                io_ $ do
+                                    now <- env.getCurrentUtcTime
+                                    env.offlineStore.deletePendingSave docId
+                                    env.offlineStore.putSyncConflict provisionalConflict { detectedAt = now }
+                        stAfter <- get
+                        if Map.null stAfter.pendingSaves
+                            then reloadDocumentsForCurrentFilter
+                            else triggerSyncNext
+                    | otherwise ->
+                        modify $ \ s -> s
+                            { syncingDocId = Nothing
+                            , lastError    = Just (formatApiClientError env.messages err)
+                            }
+    ApplyConflictLocalCopy docId -> do
+        st <- get
+        case (currentAuthSession st, Map.lookup docId st.syncConflicts) of
+            (Just _, Just _) ->
+                if isCurrentDocumentDirty st
+                    then modify (\ s -> s { pendingNavigation = Just (NavApplyConflictLocal docId) })
+                    else executeNavigation (NavApplyConflictLocal docId)
+            _ -> pure ()
+    ConflictLocalApplyLoaded seqNo docId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            st <- get
+            case Map.lookup docId st.syncConflicts of
+                Nothing -> pure ()
+                Just conflict -> case eDoc of
+                    Right serverDoc -> do
+                        cacheDocumentLocally serverDoc
+                        applyConflictToEditor serverDoc conflict
+                    Left _ ->
+                        case fmap (.document) (Map.lookup docId st.cachedDocuments) of
+                            Just cachedDoc -> applyConflictToEditor cachedDoc conflict
+                            Nothing        -> pure ()
+    RecoverConflictAsNewDocument docId -> do
+        st <- get
+        case (currentAuthSession st, Map.lookup docId st.syncConflicts) of
+            (Just _, Just _)
+                | not st.isCreatingDocument && not st.isImportingDocument ->
+                    if isCurrentDocumentDirty st
+                        then modify (\ s -> s { pendingNavigation = Just (NavRecoverConflictAsNew docId) })
+                        else executeNavigation (NavRecoverConflictAsNew docId)
+            _ -> pure ()
+    ConflictRecoveredAsNew seqNo oldDocId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            let shouldReloadList :: Bool
+                shouldReloadList = stBefore.pendingListReloadAfterCreate
+            modify $ \ s ->
+                let base :: ClientState
+                    base = (applyDocumentCreated env.messages eDoc s)
+                        { pendingListReloadAfterCreate = False
+                        }
+                in  case eDoc of
+                        Right _ -> base
+                            { syncConflicts = Map.delete oldDocId base.syncConflicts
+                            , filterState   = if shouldReloadList then defaultFilterState else base.filterState
+                            , statusNotice  = Just env.messages.noticeConflictRecovered
+                            }
+                        Left _ -> base
+            syncEditorFromCurrentState False
+            case eDoc of
+                Right doc -> do
+                    cacheDocumentLocally doc
+                    io_ (env.offlineStore.deleteSyncConflict oldDocId)
+                    when shouldReloadList reloadDocumentsForCurrentFilter
+                    io (TagsLoaded seqNo <$> listTags env.apiClient)
+                    io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                    io_ (env.sendEditorCmd CmdFocus)
+                Left _ -> pure ()
+    DismissSyncConflict docId -> do
+        modify $ \ s -> s
+            { syncConflicts = Map.delete docId s.syncConflicts
+            , statusNotice  = Just env.messages.noticeConflictDismissed
+            }
+        io_ (env.offlineStore.deleteSyncConflict docId)
     DismissError ->
         modify dismissError
     DismissNotice ->
@@ -2842,6 +3214,9 @@ updateClient env action = case action of
             , authSessionSeq   = nextAuthSeq
             , lastError        = Nothing
             }
+        io $ do
+            online <- env.offlineStore.isBrowserOnline
+            pure (NetworkStatusChanged (if online then NetworkOnline else NetworkOffline))
         io (HealthChecked <$> fetchHealth env.apiClient)
         io (AuthSessionChecked nextAuthSeq <$> getCurrentUser env.apiClient)
 
@@ -2864,6 +3239,10 @@ updateClient env action = case action of
                 io (TagsLoaded authSeq <$> listTags env.apiClient)
                 io (FoldersLoaded authSeq <$> listFolders env.apiClient)
                 io (DraftsLoaded authSeq <$> env.draftStorage.listStoredDrafts)
+                io $ do
+                    eCached  <- env.offlineStore.listCachedDocuments
+                    ePending <- env.offlineStore.listPendingSaves
+                    OfflineStoreLoaded authSeq eCached ePending <$> env.offlineStore.listSyncConflicts
 
     triggerRefreshWorkspace :: Effect () () ClientState ClientAction
     triggerRefreshWorkspace = do
@@ -2951,14 +3330,26 @@ updateClient env action = case action of
     executeNavigation nav = case nav of
         NavOpenDocument docId -> do
             st <- get
-            when (isJust (currentAuthSession st)) $ do
-                modify $ \ s -> s
-                    { openingDocumentId  = Just docId
-                    , autoOpeningDraftId = Nothing
-                    , mobilePane         = PaneEditor
-                    , lastError          = Nothing
-                    }
-                io (DocumentLoaded st.authSessionSeq docId <$> getDocument env.apiClient docId)
+            when (isJust (currentAuthSession st)) $
+                case (st.networkStatus, Map.lookup docId st.cachedDocuments) of
+                    (NetworkOffline, Just cached) -> do
+                        modify $ \ s ->
+                            let opened :: ClientState
+                                opened = applyDocumentLoaded
+                                    env.messages
+                                    docId
+                                    (Right cached.document)
+                                    (s { openingDocumentId = Just docId, autoOpeningDraftId = Nothing })
+                            in  opened { statusNotice = Just env.messages.noticeOpenedFromCache }
+                        syncEditorFromCurrentState False
+                    _ -> do
+                        modify $ \ s -> s
+                            { openingDocumentId  = Just docId
+                            , autoOpeningDraftId = Nothing
+                            , mobilePane         = PaneEditor
+                            , lastError          = Nothing
+                            }
+                        io (DocumentLoaded st.authSessionSeq docId <$> getDocument env.apiClient docId)
         NavCreateDocument -> do
             st <- get
             case currentAuthSession st of
@@ -3034,6 +3425,38 @@ updateClient env action = case action of
                                     }
                                 io (OrphanDraftRecovered st.authSessionSeq sd.docId <$> createDocument env.apiClient session.csrfToken createReq)
                 _ -> pure ()
+        NavApplyConflictLocal docId -> do
+            st <- get
+            case (currentAuthSession st, Map.lookup docId st.syncConflicts) of
+                (Just _, Just conflict) ->
+                    if st.networkStatus == NetworkOnline
+                        then io (ConflictLocalApplyLoaded st.authSessionSeq docId <$> getDocument env.apiClient docId)
+                        else case fmap (.document) (Map.lookup docId st.cachedDocuments) of
+                            Just cachedDoc -> applyConflictToEditor cachedDoc conflict
+                            Nothing ->
+                                case st.selectedDocument of
+                                    Just selDoc | selDoc.id == docId -> applyConflictToEditor selDoc conflict
+                                    _                                -> pure ()
+                _ -> pure ()
+        NavRecoverConflictAsNew docId -> do
+            st <- get
+            case (currentAuthSession st, Map.lookup docId st.syncConflicts) of
+                (Just session, Just conflict)
+                    | not st.isCreatingDocument && not st.isImportingDocument ->
+                        case buildConflictRecoveryRequest env.messages.conflictTitleSuffix conflict of
+                            Left vErr ->
+                                modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
+                            Right createReq -> do
+                                let fromTrash :: Bool
+                                    fromTrash = st.filterState.status == StatusTrashed
+                                modify $ \ s -> s
+                                    { isCreatingDocument           = True
+                                    , pendingListReloadAfterCreate = fromTrash
+                                    , lastError                    = Nothing
+                                    , statusNotice                 = Nothing
+                                    }
+                                io (ConflictRecoveredAsNew st.authSessionSeq docId <$> createDocument env.apiClient session.csrfToken createReq)
+                _ -> pure ()
         NavLogout ->
             executeLogout
 
@@ -3070,17 +3493,246 @@ updateClient env action = case action of
             (Just session, Just doc)
                 | not (isTrashed doc)
                     && isNothing st.savingDocument
-                    && isNothing st.restoringRevisionDoc ->
+                    && isNothing st.restoringRevisionDoc
+                    && st.syncingDocId /= Just doc.id ->
                     case validateEditorDraft st.draft of
                         Left vErr ->
                             modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
-                        Right updateReq -> do
-                            modify $ \ s -> s
-                                { savingDocument = Just (doc.id, st.draft)
-                                , lastError      = Nothing
-                                , statusNotice   = Nothing
+                        Right updateReq ->
+                            if st.networkStatus == NetworkOffline
+                                then queueOfflineDraftSave doc.id st.draft
+                                else do
+                                    let expectedRev :: RevisionNumber
+                                        expectedRev = case Map.lookup doc.id st.pendingSaves of
+                                            Just prev -> prev.baseRevision
+                                            Nothing   -> doc.revision
+
+                                        reqWithRev :: UpdateDocumentRequest
+                                        reqWithRev = UpdateDocumentRequest
+                                            { title        = updateReq.title
+                                            , body         = updateReq.body
+                                            , format       = updateReq.format
+                                            , folder       = updateReq.folder
+                                            , tags         = updateReq.tags
+                                            , baseRevision = Just expectedRev
+                                            }
+                                    modify $ \ s -> s
+                                        { savingDocument = Just (doc.id, st.draft)
+                                        , lastError      = Nothing
+                                        , statusNotice   = Nothing
+                                        }
+                                    io (DocumentSaved st.authSessionSeq doc.id <$> updateDocument env.apiClient session.csrfToken doc.id reqWithRev)
+            _ -> pure ()
+
+    cacheDocumentLocally :: Document -> Effect () () ClientState ClientAction
+    cacheDocumentLocally doc = do
+        st <- get
+        for_ (currentUserId st) $ \ uid -> do
+            let provisional :: CachedDocument
+                provisional = CachedDocument
+                    { ownerId  = uid
+                    , document = doc
+                    , cachedAt = doc.updatedAt
+                    }
+            modify (\ s -> s { cachedDocuments = Map.insert doc.id provisional s.cachedDocuments })
+            io_ $ do
+                now <- env.getCurrentUtcTime
+                env.offlineStore.putCachedDocument provisional { cachedAt = now }
+
+    applyConflictToEditor :: Document -> SyncConflict -> Effect () () ClientState ClientAction
+    applyConflictToEditor baseDoc conflict = do
+        let localDraft :: EditorDraft
+            localDraft = draftFromPendingSave conflict.localSave
+        modify $ \ s -> s
+            { openingDocumentId   = Nothing
+            , autoOpeningDraftId  = Nothing
+            , selectedDocument    = Just baseDoc
+            , draft               = localDraft
+            , restoredDraftDocId  = Nothing
+            , staleDraftPrompt    = Nothing
+            , editorSyncVersion   = s.editorSyncVersion + 1
+            , editorStats         = computeTextStats (toText localDraft.body)
+            , editorViewMode      = normalizeViewMode localDraft.format s.editorViewMode
+            , canUndo             = False
+            , canRedo             = False
+            , revisionHistory     = resetRevisionHistory s.revisionHistory
+            , extensionsPanelOpen = False
+            , mobilePane          = PaneEditor
+            , lastError           = Nothing
+            }
+        syncEditorFromCurrentState True
+        syncLocalDraftForCurrentState
+
+    resolveDocumentForOfflineOp :: DocumentId -> ClientState -> Maybe Document
+    resolveDocumentForOfflineOp docId st =
+        case st.selectedDocument of
+            Just selDoc | selDoc.id == docId -> Just selDoc
+            _                                -> fmap (.document) (Map.lookup docId st.cachedDocuments)
+
+    queueOfflineDraftSave :: DocumentId -> EditorDraft -> Effect () () ClientState ClientAction
+    queueOfflineDraftSave docId targetDraft = do
+        st <- get
+        case (currentUserId st, resolveDocumentForOfflineOp docId st) of
+            (Just uid, Just doc) ->
+                case validateEditorDraft targetDraft of
+                    Left vErr ->
+                        modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
+                    Right validReq -> do
+                        let baseRev :: RevisionNumber
+                            baseRev = case Map.lookup doc.id st.pendingSaves of
+                                Just prev -> prev.baseRevision
+                                Nothing   -> doc.revision
+
+                            pendingItem :: PendingSyncSave
+                            pendingItem = PendingSyncSave
+                                { docId        = doc.id
+                                , ownerId      = uid
+                                , title        = validReq.title
+                                , body         = validReq.body
+                                , format       = validReq.format
+                                , folder       = validReq.folder
+                                , tags         = validReq.tags
+                                , baseRevision = baseRev
+                                , queuedAt     = doc.updatedAt
                                 }
-                            io (DocumentSaved st.authSessionSeq doc.id <$> updateDocument env.apiClient session.csrfToken doc.id updateReq)
+
+                            -- ローカル表示とオフラインキャッシュを更新しつつ、サーバ確定リビジョン番号は維持する
+                            localDoc :: Document
+                            localDoc = Document
+                                { id        = doc.id
+                                , title     = validReq.title
+                                , body      = validReq.body
+                                , format    = validReq.format
+                                , folder    = validReq.folder
+                                , tags      = validReq.tags
+                                , revision  = doc.revision
+                                , createdAt = doc.createdAt
+                                , updatedAt = doc.updatedAt
+                                , deletedAt = doc.deletedAt
+                                }
+
+                            isSameSelected :: Bool
+                            isSameSelected = fmap (.id) st.selectedDocument == Just doc.id
+
+                            mergedDraft :: EditorDraft
+                            mergedDraft =
+                                if isSameSelected
+                                    then mergeDraftAfterSave targetDraft (draftFromDocument localDoc) st.draft
+                                    else st.draft
+
+                            stillDirty :: Bool
+                            stillDirty = isSameSelected && isDraftDirty localDoc mergedDraft
+
+                            summary :: DocumentSummary
+                            summary = toDocumentSummary localDoc
+
+                            nextSummaries :: [DocumentSummary]
+                            nextSummaries = case st.filterState.status of
+                                StatusTrashed -> st.documentSummaries
+                                _             ->
+                                    if any (\ item -> item.id == doc.id) st.documentSummaries
+                                        then summary : filter (\ item -> item.id /= doc.id) st.documentSummaries
+                                        else st.documentSummaries
+
+                            nextCached :: CachedDocument
+                            nextCached = CachedDocument
+                                { ownerId  = uid
+                                , document = localDoc
+                                , cachedAt = doc.updatedAt
+                                }
+
+                            nextQueue :: Map DocumentId PendingSyncSave
+                            nextQueue = enqueuePendingSave pendingItem st.pendingSaves
+                        modify $ \ s -> s
+                            { selectedDocument   = if isSameSelected then Just localDoc else s.selectedDocument
+                            , draft              = mergedDraft
+                            , documentSummaries  = nextSummaries
+                            , cachedDocuments    = Map.insert doc.id nextCached s.cachedDocuments
+                            , pendingSaves       = nextQueue
+                            , storedDrafts       = if stillDirty then s.storedDrafts else Map.delete doc.id s.storedDrafts
+                            , draftSyncState     = if not isSameSelected then s.draftSyncState else if stillDirty then DraftSyncPending else DraftSyncIdle
+                            , restoredDraftDocId = if not isSameSelected || stillDirty then s.restoredDraftDocId else Nothing
+                            , staleDraftPrompt   = if isSameSelected then Nothing else s.staleDraftPrompt
+                            , lastError          = Nothing
+                            , statusNotice       = Just env.messages.noticeSavedOffline
+                            }
+                        io_ $ do
+                            now <- env.getCurrentUtcTime
+                            let storedPending :: PendingSyncSave
+                                storedPending = pendingItem { queuedAt = now }
+                            env.offlineStore.putPendingSave storedPending
+                            env.offlineStore.putCachedDocument nextCached { cachedAt = now }
+                            unless stillDirty (env.draftStorage.deleteStoredDraft doc.id)
+                        when stillDirty syncLocalDraftForCurrentState
+            _ -> pure ()
+
+    stashSaveConflictFromDraft :: DocumentId -> EditorDraft -> Text -> Effect () () ClientState ClientAction
+    stashSaveConflictFromDraft docId targetDraft reasonText = do
+        st <- get
+        case (currentUserId st, resolveDocumentForOfflineOp docId st) of
+            (Just uid, Just doc) ->
+                case validateEditorDraft targetDraft of
+                    Left _ -> pure ()
+                    Right validReq -> do
+                        let baseRev :: RevisionNumber
+                            baseRev = case Map.lookup doc.id st.pendingSaves of
+                                Just prev -> prev.baseRevision
+                                Nothing   -> doc.revision
+
+                            localItem :: PendingSyncSave
+                            localItem = PendingSyncSave
+                                { docId        = doc.id
+                                , ownerId      = uid
+                                , title        = validReq.title
+                                , body         = validReq.body
+                                , format       = validReq.format
+                                , folder       = validReq.folder
+                                , tags         = validReq.tags
+                                , baseRevision = baseRev
+                                , queuedAt     = doc.updatedAt
+                                }
+
+                            conflict :: SyncConflict
+                            conflict = SyncConflict
+                                { docId      = doc.id
+                                , ownerId    = uid
+                                , localSave  = localItem
+                                , detectedAt = doc.updatedAt
+                                , reason     = reasonText
+                                }
+                        modify $ \ s -> s
+                            { pendingSaves  = Map.delete doc.id s.pendingSaves
+                            , syncConflicts = Map.insert doc.id conflict s.syncConflicts
+                            , lastError     = Nothing
+                            }
+                        io_ $ do
+                            now <- env.getCurrentUtcTime
+                            env.offlineStore.deletePendingSave doc.id
+                            env.offlineStore.putSyncConflict conflict { detectedAt = now }
+            _ -> pure ()
+
+    draftFromPendingSave :: PendingSyncSave -> EditorDraft
+    draftFromPendingSave ps = EditorDraft
+        { titleInput  = toText ps.title
+        , body        = ps.body
+        , format      = ps.format
+        , folderInput = maybe "" toText ps.folder
+        , tagsInput   = formatTagsInput ps.tags
+        }
+
+    triggerSyncNext :: Effect () () ClientState ClientAction
+    triggerSyncNext = do
+        st <- get
+        case currentAuthSession st of
+            Just session
+                | st.networkStatus == NetworkOnline
+                    && isNothing st.syncingDocId
+                    && isNothing st.savingDocument ->
+                    case nextPendingSyncSave st.pendingSaves of
+                        Nothing -> pure ()
+                        Just item -> do
+                            modify (\ s -> s { syncingDocId = Just item.docId })
+                            io (SyncItemCompleted st.authSessionSeq item.docId <$> updateDocument env.apiClient session.csrfToken item.docId (buildSyncUpdateRequest item))
             _ -> pure ()
 
     syncEditorFromCurrentState :: Bool -> Effect () () ClientState ClientAction
@@ -3186,6 +3838,11 @@ resetWorkspaceForAuthenticated session mNotice state = state
     , restoredDraftDocId           = Nothing
     , staleDraftPrompt             = Nothing
     , orphanedDraft                = Nothing
+    , cachedDocuments              = Map.empty
+    , pendingSaves                 = Map.empty
+    , syncConflicts                = Map.empty
+    , syncingDocId                 = Nothing
+    , isServingOfflineCache        = False
     , editorSyncVersion            = state.editorSyncVersion + 1
     , editorStats                  = emptyEditorStats
     , canUndo                      = False
@@ -3364,5 +4021,6 @@ mkClientComponent env renderView =
         , subs  =
             [ editorEventsSub EditorEventReceived
             , draftStorageEventsSub DraftStorageEventReceived
+            , networkStatusSub NetworkStatusChanged
             ]
         }

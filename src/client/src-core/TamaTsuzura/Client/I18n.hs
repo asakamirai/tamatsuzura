@@ -37,8 +37,50 @@ data UiMessages = UiMessages
       -- ^ サーバ接続確認中のバッジ文言
     , statusOnline               :: !Text
       -- ^ サーバ接続正常時のバッジ文言
+    , statusOffline              :: !Text
+      -- ^ ブラウザオフライン時のバッジ文言
     , statusError                :: !Text
       -- ^ サーバ接続失敗時のバッジ文言
+    , actionSyncNow              :: !Text
+      -- ^ 未同期変更を手動同期するボタンラベル
+    , actionSyncing              :: !Text
+      -- ^ 未同期変更を同期中のボタンラベル
+    , badgePendingSync           :: !Text
+      -- ^ 未同期保存キュー待機中を示すバッジ文言
+    , badgeSyncConflict          :: !Text
+      -- ^ 競合退避中を示すバッジ文言
+    , syncStatusPendingPrefix    :: !Text
+      -- ^ ヘッダの未同期件数バッジ接頭辞
+    , syncStatusSyncingPrefix    :: !Text
+      -- ^ ヘッダの同期中件数バッジ接頭辞
+    , syncStatusConflictPrefix   :: !Text
+      -- ^ ヘッダの競合件数バッジ接頭辞
+    , offlineCacheBanner         :: !Text
+      -- ^ オフラインキャッシュから一覧表示中である旨の案内バナー
+    , noticeSavedOffline         :: !Text
+      -- ^ オフライン未同期保存キューへの保存完了通知
+    , noticeOpenedFromCache      :: !Text
+      -- ^ オフラインキャッシュから文書を開いた際の通知
+    , noticeSyncCompleted        :: !Text
+      -- ^ 未同期変更の自動/手動同期完了通知
+    , noticeConflictRecovered    :: !Text
+      -- ^ 競合退避した変更を別文書として保存した際の通知
+    , noticeConflictDismissed    :: !Text
+      -- ^ 競合退避レコードを破棄した際の通知
+    , conflictBannerPrefix       :: !Text
+      -- ^ 競合退避バナーの案内文接頭辞
+    , conflictTitleSuffix        :: !Text
+      -- ^ 競合退避内容を別文書保存する際のタイトル接尾辞
+    , actionRecoverConflictAsNew :: !Text
+      -- ^ 競合退避されたローカル変更を別文書として保存するボタンラベル
+    , actionApplyConflictLocal   :: !Text
+      -- ^ 競合退避されたローカル変更をエディタへ反映するボタンラベル
+    , actionDismissConflict      :: !Text
+      -- ^ 競合退避レコードを破棄するボタンラベル
+    , errSyncConflictReason      :: !Text
+      -- ^ 409 競合退避時の標準理由文言
+    , errSyncNotFoundReason      :: !Text
+      -- ^ 404 同期失敗による退避時の標準理由文言
     , actionReload               :: !Text
       -- ^ 再読込ボタンラベル
     , actionNewDocument          :: !Text
@@ -444,7 +486,28 @@ jaMessages = UiMessages
     , appSubtitle                = "モバイルファースト・テキストエディタ"
     , statusChecking             = "接続確認中..."
     , statusOnline               = "サーバ接続済み"
+    , statusOffline              = "オフライン"
     , statusError                = "接続エラー"
+    , actionSyncNow              = "今すぐ同期"
+    , actionSyncing              = "同期中..."
+    , badgePendingSync           = "未同期"
+    , badgeSyncConflict          = "競合退避"
+    , syncStatusPendingPrefix    = "未同期 "
+    , syncStatusSyncingPrefix    = "同期中 "
+    , syncStatusConflictPrefix   = "競合 "
+    , offlineCacheBanner         = "オフラインのためローカルキャッシュを表示しています。保存した変更はオンライン復帰時に自動同期されます。"
+    , noticeSavedOffline         = "オフラインのため未同期保存キューへ保存しました。オンライン復帰時に自動同期されます。"
+    , noticeOpenedFromCache      = "オフラインキャッシュから文書を開きました。"
+    , noticeSyncCompleted        = "未同期の変更をサーバへ同期しました。"
+    , noticeConflictRecovered    = "競合退避された変更を別文書として保存しました。"
+    , noticeConflictDismissed    = "競合退避された変更を破棄しました。"
+    , conflictBannerPrefix       = "サーバ側で別更新が行われたため、ローカルの変更を安全に退避しました: "
+    , conflictTitleSuffix        = " (競合退避)"
+    , actionRecoverConflictAsNew = "別文書として保存"
+    , actionApplyConflictLocal   = "退避内容をエディタへ反映"
+    , actionDismissConflict      = "退避を破棄"
+    , errSyncConflictReason      = "サーバ側でリビジョンが更新されているため上書きせず退避しました。"
+    , errSyncNotFoundReason      = "対象文書がサーバ上に見つからないためローカル変更を退避しました。"
     , actionReload               = "再読込"
     , actionNewDocument          = "新規作成"
     , actionCreating             = "作成中..."

@@ -31,6 +31,7 @@ library client-core
     TamaTsuzura.Client.FileTransfer
     TamaTsuzura.Client.I18n
     TamaTsuzura.Client.Markdown
+    TamaTsuzura.Client.OfflineSync
     TamaTsuzura.Client.View
   build-depends:
       aeson                     >= 2.1  && < 2.3
@@ -63,6 +64,7 @@ library
     , TamaTsuzura.Client.FileTransfer
     , TamaTsuzura.Client.I18n
     , TamaTsuzura.Client.Markdown
+    , TamaTsuzura.Client.OfflineSync
     , TamaTsuzura.Client.View
   build-depends:
       base                      >= 4.18 && < 5
