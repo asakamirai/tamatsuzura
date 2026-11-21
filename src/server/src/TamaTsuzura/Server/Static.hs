@@ -4,6 +4,7 @@ module TamaTsuzura.Server.Static
     ( staticFilesMiddleware
     , resolveStaticAssetPath
     , contentTypeForOsPath
+    , cacheControlForOsPath
     ) where
 
 import           Control.Exception               (IOException, try)
@@ -33,9 +34,13 @@ staticFilesMiddleware rootDir apiApp req respond
                 let mime :: ByteString
                     mime = contentTypeForOsPath filePath
 
+                    cacheControl :: ByteString
+                    cacheControl = cacheControlForOsPath filePath
+
                     headers :: Http.ResponseHeaders
                     headers =
                         [ (Http.hContentType, mime)
+                        , (Http.hCacheControl, cacheControl)
                         , ("X-Content-Type-Options", "nosniff")
                         ]
                 if method == Http.methodHead
@@ -140,15 +145,31 @@ contentTypeForOsPath path =
     case OS.decodeUtf (OS.takeExtension path) of
         Left _    -> "application/octet-stream"
         Right ext -> case Txt.toLower (Txt.pack ext) of
-            ".html" -> "text/html; charset=utf-8"
-            ".htm"  -> "text/html; charset=utf-8"
-            ".js"   -> "text/javascript; charset=utf-8"
-            ".mjs"  -> "text/javascript; charset=utf-8"
-            ".css"  -> "text/css; charset=utf-8"
-            ".wasm" -> "application/wasm"
-            ".json" -> "application/json; charset=utf-8"
-            ".svg"  -> "image/svg+xml"
-            ".png"  -> "image/png"
-            ".ico"  -> "image/x-icon"
-            ".txt"  -> "text/plain; charset=utf-8"
-            _       -> "application/octet-stream"
+            ".html"        -> "text/html; charset=utf-8"
+            ".htm"         -> "text/html; charset=utf-8"
+            ".js"          -> "text/javascript; charset=utf-8"
+            ".mjs"         -> "text/javascript; charset=utf-8"
+            ".css"         -> "text/css; charset=utf-8"
+            ".wasm"        -> "application/wasm"
+            ".json"        -> "application/json; charset=utf-8"
+            ".webmanifest" -> "application/manifest+json; charset=utf-8"
+            ".svg"         -> "image/svg+xml"
+            ".png"         -> "image/png"
+            ".ico"         -> "image/x-icon"
+            ".txt"         -> "text/plain; charset=utf-8"
+            _              -> "application/octet-stream"
+
+-- | 静的アセットに付与する @Cache-Control@ ヘッダ値を返す。
+-- @sw.js@・HTML・Web App Manifest はブラウザの再検証を妨げないよう @no-cache@ とする。
+-- 現行アセットはファイル名にコンテンツハッシュを含まないため、その他アセットも更新漏れ防止を優先し @no-cache@ を返す（オフライン高速起動は Service Worker のバージョン付きキャッシュが担う）。
+cacheControlForOsPath :: OS.OsPath -> ByteString
+cacheControlForOsPath path =
+    case OS.decodeUtf (OS.takeFileName path) of
+        Right "sw.js" -> "no-cache"
+        _             -> case OS.decodeUtf (OS.takeExtension path) of
+            Right ext -> case Txt.toLower (Txt.pack ext) of
+                ".html"        -> "no-cache"
+                ".htm"         -> "no-cache"
+                ".webmanifest" -> "no-cache"
+                _              -> "no-cache"
+            Left _    -> "no-cache"

@@ -10,7 +10,7 @@
 
 ## 現在地
 
-**M5（Haskell 拡張機構 MVP: 同梱拡張）完了。次は M6（PWA / オフライン対応と同期）の Phase 1 へ着手予定。**
+**M6（PWA / オフライン対応と同期）Phase 1 完了。次は Phase 2（オフライン文書キャッシュ・未同期保存キュー・自動同期）へ着手予定。**
 
 | マイルストーン | 内容 | 状態 | 完了記録 |
 | --- | --- | --- | --- |
@@ -20,7 +20,7 @@
 | M3 | 認証・ユーザ管理 (CGI 互換 SQLite セッション) | **完了** | [M3.md](./project/history/M3.md) |
 | M4 | 差分管理 Phase 1 (リビジョン履歴) | **完了** | [M4.md](./project/history/M4.md) |
 | M5 | Haskell 拡張機構 (MVP: 同梱拡張) | **完了** | [M5.md](./project/history/M5.md) |
-| **M6** | **PWA / オフライン対応と同期** | **進行中 (Phase 1 着手前)** | — |
+| **M6** | **PWA / オフライン対応と同期** | **進行中 (Phase 1 完了)** | — |
 | M7 | 差分管理 Phase 2 (リビジョン比較・マージ) | 未着手 | — |
 
 ※ 各マイルストーンの詳細な目的・完了条件は [project/milestones.md](./project/milestones.md) を参照してください。
@@ -31,7 +31,7 @@
 
 **M6: PWA / オフライン対応と同期**
 
-- [ ] Phase 1: Web App Manifest・Service Worker（アプリシェルおよび Wasm/JS アセットキャッシュ）・ビルド/静的配信統合
+- [x] Phase 1: Web App Manifest・Service Worker（アプリシェルおよび Wasm/JS アセットキャッシュ）・ビルド/静的配信統合
 - [ ] Phase 2: IndexedDB オフライン文書キャッシュ・未同期保存キュー・オンライン復帰時自動同期と競合退避通知 UI（モバイル対応）
 
 ※ マイルストーンの新規追加や調整は Antigravity スキル `add-milestone` を利用してください。

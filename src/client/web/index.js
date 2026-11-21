@@ -40,6 +40,24 @@ async function instantiateWasm(url, imports) {
   return WebAssembly.instantiate(bytes, imports);
 }
 
+async function registerServiceWorker() {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) {
+    return null;
+  }
+  if (typeof window !== "undefined" && !window.isSecureContext) {
+    return null;
+  }
+  try {
+    return await navigator.serviceWorker.register("./sw.js", {
+      scope: "./",
+      updateViaCache: "none",
+    });
+  } catch (err) {
+    console.warn("[tamatsuzura] Service Worker registration failed:", err);
+    return null;
+  }
+}
+
 async function boot() {
   const wasi = new BrowserWasiShim({
     args: ["tamatsuzura-client"],
@@ -55,6 +73,9 @@ async function boot() {
   const { instance } = await instantiateWasm("./tamatsuzura-client.wasm", importObject);
   Object.assign(wasmExports, instance.exports);
   wasi.initialize(instance);
+
+  // Register Service Worker after Wasm download/instantiation to avoid competing for first-load bandwidth.
+  registerServiceWorker();
 
   // Miso startApp draws onto an empty <body>
   document.body.textContent = "";

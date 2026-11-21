@@ -27,7 +27,11 @@ import           TamaTsuzura.Server.Config
     , envStaticDir
     , resolveWarpConfig
     )
-import           TamaTsuzura.Server.Static (contentTypeForOsPath, resolveStaticAssetPath)
+import           TamaTsuzura.Server.Static
+    ( cacheControlForOsPath
+    , contentTypeForOsPath
+    , resolveStaticAssetPath
+    )
 import           TamaTsuzura.Server.Storage (defaultStorageConfig)
 import           Test.Hspec                (Spec, describe, expectationFailure, it, shouldBe)
 
@@ -51,30 +55,48 @@ staticSpec = describe "Warp development static asset serving" $ do
         eEmpty <- resolveWarpConfig ["--static-dir", "   "] []
         eEmpty `shouldBe` Left "Static directory path must not be empty"
 
-    it "assigns accurate Content-Type headers including application/wasm" $ do
-        wasmPath <- OS.encodeFS "tamatsuzura-client.wasm"
-        htmlPath <- OS.encodeFS "index.html"
-        jsPath   <- OS.encodeFS "index.js"
-        cssPath  <- OS.encodeFS "styles.css"
-        contentTypeForOsPath wasmPath `shouldBe` "application/wasm"
-        contentTypeForOsPath htmlPath `shouldBe` "text/html; charset=utf-8"
-        contentTypeForOsPath jsPath   `shouldBe` "text/javascript; charset=utf-8"
-        contentTypeForOsPath cssPath  `shouldBe` "text/css; charset=utf-8"
+    it "assigns accurate Content-Type and Cache-Control headers for Wasm and PWA assets" $ do
+        wasmPath     <- OS.encodeFS "tamatsuzura-client.wasm"
+        htmlPath     <- OS.encodeFS "index.html"
+        jsPath       <- OS.encodeFS "index.js"
+        swPath       <- OS.encodeFS "sw.js"
+        cssPath      <- OS.encodeFS "styles.css"
+        manifestPath <- OS.encodeFS "manifest.webmanifest"
+        contentTypeForOsPath wasmPath     `shouldBe` "application/wasm"
+        contentTypeForOsPath htmlPath     `shouldBe` "text/html; charset=utf-8"
+        contentTypeForOsPath jsPath       `shouldBe` "text/javascript; charset=utf-8"
+        contentTypeForOsPath swPath       `shouldBe` "text/javascript; charset=utf-8"
+        contentTypeForOsPath cssPath      `shouldBe` "text/css; charset=utf-8"
+        contentTypeForOsPath manifestPath `shouldBe` "application/manifest+json; charset=utf-8"
+        cacheControlForOsPath swPath       `shouldBe` "no-cache"
+        cacheControlForOsPath htmlPath     `shouldBe` "no-cache"
+        cacheControlForOsPath manifestPath `shouldBe` "no-cache"
+        cacheControlForOsPath wasmPath     `shouldBe` "no-cache"
 
-    it "serves index.html and Wasm assets while forwarding /api/* and blocking traversal" $
+    it "serves index.html, PWA manifest, sw.js, and Wasm assets while forwarding /api/* and blocking traversal" $
         withTempStaticDir $ \ rootDir dbPath -> do
             writeStaticFile rootDir "index.html" "<html><body>TamaTsuzura</body></html>"
             writeStaticFile rootDir "app.wasm" "\0asm\1\0\0\0"
             writeStaticFile rootDir "index.js" "export const ok = true;"
+            writeStaticFile rootDir "manifest.webmanifest" "{\"name\":\"TamaTsuzura\"}"
+            writeStaticFile rootDir "sw.js" "self.addEventListener('fetch', () => {});"
+            iconsSeg <- OS.encodeFS "icons"
+            let iconsDir :: OsPath
+                iconsDir = rootDir OS.</> iconsSeg
+            DirOS.createDirectoryIfMissing True iconsDir
+            writeStaticFile iconsDir "icon.svg" "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"
+            writeStaticFile iconsDir "icon-192.png" "\x89PNG\r\n\x1a\n"
 
             let app :: Wai.Application
                 app = mkWarpApplication (Just rootDir) (defaultStorageConfig dbPath)
 
-            -- 1. Root path serves index.html
+            -- 1. Root path serves index.html with no-cache
             resRoot <- runWaiRequest app Http.methodGet "/"
             WaiTest.simpleStatus resRoot `shouldBe` Http.status200
             lookup Http.hContentType (WaiTest.simpleHeaders resRoot)
                 `shouldBe` Just "text/html; charset=utf-8"
+            lookup Http.hCacheControl (WaiTest.simpleHeaders resRoot)
+                `shouldBe` Just "no-cache"
             WaiTest.simpleBody resRoot `shouldBe` "<html><body>TamaTsuzura</body></html>"
 
             -- 2. Wasm binary served with application/wasm
@@ -83,6 +105,31 @@ staticSpec = describe "Warp development static asset serving" $ do
             lookup Http.hContentType (WaiTest.simpleHeaders resWasm)
                 `shouldBe` Just "application/wasm"
             WaiTest.simpleBody resWasm `shouldBe` "\0asm\1\0\0\0"
+
+            -- 2b. PWA manifest and Service Worker served with appropriate headers
+            resManifest <- runWaiRequest app Http.methodGet "/manifest.webmanifest"
+            WaiTest.simpleStatus resManifest `shouldBe` Http.status200
+            lookup Http.hContentType (WaiTest.simpleHeaders resManifest)
+                `shouldBe` Just "application/manifest+json; charset=utf-8"
+            lookup Http.hCacheControl (WaiTest.simpleHeaders resManifest)
+                `shouldBe` Just "no-cache"
+
+            resSw <- runWaiRequest app Http.methodGet "/sw.js"
+            WaiTest.simpleStatus resSw `shouldBe` Http.status200
+            lookup Http.hContentType (WaiTest.simpleHeaders resSw)
+                `shouldBe` Just "text/javascript; charset=utf-8"
+            lookup Http.hCacheControl (WaiTest.simpleHeaders resSw)
+                `shouldBe` Just "no-cache"
+
+            resSvg <- runWaiRequest app Http.methodGet "/icons/icon.svg"
+            WaiTest.simpleStatus resSvg `shouldBe` Http.status200
+            lookup Http.hContentType (WaiTest.simpleHeaders resSvg)
+                `shouldBe` Just "image/svg+xml"
+
+            resPng <- runWaiRequest app Http.methodGet "/icons/icon-192.png"
+            WaiTest.simpleStatus resPng `shouldBe` Http.status200
+            lookup Http.hContentType (WaiTest.simpleHeaders resPng)
+                `shouldBe` Just "image/png"
 
             -- 3. HEAD returns headers with empty body
             resHead <- runWaiRequest app Http.methodHead "/index.js"

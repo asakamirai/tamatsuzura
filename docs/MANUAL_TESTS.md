@@ -158,7 +158,7 @@
    ```bash
    scripts/build.sh
    ```
-   - 確認項目: `dist/web/` 配下に `index.html`, `index.js`, `editor-bridge.js`, `browser-bridge.js`, `wasi-shim.js`, `ghc_wasm_jsffi.js`, `styles.css`, `tamatsuzura-client.wasm` の 8 ファイルが生成され、Wasm インポート検証ログが表示されること。
+   - 確認項目: `dist/web/` 配下に `index.html`, `index.js`, `editor-bridge.js`, `browser-bridge.js`, `wasi-shim.js`, `ghc_wasm_jsffi.js`, `styles.css`, `tamatsuzura-client.wasm`, `manifest.webmanifest`, `sw.js`, `icons/icon.svg`, `icons/icon-192.png`, `icons/icon-512.png` が生成され、Service Worker 生成ログおよび Wasm インポート検証ログが表示されること。
 2. 一時 SQLite DB を指定して開発用 Warp サーバを起動する（`dist/web/index.html` が存在するため静的アセット配信が自動で有効になる。Docker 経由で実行する場合は `USE_DOCKER=1` を付与）:
    ```bash
    TAMATSUZURA_DB_PATH=./tmp-mt3.sqlite3 PORT=18080 scripts/run-server.sh
@@ -330,6 +330,31 @@
 7. 検証終了後、一時 DB ファイル (`./tmp-mt7.sqlite3`, `./tmp-mt7.sqlite3-wal`, `./tmp-mt7.sqlite3-shm`) を削除する。
 
 **再実施が必要になる変更**: `TamaTsuzura.ExtensionApi`、`TamaTsuzura.Extensions.*`、`TamaTsuzura.Client.{ExtensionRegistry,App,View,I18n}`、`src/client/web/styles.css` の変更時。
+
+---
+
+### MT-8: PWA Web App Manifest・Service Worker 登録・アプリシェルオフライン起動確認
+
+**確認したいこと**: Web App Manifest (`manifest.webmanifest`) と Service Worker (`sw.js`) が正常に配信・登録され、アプリシェル（HTML/JS/CSS/Wasm/アイコン）がバージョン付きキャッシュにプリキャッシュされて、サーバ停止またはオフライン状態での再読み込み時にも Wasm アプリ本体が起動できること（`/api/*` がキャッシュされないこと）。
+
+**手順**:
+1. リポジトリルートで `scripts/build.sh` を実行し、一時 SQLite DB を指定して Warp 開発サーバを起動する（Docker 経由で実行する場合は `USE_DOCKER=1` を付与）:
+   ```bash
+   scripts/build.sh
+   TAMATSUZURA_DB_PATH=./tmp-mt8.sqlite3 PORT=18080 scripts/run-server.sh
+   ```
+   - 確認項目: ビルドログに `Generated dist/web/sw.js (cache version: ..., 13 precached entries).` が表示されること。
+2. ブラウザ（Chromium 系推奨）で `http://127.0.0.1:18080/` を開き、開発者ツール → **Application** タブを開く。
+   - 確認項目: **Manifest** セクションに `TamaTsuzura`（`display: standalone`、`theme_color: #1f5f99`、`icons` 3 種: SVG / 192x192 PNG / 512x512 PNG）がエラーなく読み込まれていること。
+   - 確認項目: **Service Workers** セクションに `./sw.js` が `activated and is running` として登録されていること。
+   - 確認項目: **Cache Storage** に `tamatsuzura-shell-<12桁ハッシュ>` が作成され、`index.html`, `index.js`, `editor-bridge.js`, `browser-bridge.js`, `wasi-shim.js`, `ghc_wasm_jsffi.js`, `styles.css`, `tamatsuzura-client.wasm`, `manifest.webmanifest`, `icons/*` が格納されており、`/api/*` エントリが存在しないこと。
+3. 開発者ツール → **Network** タブで **Offline** にチェックを入れる（または Warp サーバを停止する）状態で、ページを再読み込み (F5) する。
+   - 確認項目: ブラウザのオフラインエラー画面にならず、Service Worker キャッシュから HTML / JS / CSS / Wasm が読み込まれて Miso アプリシェルが起動すること（オフラインのため API 接続エラー表示または認証確認失敗となっても Wasm 起動自体は成功すること）。
+4. ネットワークをオンラインへ戻し、`src/client/web/styles.css` の末尾に一時的なテストコメント（例: `/* sw-update-test */`）を追記して `scripts/build-wasm.sh` で再ビルドし、ページを再読み込みする（確認後に追記コメントは元へ戻す）。
+   - 確認項目: **Cache Storage** に新しいハッシュの `tamatsuzura-shell-...` が作成され、古いキャッシュが自動削除されること。
+5. 検証終了後、開発者ツール → Application → Clear site data（必要に応じて）を実行し、一時 DB ファイル (`./tmp-mt8.sqlite3`, `./tmp-mt8.sqlite3-wal`, `./tmp-mt8.sqlite3-shm`) を削除する。
+
+**再実施が必要になる変更**: `src/client/web/{index.html,index.js,manifest.webmanifest,sw.js,icons/*}`、`scripts/build-wasm.sh`、`TamaTsuzura.Server.Static` の変更時。
 
 ---
 

@@ -40,7 +40,9 @@ bundle_wasm_assets() {
   node "${post_link}" -i "${dist_dir}/tamatsuzura-client.wasm" -o "${dist_dir}/ghc_wasm_jsffi.js"
 
   if [ -d "src/client/web" ]; then
-    cp src/client/web/index.html src/client/web/index.js src/client/web/browser-bridge.js src/client/web/wasi-shim.js src/client/web/styles.css "${dist_dir}/"
+    cp src/client/web/index.html src/client/web/index.js src/client/web/browser-bridge.js src/client/web/wasi-shim.js src/client/web/styles.css src/client/web/manifest.webmanifest "${dist_dir}/"
+    mkdir -p "${dist_dir}/icons"
+    cp src/client/web/icons/icon.svg src/client/web/icons/icon-192.png src/client/web/icons/icon-512.png "${dist_dir}/icons/"
     if [ -f "src/client/web/package.json" ]; then
       local need_install=0
       if [ ! -d "src/client/web/node_modules" ] || [ ! -x "src/client/web/node_modules/.bin/esbuild" ]; then
@@ -67,8 +69,71 @@ bundle_wasm_assets() {
     echo "Error: Built CodeMirror 6 bundle not found: ${dist_dir}/editor-bridge.js" >&2
     exit 1
   fi
+
+  # Generate Service Worker with deterministic content hash across all app-shell assets
+  node --input-type=module -e '
+    import crypto from "node:crypto";
+    import fs from "node:fs/promises";
+    import path from "node:path";
+
+    const distDir = path.resolve("./dist/web");
+    const manifestPath = path.join(distDir, "manifest.webmanifest");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    if (!manifest.name || !manifest.start_url || !Array.isArray(manifest.icons) || manifest.icons.length === 0) {
+      throw new Error("Invalid manifest.webmanifest: missing required fields");
+    }
+    for (const icon of manifest.icons) {
+      const iconPath = path.resolve(distDir, icon.src);
+      const relToDist = path.relative(distDir, iconPath);
+      if (!relToDist || relToDist.startsWith("..") || path.isAbsolute(relToDist)) {
+        throw new Error(`Invalid manifest icon path outside dist/web: ${icon.src}`);
+      }
+      await fs.access(iconPath);
+    }
+
+    const shellFiles = [
+      "index.html",
+      "index.js",
+      "editor-bridge.js",
+      "browser-bridge.js",
+      "wasi-shim.js",
+      "ghc_wasm_jsffi.js",
+      "styles.css",
+      "tamatsuzura-client.wasm",
+      "manifest.webmanifest",
+      "icons/icon.svg",
+      "icons/icon-192.png",
+      "icons/icon-512.png",
+    ];
+    const hash = crypto.createHash("sha256");
+    for (const rel of shellFiles) {
+      const fullPath = path.join(distDir, rel);
+      const data = await fs.readFile(fullPath);
+      hash.update(rel);
+      hash.update("\0");
+      hash.update(data);
+    }
+    const version = hash.digest("hex").slice(0, 12);
+    const precacheUrls = ["./", ...shellFiles.map((rel) => `./${rel}`)];
+
+    const swTemplate = await fs.readFile("./src/client/web/sw.js", "utf8");
+    if (!swTemplate.includes("__TAMATSUZURA_CACHE_VERSION__")) {
+      throw new Error("sw.js template is missing __TAMATSUZURA_CACHE_VERSION__ placeholder");
+    }
+    if (!swTemplate.includes("__TAMATSUZURA_APP_SHELL_ASSETS__")) {
+      throw new Error("sw.js template is missing __TAMATSUZURA_APP_SHELL_ASSETS__ placeholder");
+    }
+    const swOut = swTemplate
+      .replace("\"__TAMATSUZURA_CACHE_VERSION__\"", JSON.stringify(version))
+      .replace("__TAMATSUZURA_APP_SHELL_ASSETS__", JSON.stringify(precacheUrls, null, 2));
+    await fs.writeFile(path.join(distDir, "sw.js"), swOut, "utf8");
+    console.log(`Generated dist/web/sw.js (cache version: ${version}, ${precacheUrls.length} precached entries).`);
+  '
+
   node --check "${dist_dir}/editor-bridge.js"
   node --check "${dist_dir}/browser-bridge.js"
+  node --check "${dist_dir}/index.js"
+  node --check "${dist_dir}/sw.js"
 
   # Verify that every import required by tamatsuzura-client.wasm is satisfied by wasi-shim.js and ghc_wasm_jsffi.js
   node --input-type=module -e '

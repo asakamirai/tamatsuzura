@@ -10,7 +10,11 @@
 
 1. **CGI + 静的配信環境（最優先・主軸）**:
    - C 言語互換 CGI として動作する Haskell バイナリ（`tamatsuzura-cgi`、`wai-extra` の `Network.Wai.Handler.CGI` ベース）を `/api/*` に配置。
-   - HTML / JS / CSS / Wasm の静的フロントエンドアセットは Web サーバ（Apache / Nginx 等）から直接配信。
+   - HTML / JS / CSS / Wasm / PWA（`manifest.webmanifest`, `sw.js`, `icons/*`）の静的フロントエンドアセットは Web サーバ（Apache / Nginx 等）から直接配信。
+     - **PWA / Service Worker 配信要件**:
+       - HTTPS で配信すること（ローカル検証の `localhost` / `127.0.0.1` を除く）。
+       - `.wasm` に `application/wasm`、`.webmanifest` に `application/manifest+json; charset=utf-8` の MIME タイプを設定すること。
+       - `sw.js`・`index.html`・`manifest.webmanifest` には `Cache-Control: no-cache` を付与し、ブラウザの Service Worker 更新チェックを阻害しないこと。また現行アセット（`.js` / `.css` / `.wasm` 等）はファイル名にコンテンツハッシュを含まないため、更新時のバージョン不整合を防ぐため全静的アセットに `Cache-Control: no-cache`（または ETag による再検証）を設定することを推奨する。
    - SQLite DB ファイルは Web 公開ディレクトリ外に配置し、環境変数で指定する（WAL モード + `busy_timeout` は初回接続時に自動適用）。
    - ルーティング配置は `SCRIPT_NAME=/cgi-bin/tamatsuzura.cgi, PATH_INFO=/api/...` 方式および `ScriptAlias /api /path/to/tamatsuzura-cgi`（`SCRIPT_NAME=/api, PATH_INFO=/...`）方式の双方に対応。
    - 必須・任意環境変数:
