@@ -7,6 +7,8 @@ module TamaTsuzura.Client.I18n
     ( UiMessages(..)
     , jaMessages
     , formatDocumentFormat
+    , formatExtensionCategory
+    , formatExtensionError
     , formatApiClientError
     , formatLoginApiError
     , formatRegisterApiError
@@ -21,6 +23,7 @@ import           TamaTsuzura.Client.FileTransfer (FileImportError(..))
 import           TamaTsuzura.Common.Api          (ApiError(..), ApiErrorCode(..))
 import           TamaTsuzura.Common.Document     (DocumentFormat(..))
 import           TamaTsuzura.Common.Validation   (ValidationError(..))
+import           TamaTsuzura.ExtensionApi        (ExtensionCategory(..), ExtensionError(..))
 
 -- | クライアント UI の全表示文言を集約するメッセージカタログ。
 -- 将来の多言語化 (英語リソース追加や UI 言語切替) に備え、
@@ -328,6 +331,34 @@ data UiMessages = UiMessages
       -- ^ ステータスバーカーソル位置接頭辞
     , extensionsHeading          :: !Text
       -- ^ 登録済み拡張機能ラベル
+    , actionExtensionsToggle     :: !Text
+      -- ^ 拡張機能管理パネル開閉ボタンラベル
+    , actionCloseExtensions      :: !Text
+      -- ^ 拡張機能管理パネルを閉じるボタンラベル
+    , extensionsPanelHeading     :: !Text
+      -- ^ 拡張機能管理パネル見出し
+    , extensionsEnabledLabel     :: !Text
+      -- ^ 拡張機能有効状態のラベル
+    , extensionsDisabledLabel    :: !Text
+      -- ^ 拡張機能無効状態のラベル
+    , extensionsMarkdownOnly     :: !Text
+      -- ^ Markdown 専用コマンドを示すバッジ文言
+    , extensionsCatFormatting    :: !Text
+      -- ^ 書式整形カテゴリ名
+    , extensionsCatMarkdown      :: !Text
+      -- ^ Markdown カテゴリ名
+    , extensionsCatTextTransform :: !Text
+      -- ^ テキスト変換カテゴリ名
+    , extensionsTrashedHint      :: !Text
+      -- ^ ゴミ箱内文書で拡張実行不可である旨の案内
+    , errExtensionNotEnabled     :: !Text
+      -- ^ 無効な拡張を実行しようとしたときのエラー
+    , errExtensionUnsupportedFmt :: !Text
+      -- ^ Markdown 専用コマンドをテキスト文書で実行しようとしたときのエラー
+    , errExtensionNotFound       :: !Text
+      -- ^ 拡張コマンドが見つからないときのエラー
+    , errExtensionFailedPrefix   :: !Text
+      -- ^ 拡張コマンド実行失敗時の接頭辞
     , noticeSaved                :: !Text
       -- ^ 保存完了通知
     , noticeMovedToTrash         :: !Text
@@ -560,6 +591,20 @@ jaMessages = UiMessages
     , statsCharsUnit             = "文字"
     , statsCursorPrefix          = "カーソル"
     , extensionsHeading          = "拡張機能"
+    , actionExtensionsToggle     = "拡張機能"
+    , actionCloseExtensions      = "閉じる"
+    , extensionsPanelHeading     = "拡張機能管理"
+    , extensionsEnabledLabel     = "有効"
+    , extensionsDisabledLabel    = "無効"
+    , extensionsMarkdownOnly     = "Markdown 専用"
+    , extensionsCatFormatting    = "書式整形"
+    , extensionsCatMarkdown      = "Markdown"
+    , extensionsCatTextTransform = "テキスト変換"
+    , extensionsTrashedHint      = "ゴミ箱内の文書では拡張コマンドを実行できません。"
+    , errExtensionNotEnabled     = "この拡張機能は現在無効です。拡張機能管理から有効化してください。"
+    , errExtensionUnsupportedFmt = "このコマンドは Markdown 形式の文書でのみ実行できます。"
+    , errExtensionNotFound       = "指定された拡張コマンドが見つかりませんでした。"
+    , errExtensionFailedPrefix   = "拡張コマンドを実行できませんでした"
     , noticeSaved                = "文書を保存しました。"
     , noticeMovedToTrash         = "文書をゴミ箱へ移動しました。"
     , noticeRestored             = "文書をゴミ箱から復元しました。"
@@ -604,6 +649,22 @@ jaMessages = UiMessages
 formatDocumentFormat :: UiMessages -> DocumentFormat -> Text
 formatDocumentFormat msgs FormatMarkdown  = msgs.formatMarkdownLabel
 formatDocumentFormat msgs FormatPlainText = msgs.formatPlainTextLabel
+
+-- | 拡張カテゴリをユーザー向け表示文字列へ変換する。
+formatExtensionCategory :: UiMessages -> ExtensionCategory -> Text
+formatExtensionCategory msgs CategoryFormatting    = msgs.extensionsCatFormatting
+formatExtensionCategory msgs CategoryMarkdown      = msgs.extensionsCatMarkdown
+formatExtensionCategory msgs CategoryTextTransform = msgs.extensionsCatTextTransform
+
+-- | 拡張コマンド実行エラーをユーザー向けの表示文言へ整形する。
+formatExtensionError :: UiMessages -> ExtensionError -> Text
+formatExtensionError msgs err = case err of
+    ExtensionUnsupportedFormat{} ->
+        msgs.errExtensionUnsupportedFmt
+    ExtensionCommandFailed detail ->
+        msgs.errExtensionFailedPrefix <> " (" <> detail <> ")"
+    ExtensionCommandNotFound{} ->
+        msgs.errExtensionNotFound
 
 -- | ドメイン検証エラーをユーザー向けの表示文言へ整形する。
 formatValidationError :: UiMessages -> ValidationError -> Text

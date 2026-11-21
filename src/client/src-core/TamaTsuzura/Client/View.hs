@@ -14,6 +14,7 @@ module TamaTsuzura.Client.View
 import           Data.Either                     (fromRight)
 import qualified Data.Map.Strict                 as Map
 import           Data.Maybe                      (isJust, isNothing)
+import qualified Data.Set                        as Set
 import           Data.Text                       (Text)
 import qualified Data.Text                       as Txt
 import           Data.Time.Clock                 (UTCTime)
@@ -32,6 +33,7 @@ import           TamaTsuzura.Client.App
     , ConnectionStatus(..)
     , EditorDraft(..)
     , EditorViewMode(..)
+    , ExtensionCatalogEntry(..)
     , FilterState(..)
     , MobilePane(..)
     , PendingNavigation(..)
@@ -43,7 +45,7 @@ import           TamaTsuzura.Client.App
     )
 import           TamaTsuzura.Client.DraftStorage (DraftSyncState(..), StoredDraft(..))
 import           TamaTsuzura.Client.EditorBridge (EditorStats(..))
-import           TamaTsuzura.Client.I18n         (UiMessages(..), formatDocumentFormat)
+import           TamaTsuzura.Client.I18n         (UiMessages(..), formatDocumentFormat, formatExtensionCategory)
 import           TamaTsuzura.Client.Markdown     (renderMarkdownView)
 import           TamaTsuzura.Common.Api          (DocumentStatusFilter(..))
 import           TamaTsuzura.Common.Auth         (AuthSessionResponse(..), UserProfile(..))
@@ -72,7 +74,7 @@ import           TamaTsuzura.Common.Document
     )
 import           TamaTsuzura.Common.Revision     (RevisionDetail(..), RevisionSummary(..))
 import           TamaTsuzura.Common.Text         (ToText(..))
-import           TamaTsuzura.ExtensionApi        (ExtensionMetadata(..))
+import           TamaTsuzura.ExtensionApi        (ExtensionCommandInfo(..), ExtensionId, ExtensionMetadata(..))
 
 -- | モバイルファースト日本語 UI をレンダリングする純粋ビュー関数。
 -- 未認証時は中央配置のログイン・新規登録画面を表示し、認証済み時は
@@ -699,6 +701,9 @@ viewActiveEditor msgs state doc =
         , if state.revisionHistory.isHistoryOpen
             then viewRevisionHistoryPanel msgs state doc readOnly
             else H.div_ [ HP.class_ "tt-slot-empty" ] []
+        , if state.extensionsPanelOpen
+            then viewExtensionsPanel msgs state readOnly
+            else H.div_ [ HP.class_ "tt-slot-empty" ] []
         , viewEditorWorkspace msgs state
         , viewEditorStatusBar msgs state readOnly
         ]
@@ -707,10 +712,10 @@ viewActiveEditor msgs state doc =
     readOnly = isTrashed doc
 
     shellClass :: Text
-    shellClass =
-        if state.revisionHistory.isHistoryOpen
-            then "tt-editor-shell tt-history-open"
-            else "tt-editor-shell"
+    shellClass
+        | state.revisionHistory.isHistoryOpen = "tt-editor-shell tt-history-open"
+        | state.extensionsPanelOpen           = "tt-editor-shell tt-extensions-open"
+        | otherwise                           = "tt-editor-shell"
 
 viewDraftRecoveryBanner ::
        UiMessages
@@ -811,6 +816,12 @@ viewEditorToolbar msgs state doc =
                         [ text (ms msgs.actionHistoryToggle) ]
                    , H.button_
                         [ HP.type_ "button"
+                        , HP.class_ (ms extBtnClass)
+                        , HE.onClick ToggleExtensionsPanel
+                        ]
+                        [ text (ms msgs.actionExtensionsToggle) ]
+                   , H.button_
+                        [ HP.type_ "button"
                         , HP.class_ "tt-btn tt-btn-secondary tt-btn-compact"
                         , HE.onClick ExportCurrentDocument
                         ]
@@ -855,6 +866,12 @@ viewEditorToolbar msgs state doc =
     historyBtnClass :: Text
     historyBtnClass =
         if state.revisionHistory.isHistoryOpen
+            then "tt-btn tt-btn-secondary tt-btn-compact tt-btn-active"
+            else "tt-btn tt-btn-secondary tt-btn-compact"
+
+    extBtnClass :: Text
+    extBtnClass =
+        if state.extensionsPanelOpen
             then "tt-btn tt-btn-secondary tt-btn-compact tt-btn-active"
             else "tt-btn tt-btn-secondary tt-btn-compact"
 
@@ -1339,6 +1356,110 @@ viewUnifiedDiff msgs diff
                         [ text "\\ No newline at end of file" ]
                     ]
 
+viewExtensionsPanel ::
+       UiMessages
+    -> ClientState
+    -> Bool
+    -> View () () ClientState ClientAction
+viewExtensionsPanel msgs state readOnly =
+    H.section_ [ HP.class_ "tt-ext-panel", HP.aria_ "label" (ms msgs.extensionsPanelHeading) ]
+        [ H.div_ [ HP.class_ "tt-history-header" ]
+            [ H.div_ [ HP.class_ "tt-section-header" ]
+                [ H.h2_ [ HP.class_ "tt-section-heading" ] [ text (ms msgs.extensionsPanelHeading) ]
+                , H.span_ [ HP.class_ "tt-count" ]
+                    [ text (ms (Txt.pack (show enabledCount) <> " / " <> Txt.pack (show (length state.extensionCatalog)) <> msgs.documentsCountUnit)) ]
+                ]
+            , H.button_
+                [ HP.type_ "button"
+                , HP.class_ "tt-btn tt-btn-ghost tt-btn-xs"
+                , HE.onClick ToggleExtensionsPanel
+                ]
+                [ text (ms msgs.actionCloseExtensions) ]
+            ]
+        , if readOnly
+            then H.div_ [ HP.class_ "tt-banner tt-banner-warn", HP.role_ "status" ]
+                [ H.span_ [ HP.class_ "tt-banner-text" ] [ text (ms msgs.extensionsTrashedHint) ] ]
+            else H.div_ [ HP.class_ "tt-slot-empty" ] []
+        , H.div_ [ HP.class_ "tt-ext-panel-body" ]
+            [ H.ul_ [ HP.class_ "tt-ext-list" ]
+                (map viewExtensionCard state.extensionCatalog)
+            ]
+        ]
+  where
+    enabledCount :: Int
+    enabledCount = length (filter (\ e -> Set.member e.metadata.extensionId state.enabledExtensions) state.extensionCatalog)
+
+    isBusy :: Bool
+    isBusy = isJust state.savingDocument || isJust state.mutatingDocumentId || isJust state.restoringRevisionDoc
+
+    viewExtensionCard :: ExtensionCatalogEntry -> View () () ClientState ClientAction
+    viewExtensionCard entry =
+        let extId :: ExtensionId
+            extId = entry.metadata.extensionId
+
+            isEnabled :: Bool
+            isEnabled = Set.member extId state.enabledExtensions
+
+            toggleLabel :: Text
+            toggleLabel = if isEnabled then msgs.extensionsEnabledLabel else msgs.extensionsDisabledLabel
+
+            cardClass :: Text
+            cardClass = if isEnabled then "tt-ext-card tt-ext-card-enabled" else "tt-ext-card"
+        in  H.li_ [ HP.class_ (ms cardClass) ]
+                [ H.div_ [ HP.class_ "tt-ext-card-head" ]
+                    [ H.div_ [ HP.class_ "tt-ext-card-info" ]
+                        [ H.div_ [ HP.class_ "tt-ext-card-title-row" ]
+                            [ H.span_ [ HP.class_ "tt-ext-card-name" ]
+                                [ text (ms (toText entry.metadata.name)) ]
+                            , H.span_ [ HP.class_ "tt-doc-format" ]
+                                [ text (ms (formatExtensionCategory msgs entry.metadata.category)) ]
+                            , H.span_ [ HP.class_ "tt-ext-version" ]
+                                [ text (ms ("v" <> toText entry.metadata.version)) ]
+                            ]
+                        , H.p_ [ HP.class_ "tt-ext-card-desc" ]
+                            [ text (ms entry.metadata.description) ]
+                        ]
+                    , H.label_ [ HP.class_ "tt-checkbox-label tt-ext-toggle" ]
+                        [ H.input_
+                            [ HP.type_ "checkbox"
+                            , HP.checked_ isEnabled
+                            , HE.onChecked (\ (Checked _) -> ToggleExtensionEnabled extId)
+                            ]
+                        , H.span_ [] [ text (ms toggleLabel) ]
+                        ]
+                    ]
+                , if isEnabled
+                    then H.div_ [ HP.class_ "tt-ext-commands" ]
+                        (map (viewCommandRow extId) entry.commands)
+                    else H.div_ [ HP.class_ "tt-slot-empty" ] []
+                ]
+
+    viewCommandRow :: ExtensionId -> ExtensionCommandInfo -> View () () ClientState ClientAction
+    viewCommandRow extId cmd =
+        let formatIncompatible :: Bool
+            formatIncompatible = cmd.markdownOnly && state.draft.format /= FormatMarkdown
+
+            isDisabled :: Bool
+            isDisabled = readOnly || isBusy || formatIncompatible
+        in  H.div_ [ HP.class_ "tt-ext-cmd-row" ]
+                [ H.div_ [ HP.class_ "tt-ext-cmd-meta" ]
+                    [ H.div_ [ HP.class_ "tt-ext-cmd-title-row" ]
+                        ( H.span_ [ HP.class_ "tt-ext-cmd-label" ] [ text (ms (toText cmd.label)) ]
+                        : [ H.span_ [ HP.class_ "tt-tag-chip" ] [ text (ms msgs.extensionsMarkdownOnly) ]
+                          | cmd.markdownOnly
+                          ]
+                        )
+                    , H.span_ [ HP.class_ "tt-ext-cmd-desc" ] [ text (ms cmd.description) ]
+                    ]
+                , H.button_
+                    ( [ HP.type_ "button"
+                      , HP.class_ "tt-btn tt-btn-primary tt-btn-xs"
+                      , HE.onClick (RunExtensionCommand extId cmd.commandId)
+                      ] <> disabledAttr isDisabled
+                    )
+                    [ text (ms (toText cmd.label)) ]
+                ]
+
 -- | CodeMirror 6 ホストと Markdown プレビューのワークスペース。
 -- 編集/プレビュー切替時も Custom Element @\<tt-codemirror-editor\>@ を DOM から破棄せず
 -- CSS クラスで可視性のみ切り替えることで、CodeMirror 6 の Undo 履歴とカーソル位置を保持する。
@@ -1391,7 +1512,7 @@ viewEditorStatusBar msgs state readOnly =
                    ]
                 <> draftSyncIndicator
             )
-        , viewExtensionQuickActions msgs state.extensionMetadatas readOnly
+        , viewExtensionQuickActions msgs state readOnly
         ]
   where
     stats :: EditorStats
@@ -1432,26 +1553,40 @@ viewEditorStatusBar msgs state readOnly =
 
 viewExtensionQuickActions ::
        UiMessages
-    -> [ExtensionMetadata]
+    -> ClientState
     -> Bool
     -> View () () ClientState ClientAction
-viewExtensionQuickActions _ [] _ = H.div_ [ HP.class_ "tt-slot-empty" ] []
-viewExtensionQuickActions msgs metas readOnly =
-    H.div_ [ HP.class_ "tt-ext-bar" ]
-        ( H.span_ [ HP.class_ "tt-ext-label" ] [ text (ms (msgs.extensionsHeading <> ":")) ]
-        : map extButton metas
-        )
+viewExtensionQuickActions msgs state readOnly =
+    case enabledCommands of
+        [] -> H.div_ [ HP.class_ "tt-slot-empty" ] []
+        cmds ->
+            H.div_ [ HP.class_ "tt-ext-bar" ]
+                ( H.span_ [ HP.class_ "tt-ext-label" ] [ text (ms (msgs.extensionsHeading <> ":")) ]
+                : map cmdButton cmds
+                )
   where
-    extButton :: ExtensionMetadata -> View () () ClientState ClientAction
-    extButton meta =
+    isBusy :: Bool
+    isBusy = isJust state.savingDocument || isJust state.mutatingDocumentId || isJust state.restoringRevisionDoc
+
+    enabledCommands :: [(ExtensionCatalogEntry, ExtensionCommandInfo)]
+    enabledCommands =
+        [ (entry, cmd)
+        | entry <- state.extensionCatalog
+        , Set.member entry.metadata.extensionId state.enabledExtensions
+        , cmd <- take 1 entry.commands
+        , not cmd.markdownOnly || state.draft.format == FormatMarkdown
+        ]
+
+    cmdButton :: (ExtensionCatalogEntry, ExtensionCommandInfo) -> View () () ClientState ClientAction
+    cmdButton (entry, cmd) =
         H.button_
             ( [ HP.type_ "button"
               , HP.class_ "tt-btn tt-btn-ghost tt-btn-xs"
-              , HP.title_ (ms meta.description)
-              , HE.onClick (ApplyExtension meta.extensionId)
-              ] <> disabledAttr readOnly
+              , HP.title_ (ms cmd.description)
+              , HE.onClick (RunExtensionCommand entry.metadata.extensionId cmd.commandId)
+              ] <> disabledAttr (readOnly || isBusy)
             )
-            [ text (ms (toText meta.name)) ]
+            [ text (ms (toText cmd.label)) ]
 
 viewModals :: UiMessages -> ClientState -> View () () ClientState ClientAction
 viewModals msgs state = case state.authState of

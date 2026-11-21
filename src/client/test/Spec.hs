@@ -14,6 +14,7 @@ import qualified Data.ByteString.Lazy                 as LazyBS
 import           Data.IORef                           (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict                      as Map
 import           Data.Maybe                           (isNothing)
+import qualified Data.Set                             as Set
 import           Data.Text                            (Text)
 import qualified Data.Text                            as Txt
 import qualified Data.Text.Encoding                   as TxtEnc
@@ -104,6 +105,7 @@ import           TamaTsuzura.Client.App
     , applyDraftsLoaded
     , applyEditorEvent
     , applyExtensionById
+    , applyExtensionCommand
     , applyFoldersResult
     , applyHealthResult
     , applyRevisionDetailLoaded
@@ -191,6 +193,8 @@ import           TamaTsuzura.Client.I18n
     ( UiMessages(..)
     , formatApiClientError
     , formatDocumentFormat
+    , formatExtensionCategory
+    , formatExtensionError
     , formatFileImportError
     , formatLoginApiError
     , formatRegisterApiError
@@ -276,7 +280,7 @@ import           TamaTsuzura.Common.Revision
     )
 import           TamaTsuzura.Common.Text              (ToText(..))
 import           TamaTsuzura.Common.Validation        (ValidationError(..), maxDocumentBodyBytes)
-import           TamaTsuzura.ExtensionApi             (ExtensionId(..))
+import           TamaTsuzura.ExtensionApi             (CommandId(..), ExtensionCategory(..), ExtensionError(..), ExtensionId(..), validateExtensionRegistry)
 import           Test.Hspec                           (Spec, describe, expectationFailure, hspec, it, shouldBe, shouldSatisfy)
 import           Test.QuickCheck                      (property)
 
@@ -647,7 +651,9 @@ spec = do
             state.mobilePane `shouldBe` PaneList
             state.editorViewMode `shouldBe` ModeEdit
             state.draft `shouldBe` emptyEditorDraft
-            length state.extensionMetadatas `shouldBe` 1
+            length state.extensionCatalog `shouldBe` 3
+            Set.size state.enabledExtensions `shouldBe` 2
+            fmap length (validateExtensionRegistry bundledExtensions) `shouldBe` Right 3
 
         it "applies a bundled extension by id, bumps sync version, and ignores trashed or unknown ids" $ do
             doc <- mkSampleDocument "doc-ext" "拡張テスト"
@@ -2930,6 +2936,189 @@ spec = do
                     TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () st (viewClient jaMessages st)))
             htmlText `shouldSatisfy` Txt.isInfixOf jaMessages.historyTrashedRestoreHint
             htmlText `shouldSatisfy` (not . Txt.isInfixOf jaMessages.actionRestoreRevision)
+
+    describe "M5 Phase 2: Bundled extension registry, enable/disable UI, and command execution" $ do
+        it "toggles extensions panel mutually exclusively with revision history and toggles enabled state" $ do
+            baseState <- mkAuthenticatedState
+            doc <- mkSampleDocument "doc-ext-mvu" "拡張検証"
+            (env, _, _, _, _, _) <- mkFullMockClientEnv (\ _ -> pure (Left "no-http")) (pure (Right [])) (pure FilePickCancelled)
+            let s0 :: ClientState
+                s0 = baseState
+                    { selectedDocument = Just doc
+                    , draft            = withDraftBody (DocumentBody "#見出し\n* 項目\nＴａｍａ　１２３\n") (draftFromDocument doc)
+                    , revisionHistory  = emptyRevisionHistoryState { isHistoryOpen = True, documentId = Just doc.id }
+                    }
+            -- Opening extensions panel closes revision history panel
+            (sOpen, _) <- runActionQueue env [ToggleExtensionsPanel] s0
+            sOpen.extensionsPanelOpen `shouldBe` True
+            sOpen.revisionHistory.isHistoryOpen `shouldBe` False
+
+            -- Disabled opt-in extension (text-transform) is rejected before execution
+            (sRejected, _) <- runActionQueue env [RunExtensionCommand (ExtensionId "text-transform") (CommandId "normalize-fullwidth-alnum")] sOpen
+            sRejected.lastError `shouldBe` Just jaMessages.errExtensionNotEnabled
+            sRejected.draft.body `shouldBe` sOpen.draft.body
+
+            -- Enabling text-transform allows running its commands and updates view/status bar
+            (sEnabled, _) <- runActionQueue env [ToggleExtensionEnabled (ExtensionId "text-transform")] sRejected
+            Set.member (ExtensionId "text-transform") sEnabled.enabledExtensions `shouldBe` True
+
+            let htmlPanel :: Text
+                htmlPanel = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () sEnabled (viewClient jaMessages sEnabled)))
+            htmlPanel `shouldSatisfy` Txt.isInfixOf jaMessages.extensionsPanelHeading
+            htmlPanel `shouldSatisfy` Txt.isInfixOf "3 / 3件"
+            htmlPanel `shouldSatisfy` Txt.isInfixOf jaMessages.extensionsMarkdownOnly
+            htmlPanel `shouldSatisfy` Txt.isInfixOf "行を昇順ソート"
+
+            -- Closing extensions panel
+            (sClosed, _) <- runActionQueue env [ToggleExtensionsPanel] sEnabled
+            sClosed.extensionsPanelOpen `shouldBe` False
+
+        it "executes markdown formatter, TOC generator, and text transform commands with sync/draft side effects and error handling" $ do
+            baseState <- mkAuthenticatedState
+            doc <- mkSampleDocument "doc-ext-run" "整形検証"
+            (env, _, cmdRef, savedDraftsRef, _, _) <- mkFullMockClientEnv (\ _ -> pure (Left "no-http")) (pure (Right [])) (pure FilePickCancelled)
+            let s0 :: ClientState
+                s0 = baseState
+                    { selectedDocument  = Just doc
+                    , draft             = withDraftBody (DocumentBody "#見出し   \n* 項目\nＴａｍａ　１２３\n") (draftFromDocument doc)
+                    , enabledExtensions = Set.insert (ExtensionId "text-transform") baseState.enabledExtensions
+                    }
+            (s1, _) <- runActionQueue env
+                [ RunExtensionCommand (ExtensionId "markdown-formatter") (CommandId "format-markdown")
+                , RunExtensionCommand (ExtensionId "text-transform") (CommandId "normalize-fullwidth-alnum")
+                ]
+                s0
+            s1.draft.body `shouldBe` DocumentBody "# 見出し\n- 項目\nTama 123\n"
+            s1.lastError `shouldBe` Nothing
+            s1.statusNotice `shouldBe` Just "全角英数字を半角へ統一しました。"
+            cmds <- readIORef cmdRef
+            cmds `shouldSatisfy` (not . null)
+            savedDrafts <- readIORef savedDraftsRef
+            savedDrafts `shouldSatisfy` (not . null)
+
+            -- Plain text format blocks markdownOnly command with localized error
+            let sPlain :: ClientState
+                sPlain = s1 { draft = withDraftFormat FormatPlainText s1.draft }
+            (sFmtErr, _) <- runActionQueue env [RunExtensionCommand (ExtensionId "markdown-formatter") (CommandId "format-markdown")] sPlain
+            sFmtErr.lastError `shouldBe` Just jaMessages.errExtensionUnsupportedFmt
+
+            -- ExtensionCommandFailed (insert-toc without headings) surfaces localized error
+            let sNoHeadings :: ClientState
+                sNoHeadings = s1 { draft = withDraftBody (DocumentBody "見出しなし") s1.draft }
+            (sTocErr, _) <- runActionQueue env [RunExtensionCommand (ExtensionId "markdown-formatter") (CommandId "insert-toc")] sNoHeadings
+            sTocErr.lastError `shouldSatisfy` maybe False (Txt.isPrefixOf jaMessages.errExtensionFailedPrefix)
+
+            -- Pure applyExtensionCommand reports missing command ID cleanly
+            applyExtensionCommand bundledExtensions (ExtensionId "markdown-formatter") (CommandId "no-such-cmd") s1
+                `shouldBe` Left (ExtensionCommandNotFound (ExtensionId "markdown-formatter") (CommandId "no-such-cmd"))
+
+        it "enforces mutual exclusion, lifecycle resets, safety guards, unknown ID ignore, and view/I18n details" $ do
+            baseState <- mkAuthenticatedState
+            doc1 <- mkSampleDocument "doc-ext-g1" "文書1"
+            doc2 <- mkSampleDocument "doc-ext-g2" "文書2"
+            let handler :: HttpRequest -> IO (Either Text HttpResponse)
+                handler req
+                    | req.method == MethodGet && req.url == "/api/documents/doc-ext-g1/revisions" =
+                        pure (Right (HttpResponse 200 (encodeStrict (RevisionListResponse [] 0))))
+                    | req.method == MethodGet && req.url == "/api/documents?status=trashed" =
+                        pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [] 0))))
+                    | otherwise =
+                        pure (Left "unexpected")
+            (env, _, cmdRef, savedDraftsRef, _, _) <- mkFullMockClientEnv handler (pure (Right [])) (pure FilePickCancelled)
+
+            let sOpen :: ClientState
+                sOpen = baseState
+                    { selectedDocument    = Just doc1
+                    , draft               = draftFromDocument doc1
+                    , extensionsPanelOpen = True
+                    , enabledExtensions   = Set.insert (ExtensionId "text-transform") baseState.enabledExtensions
+                    }
+
+            -- Reverse mutual exclusion: opening revision history closes extensions panel
+            (sRevOpen, _) <- runActionQueue env [ToggleRevisionHistory] sOpen
+            sRevOpen.revisionHistory.isHistoryOpen `shouldBe` True
+            sRevOpen.extensionsPanelOpen `shouldBe` False
+
+            -- Unknown extension ID does not pollute enabledExtensions
+            (sUnknownToggle, _) <- runActionQueue env [ToggleExtensionEnabled (ExtensionId "unknown-ext")] sOpen
+            sUnknownToggle.enabledExtensions `shouldBe` sOpen.enabledExtensions
+
+            -- Document load / create / soft-delete / permanent-delete / status switch close extensionsPanelOpen
+            let sAfterLoad :: ClientState
+                sAfterLoad = applyDocumentLoaded jaMessages doc2.id (Right doc2) (sOpen { openingDocumentId = Just doc2.id })
+
+                sAfterCreate :: ClientState
+                sAfterCreate = applyDocumentCreated jaMessages (Right doc2) sOpen
+
+                sAfterSoftDel :: ClientState
+                sAfterSoftDel = applyDocumentSoftDeleted jaMessages doc1.id (Right (withDocDeletedAt (Just sampleUtcTime) doc1)) sOpen
+
+                sAfterPermDel :: ClientState
+                sAfterPermDel = applyDocumentPermanentlyDeleted jaMessages doc1.id (Right ()) sOpen
+
+                sExpired :: ClientState
+                sExpired = applySessionExpired jaMessages sOpen
+            sAfterLoad.extensionsPanelOpen `shouldBe` False
+            sAfterCreate.extensionsPanelOpen `shouldBe` False
+            sAfterSoftDel.extensionsPanelOpen `shouldBe` False
+            sAfterPermDel.extensionsPanelOpen `shouldBe` False
+            sExpired.extensionsPanelOpen `shouldBe` False
+            Set.size sExpired.enabledExtensions `shouldBe` 2
+
+            (sSwitchedTab, _) <- runActionQueue env [RequestStatusFilter StatusTrashed] sOpen
+            sSwitchedTab.extensionsPanelOpen `shouldBe` False
+
+            -- Safety guards: trashed, saving, mutating, restoring, and Nothing selectedDocument block RunExtensionCommand
+            let runTrimCmd :: ClientAction
+                runTrimCmd = RunExtensionCommand (ExtensionId "trim-trailing-spaces") (CommandId "trim")
+
+                blockedStates :: [ClientState]
+                blockedStates =
+                    [ sOpen { selectedDocument = Just (withDocDeletedAt (Just sampleUtcTime) doc1) }
+                    , sOpen { savingDocument = Just (doc1.id, sOpen.draft) }
+                    , sOpen { mutatingDocumentId = Just doc1.id }
+                    , sOpen { restoringRevisionDoc = Just doc1.id }
+                    , sOpen { selectedDocument = Nothing }
+                    ]
+            mapM_ (\ st -> do
+                writeIORef cmdRef []
+                writeIORef savedDraftsRef []
+                (after, _) <- runActionQueue env [runTrimCmd] st
+                after.draft.body `shouldBe` st.draft.body
+                readIORef cmdRef >>= (`shouldBe` [])
+                readIORef savedDraftsRef >>= (`shouldBe` [])
+                ) blockedStates
+
+            -- View: open extensions panel keeps CodeMirror mounted, plain_text hides MD quick action, trashed shows hint
+            let htmlOpen :: Text
+                htmlOpen = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () sOpen (viewClient jaMessages sOpen)))
+
+                sPlain :: ClientState
+                sPlain = sOpen { draft = withDraftFormat FormatPlainText sOpen.draft, extensionsPanelOpen = False }
+
+                htmlPlain :: Text
+                htmlPlain = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () sPlain (viewClient jaMessages sPlain)))
+
+                sTrashed :: ClientState
+                sTrashed = sOpen { selectedDocument = Just (withDocDeletedAt (Just sampleUtcTime) doc1) }
+
+                htmlTrashed :: Text
+                htmlTrashed = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () sTrashed (viewClient jaMessages sTrashed)))
+            htmlOpen `shouldSatisfy` Txt.isInfixOf "tt-extensions-open"
+            htmlOpen `shouldSatisfy` Txt.isInfixOf "<tt-codemirror-editor"
+            htmlPlain `shouldSatisfy` (not . Txt.isInfixOf "Markdown 書式整形")
+            htmlTrashed `shouldSatisfy` Txt.isInfixOf jaMessages.extensionsTrashedHint
+
+            -- I18n formatters for extension categories and errors
+            formatExtensionCategory jaMessages CategoryFormatting `shouldBe` jaMessages.extensionsCatFormatting
+            formatExtensionCategory jaMessages CategoryMarkdown `shouldBe` jaMessages.extensionsCatMarkdown
+            formatExtensionCategory jaMessages CategoryTextTransform `shouldBe` jaMessages.extensionsCatTextTransform
+            formatExtensionError jaMessages (ExtensionUnsupportedFormat FormatMarkdown FormatPlainText)
+                `shouldBe` jaMessages.errExtensionUnsupportedFmt
+            formatExtensionError jaMessages (ExtensionCommandNotFound (ExtensionId "e") (CommandId "c"))
+                `shouldBe` jaMessages.errExtensionNotFound
+            formatExtensionError jaMessages (ExtensionCommandFailed "boom")
+                `shouldBe` (jaMessages.errExtensionFailedPrefix <> " (boom)")
 
 recordingTransport ::
        IORef (Maybe HttpRequest)

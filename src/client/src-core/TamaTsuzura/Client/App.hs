@@ -33,6 +33,8 @@ module TamaTsuzura.Client.App
     , RevisionHistoryState(..)
     , emptyRevisionHistoryState
     , resetRevisionHistory
+    , ExtensionCatalogEntry(..)
+    , defaultEnabledExtensions
     , ClientState(..)
     , ClientAction(..)
       -- * 純粋な変換・検証・判定関数
@@ -56,6 +58,7 @@ module TamaTsuzura.Client.App
     , applyAuthSubmitted
     , applySessionExpired
     , applyExtensionById
+    , applyExtensionCommand
     , applyHealthResult
     , applyDocumentsResult
     , applyTagsResult
@@ -86,7 +89,9 @@ import           Data.Foldable                   (for_)
 import           Data.List                       (find)
 import           Data.Map.Strict                 (Map)
 import qualified Data.Map.Strict                 as Map
-import           Data.Maybe                      (isJust, isNothing)
+import           Data.Maybe                      (fromMaybe, isJust, isNothing)
+import           Data.Set                        (Set)
+import qualified Data.Set                        as Set
 import           Data.Text                       (Text)
 import qualified Data.Text                       as Txt
 import           Data.Time.Clock                 (UTCTime, getCurrentTime)
@@ -146,6 +151,7 @@ import           TamaTsuzura.Client.FileTransfer
 import           TamaTsuzura.Client.I18n
     ( UiMessages(..)
     , formatApiClientError
+    , formatExtensionError
     , formatFileImportError
     , formatLoginApiError
     , formatRegisterApiError
@@ -210,7 +216,18 @@ import           TamaTsuzura.Common.Revision
     )
 import           TamaTsuzura.Common.Text         (ToText(..))
 import           TamaTsuzura.Common.Validation   (ValidationError)
-import           TamaTsuzura.ExtensionApi        (Extension(..), ExtensionId, ExtensionMetadata(..))
+import           TamaTsuzura.ExtensionApi
+    ( CommandId
+    , Extension(..)
+    , ExtensionCommandInfo
+    , ExtensionContext(..)
+    , ExtensionError(..)
+    , ExtensionId
+    , ExtensionMetadata(..)
+    , ExtensionResult(..)
+    , runExtensionCommand
+    , toExtensionCommandInfo
+    )
 
 -- | Miso コンポーネント実行時に外部から注入される不変の依存環境。
 -- 関数を含む 'Extension' や 'HttpTransport'・エディタコマンド送出器・ローカルストレージ・
@@ -582,6 +599,24 @@ resetRevisionHistory rh = emptyRevisionHistoryState
     , detailRequestSeq = rh.detailRequestSeq + 1
     }
 
+-- | Miso Model 内で保持する拡張機能の純粋カタログエントリ (メタデータ＋コマンドメタデータ)。
+-- 実行関数を含めないことで 'ClientState' の 'Eq' / 'Show' 導出を維持する。
+data ExtensionCatalogEntry = ExtensionCatalogEntry
+    { metadata :: !ExtensionMetadata
+      -- ^ 拡張機能の基本メタデータ
+    , commands :: ![ExtensionCommandInfo]
+      -- ^ 拡張機能が提供するコマンドメタデータ一覧
+    } deriving (Eq, Show)
+
+-- | カタログから既定有効 (@defaultEnabled == True@) な拡張 ID 集合を算出する。
+defaultEnabledExtensions :: [ExtensionCatalogEntry] -> Set ExtensionId
+defaultEnabledExtensions entries =
+    Set.fromList
+        [ entry.metadata.extensionId
+        | entry <- entries
+        , entry.metadata.defaultEnabled
+        ]
+
 -- | クライアントコアの状態モデル (Miso Model)。
 -- 本モジュールは 'tamatsuzura-common' と 'tamatsuzura-extension-api' のみに依存し、
 -- 同梱拡張の具体実装には依存しない。
@@ -658,6 +693,10 @@ data ClientState = ClientState
       -- ^ エディタ内検索・置換パネルの状態
     , revisionHistory              :: !RevisionHistoryState
       -- ^ 過去リビジョン履歴閲覧・復元パネルの状態
+    , extensionsPanelOpen          :: !Bool
+      -- ^ 拡張機能管理・コマンド実行パネルを開いているか
+    , enabledExtensions            :: !(Set ExtensionId)
+      -- ^ 現在有効化されている拡張機能 ID の集合
     , pendingNavigation            :: !(Maybe PendingNavigation)
       -- ^ 未保存変更破棄の確認ダイアログ待ち遷移
     , confirmPermanentDelete       :: !(Maybe DocumentId)
@@ -666,8 +705,8 @@ data ClientState = ClientState
       -- ^ 直近発生したユーザー向けエラーメッセージ
     , statusNotice                 :: !(Maybe Text)
       -- ^ 保存・復元などの完了通知メッセージ
-    , extensionMetadatas           :: ![ExtensionMetadata]
-      -- ^ 結線層から登録された拡張機能の表示用メタデータ一覧
+    , extensionCatalog             :: ![ExtensionCatalogEntry]
+      -- ^ 結線層から登録された拡張機能のカタログ (メタデータ＋コマンド一覧)
     } deriving (Eq, Show)
 
 -- | クライアント MVU ループで処理するアクション。
@@ -793,7 +832,13 @@ data ClientAction
     | DocumentPermanentlyDeleted !Int !DocumentId !(Either ApiClientError ())
       -- ^ 完全削除の結果受信 (認証セッション世代番号, 文書 ID, 結果)
     | ApplyExtension !ExtensionId
-      -- ^ 指定した拡張機能を現在の編集本文へ適用する
+      -- ^ 指定した拡張機能のプライマリ変換を現在の編集本文へ適用する (互換アクション)
+    | ToggleExtensionsPanel
+      -- ^ 拡張機能管理パネルの開閉
+    | ToggleExtensionEnabled !ExtensionId
+      -- ^ 指定した拡張機能の有効・無効を切り替える
+    | RunExtensionCommand !ExtensionId !CommandId
+      -- ^ 有効化済み拡張の指定コマンドを現在文書へ実行する
     | DraftsLoaded !Int !(Either Text [StoredDraft])
       -- ^ IndexedDB 未保存ドラフト一覧の読み込み結果 (認証セッション世代番号, 結果)
     | DraftStorageEventReceived !DraftStorageEvent
@@ -846,51 +891,62 @@ data ClientAction
       -- ^ 表示中の通知バナーを閉じる
     deriving (Eq, Show)
 
--- | 拡張一覧のメタデータを取り込んで初期クライアント状態を構築する。
+-- | 拡張一覧のメタデータ・コマンド情報を取り込んで初期クライアント状態を構築する。
 initialClientState :: [Extension] -> ClientState
-initialClientState exts = ClientState
-    { connectionStatus             = ConnChecking
-    , authState                    = AuthChecking
-    , authSessionSeq               = 0
-    , isLoggingOut                 = False
-    , mobilePane                   = PaneList
-    , editorViewMode               = ModeEdit
-    , filterState                  = defaultFilterState
-    , availableTags                = []
-    , availableFolders             = []
-    , documentSummaries            = []
-    , totalDocuments               = 0
-    , listRequestSeq               = 0
-    , isLoadingDocuments           = False
-    , isCreatingDocument           = False
-    , isImportingDocument          = False
-    , pendingListReloadAfterCreate = False
-    , pendingListReloadAfterImport = False
-    , openingDocumentId            = Nothing
-    , autoOpeningDraftId           = Nothing
-    , savingDocument               = Nothing
-    , mutatingDocumentId           = Nothing
-    , restoringRevisionDoc         = Nothing
-    , selectedDocument             = Nothing
-    , draft                        = emptyEditorDraft
-    , storedDrafts                 = Map.empty
-    , draftSyncState               = DraftSyncIdle
-    , restoredDraftDocId           = Nothing
-    , staleDraftPrompt             = Nothing
-    , orphanedDraft                = Nothing
-    , editorSyncVersion            = 0
-    , editorStats                  = emptyEditorStats
-    , canUndo                      = False
-    , canRedo                      = False
-    , metadataPanelOpen            = False
-    , searchPanel                  = emptySearchPanelState
-    , revisionHistory              = emptyRevisionHistoryState
-    , pendingNavigation            = Nothing
-    , confirmPermanentDelete       = Nothing
-    , lastError                    = Nothing
-    , statusNotice                 = Nothing
-    , extensionMetadatas           = map (\ ext -> ext.metadata) exts
-    }
+initialClientState exts =
+    let catalog :: [ExtensionCatalogEntry]
+        catalog = map toCatalogEntry exts
+    in  ClientState
+            { connectionStatus             = ConnChecking
+            , authState                    = AuthChecking
+            , authSessionSeq               = 0
+            , isLoggingOut                 = False
+            , mobilePane                   = PaneList
+            , editorViewMode               = ModeEdit
+            , filterState                  = defaultFilterState
+            , availableTags                = []
+            , availableFolders             = []
+            , documentSummaries            = []
+            , totalDocuments               = 0
+            , listRequestSeq               = 0
+            , isLoadingDocuments           = False
+            , isCreatingDocument           = False
+            , isImportingDocument          = False
+            , pendingListReloadAfterCreate = False
+            , pendingListReloadAfterImport = False
+            , openingDocumentId            = Nothing
+            , autoOpeningDraftId           = Nothing
+            , savingDocument               = Nothing
+            , mutatingDocumentId           = Nothing
+            , restoringRevisionDoc         = Nothing
+            , selectedDocument             = Nothing
+            , draft                        = emptyEditorDraft
+            , storedDrafts                 = Map.empty
+            , draftSyncState               = DraftSyncIdle
+            , restoredDraftDocId           = Nothing
+            , staleDraftPrompt             = Nothing
+            , orphanedDraft                = Nothing
+            , editorSyncVersion            = 0
+            , editorStats                  = emptyEditorStats
+            , canUndo                      = False
+            , canRedo                      = False
+            , metadataPanelOpen            = False
+            , searchPanel                  = emptySearchPanelState
+            , revisionHistory              = emptyRevisionHistoryState
+            , extensionsPanelOpen          = False
+            , enabledExtensions            = defaultEnabledExtensions catalog
+            , pendingNavigation            = Nothing
+            , confirmPermanentDelete       = Nothing
+            , lastError                    = Nothing
+            , statusNotice                 = Nothing
+            , extensionCatalog             = catalog
+            }
+  where
+    toCatalogEntry :: Extension -> ExtensionCatalogEntry
+    toCatalogEntry ext = ExtensionCatalogEntry
+        { metadata = ext.metadata
+        , commands = map toExtensionCommandInfo ext.commands
+        }
 
 -- | ワークスペース上の全ユーザーデータを破棄し、未認証状態へ戻すための純粋リセット関数。
 -- 接続状態および拡張メタデータは保持しつつ、文書一覧・選択文書・編集ドラフト・フィルタ・
@@ -938,6 +994,8 @@ resetWorkspaceForUnauthenticated nextForm mErr mNotice state = state
     , metadataPanelOpen            = False
     , searchPanel                  = emptySearchPanelState
     , revisionHistory              = resetRevisionHistory state.revisionHistory
+    , extensionsPanelOpen          = False
+    , enabledExtensions            = defaultEnabledExtensions state.extensionCatalog
     , pendingNavigation            = Nothing
     , confirmPermanentDelete       = Nothing
     , lastError                    = mErr
@@ -1204,6 +1262,38 @@ applyExtensionById exts targetId state
     hasTargetId :: Extension -> Bool
     hasTargetId ext = ext.metadata.extensionId == targetId
 
+-- | 拡張レジストリ内の該当コマンドを検索し、フォーマット制約を検証した上で現在の本文へ純粋に適用する。
+-- 有効化状態 ('enabledExtensions') および選択文書・ゴミ箱・通信中ガードの判定は
+-- 'updateClient' の 'RunExtensionCommand' 側で実施する。
+-- コマンド不在・フォーマット不一致・コマンド固有失敗は 'Left' で返し、
+-- 正常時は更新後 'ClientState' と任意の実行サマリ文言を返す。
+applyExtensionCommand ::
+       [Extension]
+    -> ExtensionId
+    -> CommandId
+    -> ClientState
+    -> Either ExtensionError (ClientState, Maybe Text)
+applyExtensionCommand exts targetExtId targetCmdId state =
+    case find (\ ext -> ext.metadata.extensionId == targetExtId) exts of
+        Nothing ->
+            Left (ExtensionCommandNotFound targetExtId targetCmdId)
+        Just ext ->
+            let ctx :: ExtensionContext
+                ctx = ExtensionContext
+                    { body   = state.draft.body
+                    , format = state.draft.format
+                    }
+            in  case runExtensionCommand ext targetCmdId ctx of
+                    Left err -> Left err
+                    Right res ->
+                        let nextState :: ClientState
+                            nextState = state
+                                { draft             = setDraftBody res.nextBody state.draft
+                                , editorSyncVersion = state.editorSyncVersion + 1
+                                , editorStats       = computeTextStats (toText res.nextBody)
+                                }
+                        in  Right (nextState, res.summary)
+
 -- | ヘルスチェック応答をクライアント状態へ純粋に反映する。
 applyHealthResult ::
        UiMessages
@@ -1351,10 +1441,11 @@ applyDocumentLoaded msgs reqId result state
                         , editorSyncVersion  = state.editorSyncVersion + 1
                         , editorStats        = computeTextStats (toText sd.body)
                         , editorViewMode     = normalizeViewMode sd.format state.editorViewMode
-                        , canUndo            = False
-                        , canRedo            = False
-                        , revisionHistory    = resetRevisionHistory state.revisionHistory
-                        , mobilePane         = PaneEditor
+                        , canUndo             = False
+                        , canRedo             = False
+                        , revisionHistory     = resetRevisionHistory state.revisionHistory
+                        , extensionsPanelOpen = False
+                        , mobilePane          = PaneEditor
                         , lastError          = Nothing
                         , statusNotice       = Just msgs.noticeDraftRestored
                         }
@@ -1370,10 +1461,11 @@ applyDocumentLoaded msgs reqId result state
                         , editorSyncVersion  = state.editorSyncVersion + 1
                         , editorStats        = computeTextStats (toText doc.body)
                         , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
-                        , canUndo            = False
-                        , canRedo            = False
-                        , revisionHistory    = resetRevisionHistory state.revisionHistory
-                        , mobilePane         = PaneEditor
+                        , canUndo             = False
+                        , canRedo             = False
+                        , revisionHistory     = resetRevisionHistory state.revisionHistory
+                        , extensionsPanelOpen = False
+                        , mobilePane          = PaneEditor
                         , lastError          = Nothing
                         , statusNotice       = Nothing
                         }
@@ -1390,10 +1482,11 @@ applyDocumentLoaded msgs reqId result state
                         , editorSyncVersion  = state.editorSyncVersion + 1
                         , editorStats        = computeTextStats (toText doc.body)
                         , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
-                        , canUndo            = False
-                        , canRedo            = False
-                        , revisionHistory    = resetRevisionHistory state.revisionHistory
-                        , mobilePane         = PaneEditor
+                        , canUndo             = False
+                        , canRedo             = False
+                        , revisionHistory     = resetRevisionHistory state.revisionHistory
+                        , extensionsPanelOpen = False
+                        , mobilePane          = PaneEditor
                         , lastError          = Nothing
                         , statusNotice       = Nothing
                         }
@@ -1409,10 +1502,11 @@ applyDocumentLoaded msgs reqId result state
                         , editorSyncVersion  = state.editorSyncVersion + 1
                         , editorStats        = computeTextStats (toText doc.body)
                         , editorViewMode     = normalizeViewMode doc.format state.editorViewMode
-                        , canUndo            = False
-                        , canRedo            = False
-                        , revisionHistory    = resetRevisionHistory state.revisionHistory
-                        , mobilePane         = PaneEditor
+                        , canUndo             = False
+                        , canRedo             = False
+                        , revisionHistory     = resetRevisionHistory state.revisionHistory
+                        , extensionsPanelOpen = False
+                        , mobilePane          = PaneEditor
                         , lastError          = Nothing
                         , statusNotice       = Nothing
                         }
@@ -1471,10 +1565,11 @@ applyDocumentCreated _ (Right doc) state =
             , editorSyncVersion  = state.editorSyncVersion + 1
             , editorStats        = computeTextStats (toText doc.body)
             , editorViewMode     = ModeEdit
-            , canUndo            = False
-            , canRedo            = False
-            , revisionHistory    = resetRevisionHistory state.revisionHistory
-            , mobilePane         = PaneEditor
+            , canUndo             = False
+            , canRedo             = False
+            , revisionHistory     = resetRevisionHistory state.revisionHistory
+            , extensionsPanelOpen = False
+            , mobilePane          = PaneEditor
             , lastError          = Nothing
             , statusNotice       = Nothing
             }
@@ -1596,10 +1691,11 @@ applyDocumentSoftDeleted msgs targetId result state = case result of
                 , restoredDraftDocId = if wasSelected then Nothing else state.restoredDraftDocId
                 , staleDraftPrompt   = if wasSelected then Nothing else state.staleDraftPrompt
                 , editorStats        = if wasSelected then emptyEditorStats else state.editorStats
-                , canUndo            = not wasSelected && state.canUndo
-                , canRedo            = not wasSelected && state.canRedo
-                , revisionHistory    = if wasSelected then resetRevisionHistory state.revisionHistory else state.revisionHistory
-                , mobilePane         = if wasSelected then PaneList else state.mobilePane
+                , canUndo             = not wasSelected && state.canUndo
+                , canRedo             = not wasSelected && state.canRedo
+                , revisionHistory     = if wasSelected then resetRevisionHistory state.revisionHistory else state.revisionHistory
+                , extensionsPanelOpen = not wasSelected && state.extensionsPanelOpen
+                , mobilePane          = if wasSelected then PaneList else state.mobilePane
                 , lastError          = Nothing
                 , statusNotice       = Just msgs.noticeMovedToTrash
                 }
@@ -1682,6 +1778,7 @@ applyDocumentPermanentlyDeleted msgs targetId result state = case result of
                 , canUndo                = not wasSelected && state.canUndo
                 , canRedo                = not wasSelected && state.canRedo
                 , revisionHistory        = if wasSelected then resetRevisionHistory state.revisionHistory else state.revisionHistory
+                , extensionsPanelOpen    = not wasSelected && state.extensionsPanelOpen
                 , mobilePane             = if wasSelected then PaneList else state.mobilePane
                 , lastError              = Nothing
                 , statusNotice           = Just msgs.noticePermanentlyDeleted
@@ -2319,13 +2416,70 @@ updateClient env action = case action of
         let hasExt :: Bool
             hasExt = any (\ ext -> ext.metadata.extensionId == extId) env.extensions
         case st.selectedDocument of
-            Just doc | not (isTrashed doc) && hasExt && isNothing st.restoringRevisionDoc -> do
+            Just doc
+                | not (isTrashed doc)
+                    && hasExt
+                    && Set.member extId st.enabledExtensions
+                    && isNothing st.savingDocument
+                    && isNothing st.mutatingDocumentId
+                    && isNothing st.restoringRevisionDoc -> do
                 modify $ \ s ->
                     (applyExtensionById env.extensions extId s)
                         { statusNotice = Just env.messages.noticeExtensionApplied
                         }
                 syncLocalDraftForCurrentState
                 syncEditorFromCurrentState False
+            _ -> pure ()
+    ToggleExtensionsPanel -> do
+        st <- get
+        case st.selectedDocument of
+            Nothing -> pure ()
+            Just _ ->
+                if st.extensionsPanelOpen
+                    then modify (\ s -> s { extensionsPanelOpen = False })
+                    else modify $ \ s -> s
+                        { extensionsPanelOpen = True
+                        , revisionHistory     = resetRevisionHistory s.revisionHistory
+                        }
+    ToggleExtensionEnabled extId ->
+        modify $ \ s ->
+            let known :: Bool
+                known = any (\ entry -> entry.metadata.extensionId == extId) s.extensionCatalog
+
+                nextEnabled :: Set ExtensionId
+                nextEnabled
+                    | not known                            = s.enabledExtensions
+                    | Set.member extId s.enabledExtensions = Set.delete extId s.enabledExtensions
+                    | otherwise                            = Set.insert extId s.enabledExtensions
+            in  s { enabledExtensions = nextEnabled }
+    RunExtensionCommand extId cmdId -> do
+        st <- get
+        case st.selectedDocument of
+            Just doc
+                | not (isTrashed doc)
+                    && isNothing st.savingDocument
+                    && isNothing st.mutatingDocumentId
+                    && isNothing st.restoringRevisionDoc ->
+                    if not (Set.member extId st.enabledExtensions)
+                        then modify $ \ s -> s
+                            { lastError    = Just env.messages.errExtensionNotEnabled
+                            , statusNotice = Nothing
+                            }
+                        else case applyExtensionCommand env.extensions extId cmdId st of
+                            Left err ->
+                                modify $ \ s -> s
+                                    { lastError    = Just (formatExtensionError env.messages err)
+                                    , statusNotice = Nothing
+                                    }
+                            Right (nextState, mSummary) -> do
+                                let noticeMsg :: Text
+                                    noticeMsg = fromMaybe env.messages.noticeExtensionApplied mSummary
+                                modify $ const nextState
+                                    { lastError    = Nothing
+                                    , statusNotice = Just noticeMsg
+                                    }
+                                syncLocalDraftForCurrentState
+                                syncEditorFromCurrentState False
             _ -> pure ()
     DraftsLoaded seqNo eDrafts -> do
         stBefore <- get
@@ -2560,7 +2714,8 @@ updateClient env action = case action of
                         }
                     else do
                         modify $ \ s -> s
-                            { revisionHistory = (resetRevisionHistory s.revisionHistory)
+                            { extensionsPanelOpen = False
+                            , revisionHistory     = (resetRevisionHistory s.revisionHistory)
                                 { isHistoryOpen = True
                                 , documentId    = Just doc.id
                                 }
@@ -2832,10 +2987,11 @@ updateClient env action = case action of
                 , restoredDraftDocId = Nothing
                 , staleDraftPrompt   = Nothing
                 , editorStats        = emptyEditorStats
-                , canUndo            = False
-                , canRedo            = False
-                , revisionHistory    = resetRevisionHistory s.revisionHistory
-                , mobilePane         = PaneList
+                , canUndo             = False
+                , canRedo             = False
+                , revisionHistory     = resetRevisionHistory s.revisionHistory
+                , extensionsPanelOpen = False
+                , mobilePane          = PaneList
                 , statusNotice       = Nothing
                 }
             io_ (env.sendEditorCmd CmdResetEditor)
@@ -3037,6 +3193,8 @@ resetWorkspaceForAuthenticated session mNotice state = state
     , metadataPanelOpen            = False
     , searchPanel                  = emptySearchPanelState
     , revisionHistory              = resetRevisionHistory state.revisionHistory
+    , extensionsPanelOpen          = False
+    , enabledExtensions            = defaultEnabledExtensions state.extensionCatalog
     , pendingNavigation            = Nothing
     , confirmPermanentDelete       = Nothing
     , lastError                    = Nothing
