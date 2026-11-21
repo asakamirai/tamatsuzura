@@ -72,15 +72,24 @@ import           TamaTsuzura.Common.Auth
     , UserProfile(..)
     , validateRegisterRequest
     )
-import           TamaTsuzura.Common.Document      (Document, DocumentId)
+import           TamaTsuzura.Common.Document      (Document, DocumentId, RevisionNumber)
+import           TamaTsuzura.Common.Revision
+    ( RestoreRevisionRequest
+    , RevisionDetail
+    , RevisionListResponse
+    )
 import           TamaTsuzura.Common.Text          (ToText(..))
 import           TamaTsuzura.Server.Api
     ( AuthApi
     , CsrfVerifiedSession(..)
     , DocumentByIdApi
+    , DocumentRevisionByNumberApi
+    , DocumentRevisionsApi
     , DocumentsApi
     , RawCookieHeader(..)
     , RawDocumentListQuery(..)
+    , RawRevisionListQuery(..)
+    , RevisionListQuery(..)
     , SessionAuthContext(..)
     , TamaTsuzuraApi
     , apiErrorFormatters
@@ -88,6 +97,8 @@ import           TamaTsuzura.Server.Api
     , jsonContentType
     , parseDocumentIdParam
     , parseDocumentListQuery
+    , parseRevisionListQuery
+    , parseRevisionNumberParam
     , tamaTsuzuraApiProxy
     )
 import           TamaTsuzura.Server.Auth.Cookie
@@ -367,6 +378,17 @@ documentByIdHandlers storageCfg rawId =
         :<|> handleSoftDeleteDocument storageCfg rawId
         :<|> handleRestoreDocument storageCfg rawId
         :<|> handlePermanentDeleteDocument storageCfg rawId
+        :<|> documentRevisionsHandlers storageCfg rawId
+
+documentRevisionsHandlers :: StorageConfig -> Text -> Server DocumentRevisionsApi
+documentRevisionsHandlers storageCfg rawId =
+    handleListDocumentRevisions storageCfg rawId
+        :<|> documentRevisionByNumberHandlers storageCfg rawId
+
+documentRevisionByNumberHandlers :: StorageConfig -> Text -> Text -> Server DocumentRevisionByNumberApi
+documentRevisionByNumberHandlers storageCfg rawId rawRev =
+    handleGetDocumentRevision storageCfg rawId rawRev
+        :<|> handleRestoreDocumentRevision storageCfg rawId rawRev
 
 handleHealth :: Handler HealthStatus
 handleHealth = pure healthOk
@@ -585,6 +607,53 @@ handlePermanentDeleteDocument storageCfg rawId csrfSession = do
     () <- runStorage storageCfg (\ handle -> Storage.permanentDeleteDocument handle ownerId docId)
     pure NoContent
 
+handleListDocumentRevisions ::
+       StorageConfig
+    -> Text
+    -> SessionAuthContext
+    -> Maybe Text
+    -> Maybe Text
+    -> Handler RevisionListResponse
+handleListDocumentRevisions storageCfg rawId sessionCtx mLimit mOffset = do
+    let ownerId :: UserId
+        ownerId = sessionCtx.authenticated.user.id
+
+        rawQuery :: RawRevisionListQuery
+        rawQuery = RawRevisionListQuery
+            { rawLimit  = mLimit
+            , rawOffset = mOffset
+            }
+    docId <- parseIdOrThrow rawId
+    query <- either (Servant.throwError . apiErrorToServerError) pure (parseRevisionListQuery rawQuery)
+    runStorage storageCfg (\ handle -> Storage.listDocumentRevisions handle ownerId docId query.limit query.offset)
+
+handleGetDocumentRevision ::
+       StorageConfig
+    -> Text
+    -> Text
+    -> SessionAuthContext
+    -> Handler RevisionDetail
+handleGetDocumentRevision storageCfg rawId rawRev sessionCtx = do
+    let ownerId :: UserId
+        ownerId = sessionCtx.authenticated.user.id
+    docId <- parseIdOrThrow rawId
+    targetRev <- parseRevisionOrThrow rawRev
+    runStorage storageCfg (\ handle -> Storage.getDocumentRevision handle ownerId docId targetRev)
+
+handleRestoreDocumentRevision ::
+       StorageConfig
+    -> Text
+    -> Text
+    -> CsrfVerifiedSession
+    -> RestoreRevisionRequest
+    -> Handler Document
+handleRestoreDocumentRevision storageCfg rawId rawRev csrfSession req = do
+    let ownerId :: UserId
+        ownerId = csrfSession.authenticated.user.id
+    docId <- parseIdOrThrow rawId
+    targetRev <- parseRevisionOrThrow rawRev
+    runStorage storageCfg (\ handle -> Storage.restoreDocumentRevision handle ownerId docId targetRev req)
+
 handleListTags :: StorageConfig -> SessionAuthContext -> Handler TagListResponse
 handleListTags storageCfg sessionCtx =
     runStorage storageCfg (`Storage.listTags` sessionCtx.authenticated.user.id)
@@ -622,6 +691,10 @@ internalServerError = ApiError
 parseIdOrThrow :: Text -> Handler DocumentId
 parseIdOrThrow rawId =
     either (Servant.throwError . apiErrorToServerError) pure (parseDocumentIdParam rawId)
+
+parseRevisionOrThrow :: Text -> Handler RevisionNumber
+parseRevisionOrThrow rawRev =
+    either (Servant.throwError . apiErrorToServerError) pure (parseRevisionNumberParam rawRev)
 
 runStorage ::
        StorageConfig

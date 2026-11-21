@@ -23,6 +23,11 @@ module TamaTsuzura.Server.Storage
       -- * 整理メタデータ一覧 (所有者分離)
     , listTags
     , listFolders
+      -- * リビジョン履歴取得・復元 (所有者分離)
+    , listDocumentRevisions
+    , getDocumentRevision
+    , restoreDocumentRevision
+    , restoreDocumentRevisionAt
       -- re-export
     , StorageTarget(..)
     , BusyTimeoutMs
@@ -38,11 +43,10 @@ module TamaTsuzura.Server.Storage
     , storageErrorToApiError
     ) where
 
-import           Control.Exception                 (bracket)
-import           Control.Monad                     (forM_, unless)
-import           Data.Bifunctor                    (first)
-import           Data.Map.Strict                   (Map)
-import qualified Data.Map.Strict                   as Map
+import           Control.Exception                   (bracket)
+import           Control.Monad                       (forM_, unless)
+import           Data.Map.Strict                     (Map)
+import qualified Data.Map.Strict                     as Map
 import           Data.Maybe                        (fromMaybe)
 import           Data.Text                         (Text)
 import qualified Data.Text                         as Txt
@@ -74,7 +78,9 @@ import           TamaTsuzura.Common.Document
     , DocumentFormat
     , DocumentId
     , DocumentSummary(..)
+    , DocumentTitle
     , FolderPath
+    , RevisionNumber
     , Tag
     , TagSet
     , emptyTagSet
@@ -82,13 +88,23 @@ import           TamaTsuzura.Common.Document
     , mkDocumentId
     , mkDocumentTitle
     , mkFolderPath
+    , mkRevisionNumber
     , mkTag
     , mkTagSetFromTexts
     , parseDocumentFormat
+    , revisionNumberValue
     , tagSetToList
     )
-import           TamaTsuzura.Common.Text           (ToText(..))
-import           TamaTsuzura.Common.Validation     (ValidationError)
+import           TamaTsuzura.Common.Revision         (RestoreRevisionRequest(..), RevisionDetail(..))
+import           TamaTsuzura.Common.Text             (ToText(..))
+import           TamaTsuzura.Server.Storage.Revision
+    ( appendRevisionInTx
+    , computeRevisionContentHash
+    , getDocumentRevision
+    , insertInitialRevisionInTx
+    , listDocumentRevisions
+    , reconstructRevisionDetailInTx
+    )
 import           TamaTsuzura.Server.Storage.Schema
     ( StorageHandle(..)
     , asciiToLower
@@ -98,6 +114,7 @@ import           TamaTsuzura.Server.Storage.Schema
     , formatSqliteUtcTime
     , initializeSchema
     , inspectPragmas
+    , mapValidationToCorrupted
     , parseSqliteUtcTime
     , truncateToMicros
     , withImmediateTransaction
@@ -118,9 +135,11 @@ import           TamaTsuzura.Server.Storage.Types
     , storageErrorToApiError
     )
 
-type DocumentRow = (Text, Text, Text, Text, Maybe Text, Text, Text, Maybe Text)
+type DocumentRow = (Text, Text, Text, Text, Maybe Text, Int, Text, Text, Maybe Text)
 
-type SummaryRow = (Text, Text, Text, Maybe Text, Text, Text, Maybe Text)
+type SummaryRow = (Text, Text, Text, Maybe Text, Int, Text, Text, Maybe Text)
+
+type UpdateTargetRow = (Text, Text, Text, Int, Text, Maybe Text)
 
 -- | 設定に従って SQLite 接続を開き、PRAGMA 設定およびスキーマ初期化を行った上で
 -- アクションを実行し、終了時に必ず接続を閉じる。
@@ -205,19 +224,27 @@ createDocumentWith handle ownerId docId now req =
                                     SQLite.execute
                                         handle.connection
                                         "INSERT INTO documents\
-                                        \ (id, owner_id, title, body, format, folder, created_at, updated_at, deleted_at)\
-                                        \ VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)"
+                                        \ (id, owner_id, title, body, format, folder, revision, created_at, updated_at, deleted_at)\
+                                        \ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"
                                         ( toText newDoc.id
                                         , toText ownerId
                                         , toText newDoc.title
                                         , toText newDoc.body
                                         , toText newDoc.format
                                         , fmap toText newDoc.folder
+                                        , revisionNumberValue newDoc.revision
                                         , timestampText
                                         , timestampText
                                         )
                                     insertDocumentTags handle.connection docId newDoc.tags
-                                    pure (Right newDoc)
+                                    eRev <- insertInitialRevisionInTx
+                                        handle.connection
+                                        docId
+                                        newDoc.title
+                                        newDoc.format
+                                        newDoc.body
+                                        timestamp
+                                    pure (newDoc <$ eRev)
 
 -- | 指定ユーザーが所有する文書 (本文・タグ含む) を ID で取得する。
 -- 他ユーザーの文書 ID を指定した場合は存在有無を秘匿するため 'DocumentNotFound' を返す。
@@ -250,7 +277,7 @@ listDocuments handle ownerId query =
 
                 selectSql :: SQLite.Query
                 selectSql = SQLite.Query
-                    ( "SELECT d.id, d.title, d.format, d.folder, d.created_at, d.updated_at, d.deleted_at\
+                    ( "SELECT d.id, d.title, d.format, d.folder, d.revision, d.created_at, d.updated_at, d.deleted_at\
                       \ FROM documents d"
                         <> whereSql
                         <> " ORDER BY d.updated_at DESC, d.id ASC LIMIT :limit OFFSET :offset"
@@ -309,7 +336,10 @@ updateDocument handle ownerId docId req = do
     updateDocumentAt handle ownerId docId now req
 
 -- | 明示的に指定した更新日時を用いて指定ユーザー所有の稼働中文書の内容・メタデータを全体置換する。
--- 他ユーザーの文書は 'DocumentNotFound' (HTTP 404)、本人所有かつゴミ箱内の文書は 'DocumentInTrash' (HTTP 409) とする。
+-- 他ユーザーの文書は 'DocumentNotFound' (HTTP 404)、本人所有かつゴミ箱内の文書は 'DocumentInTrash' (HTTP 409)、
+-- @base_revision@ 不一致時は 'RevisionConflict' (HTTP 409) とする。
+-- タイトル・フォーマット・本文のいずれかが変化した場合のみ新リビジョンを追記し、
+-- 整理メタデータ (@folder@ / @tags@) のみの変更時はリビジョン番号を据え置く。
 updateDocumentAt ::
        StorageHandle
     -> UserId
@@ -325,53 +355,95 @@ updateDocumentAt handle ownerId docId now req =
                 withImmediateTransaction handle.connection $ do
                     rows <- SQLite.query
                         handle.connection
-                        "SELECT created_at, deleted_at FROM documents WHERE id = ? AND owner_id = ?"
+                        "SELECT title, body, format, revision, created_at, deleted_at\
+                        \ FROM documents\
+                        \ WHERE id = ? AND owner_id = ?"
                         (toText docId, toText ownerId)
-                        :: IO [(Text, Maybe Text)]
+                        :: IO [UpdateTargetRow]
                     case rows of
-                        []                        -> pure (Left (DocumentNotFound docId))
-                        [(_, Just _)]             -> pure (Left (DocumentInTrash docId))
-                        [(rawCreatedAt, Nothing)] ->
-                            case parseSqliteUtcTime rawCreatedAt of
-                                Left err        -> pure (Left err)
-                                Right createdAt -> do
-                                    let updatedAt :: UTCTime
-                                        updatedAt = truncateToMicros now
+                        [] -> pure (Left (DocumentNotFound docId))
+                        [(_, _, _, _, _, Just _)] -> pure (Left (DocumentInTrash docId))
+                        [(rawTitle, rawBody, rawFormat, rawRev, rawCreatedAt, Nothing)] ->
+                            case decodeUpdateTarget rawTitle rawBody rawFormat rawRev rawCreatedAt of
+                                Left err -> pure (Left err)
+                                Right (currentTitle, currentBody, currentFormat, currentRev, createdAt) ->
+                                    case validatedReq.baseRevision of
+                                        Just expectedRev
+                                            | expectedRev /= currentRev ->
+                                                pure (Left (RevisionConflict docId expectedRev currentRev))
+                                        _ -> do
+                                            let updatedAt :: UTCTime
+                                                updatedAt = truncateToMicros now
 
-                                        updatedDoc :: Document
-                                        updatedDoc = Document
-                                            { id        = docId
-                                            , title     = validatedReq.title
-                                            , body      = validatedReq.body
-                                            , format    = validatedReq.format
-                                            , folder    = validatedReq.folder
-                                            , tags      = validatedReq.tags
-                                            , revision  = initialRevisionNumber
-                                            , createdAt = createdAt
-                                            , updatedAt = updatedAt
-                                            , deletedAt = Nothing
-                                            }
-                                    SQLite.execute
-                                        handle.connection
-                                        "UPDATE documents\
-                                        \ SET title = ?, body = ?, format = ?, folder = ?, updated_at = ?\
-                                        \ WHERE id = ? AND owner_id = ?"
-                                        ( toText updatedDoc.title
-                                        , toText updatedDoc.body
-                                        , toText updatedDoc.format
-                                        , fmap toText updatedDoc.folder
-                                        , formatSqliteUtcTime updatedAt
-                                        , toText docId
-                                        , toText ownerId
-                                        )
-                                    SQLite.execute
-                                        handle.connection
-                                        "DELETE FROM document_tags WHERE document_id = ?"
-                                        (Only (toText docId))
-                                    insertDocumentTags handle.connection docId updatedDoc.tags
-                                    pure (Right updatedDoc)
-                        _                         ->
+                                                contentChanged :: Bool
+                                                contentChanged =
+                                                    currentTitle /= validatedReq.title
+                                                        || currentFormat /= validatedReq.format
+                                                        || currentBody /= validatedReq.body
+                                            eNextRev <-
+                                                if contentChanged
+                                                    then fmap snd <$> appendRevisionInTx
+                                                        handle.connection
+                                                        docId
+                                                        currentRev
+                                                        currentBody
+                                                        validatedReq.title
+                                                        validatedReq.format
+                                                        validatedReq.body
+                                                        updatedAt
+                                                    else pure (Right currentRev)
+                                            case eNextRev of
+                                                Left err -> pure (Left err)
+                                                Right nextRev -> do
+                                                    let updatedDoc :: Document
+                                                        updatedDoc = Document
+                                                            { id        = docId
+                                                            , title     = validatedReq.title
+                                                            , body      = validatedReq.body
+                                                            , format    = validatedReq.format
+                                                            , folder    = validatedReq.folder
+                                                            , tags      = validatedReq.tags
+                                                            , revision  = nextRev
+                                                            , createdAt = createdAt
+                                                            , updatedAt = updatedAt
+                                                            , deletedAt = Nothing
+                                                            }
+                                                    SQLite.execute
+                                                        handle.connection
+                                                        "UPDATE documents\
+                                                        \ SET title = ?, body = ?, format = ?, folder = ?, revision = ?, updated_at = ?\
+                                                        \ WHERE id = ? AND owner_id = ?"
+                                                        ( toText updatedDoc.title
+                                                        , toText updatedDoc.body
+                                                        , toText updatedDoc.format
+                                                        , fmap toText updatedDoc.folder
+                                                        , revisionNumberValue updatedDoc.revision
+                                                        , formatSqliteUtcTime updatedAt
+                                                        , toText docId
+                                                        , toText ownerId
+                                                        )
+                                                    SQLite.execute
+                                                        handle.connection
+                                                        "DELETE FROM document_tags WHERE document_id = ?"
+                                                        (Only (toText docId))
+                                                    insertDocumentTags handle.connection docId updatedDoc.tags
+                                                    pure (Right updatedDoc)
+                        _ ->
                             pure (Left (CorruptedData ("Duplicate primary key for document: " <> toText docId)))
+  where
+    decodeUpdateTarget ::
+           Text
+        -> Text
+        -> Text
+        -> Int
+        -> Text
+        -> Either StorageError (DocumentTitle, DocumentBody, DocumentFormat, RevisionNumber, UTCTime)
+    decodeUpdateTarget rawTitle rawBody rawFormat rawRev rawCreatedAt = do
+        title     <- mapValidationToCorrupted "title" (mkDocumentTitle rawTitle)
+        format    <- decodeFormat rawFormat
+        rev       <- mapValidationToCorrupted "revision" (mkRevisionNumber rawRev)
+        createdAt <- parseSqliteUtcTime rawCreatedAt
+        Right (title, DocumentBody rawBody, format, rev, createdAt)
 
 -- | 現在の UTC 時刻を用いて指定ユーザー所有の文書を論理削除 (ゴミ箱へ移動) する。
 softDeleteDocument ::
@@ -434,7 +506,7 @@ restoreDocument handle ownerId docId =
 -- | 指定ユーザー所有のゴミ箱内文書をストレージから完全削除する。
 -- 他ユーザーの文書は 'DocumentNotFound' (HTTP 404)、本人所有かつ稼働中の文書は誤削除防止のため
 -- 'DocumentNotTrashed' (HTTP 409) として拒否する。
--- 関連タグ行は外部キーの @ON DELETE CASCADE@ により同時に削除される。
+-- 関連タグ行およびリビジョン履歴行は外部キーの @ON DELETE CASCADE@ により同時に削除される。
 permanentDeleteDocument ::
        StorageHandle
     -> UserId
@@ -458,6 +530,100 @@ permanentDeleteDocument handle ownerId docId =
                         (toText docId, toText ownerId)
                     pure (Right ())
                 _              -> pure (Left (CorruptedData ("Duplicate primary key for document: " <> toText docId)))
+
+-- | 現在の UTC 時刻を用いて稼働中文書を指定リビジョンの内容へロールバックする。
+restoreDocumentRevision ::
+       StorageHandle
+    -> UserId
+    -> DocumentId
+    -> RevisionNumber
+    -> RestoreRevisionRequest
+    -> IO (Either StorageError Document)
+restoreDocumentRevision handle ownerId docId targetRev req = do
+    now <- getCurrentTime
+    restoreDocumentRevisionAt handle ownerId docId targetRev now req
+
+-- | 明示的に指定した更新日時を用いて稼働中文書を指定リビジョンの内容へロールバックする。
+-- タイトル・フォーマット・本文のみを復元し、整理メタデータ (@folder@ / @tags@) は現行値を維持する。
+-- 履歴は追記型であるため、内容が変化する場合は新リビジョン (@current + 1@) を追記し、
+-- 対象リビジョンと現行内容の 'ContentHash' が一致する場合は重複リビジョンを作らず現行文書を返す。
+restoreDocumentRevisionAt ::
+       StorageHandle
+    -> UserId
+    -> DocumentId
+    -> RevisionNumber
+    -> UTCTime
+    -> RestoreRevisionRequest
+    -> IO (Either StorageError Document)
+restoreDocumentRevisionAt handle ownerId docId targetRev now req =
+    catchSqliteErrors $
+        withImmediateTransaction handle.connection $ do
+            eDoc <- fetchDocumentInTx handle.connection ownerId docId
+            case eDoc of
+                Left err -> pure (Left err)
+                Right currentDoc ->
+                    case currentDoc.deletedAt of
+                        Just _ -> pure (Left (DocumentInTrash docId))
+                        Nothing ->
+                            case req.baseRevision of
+                                Just expectedRev
+                                    | expectedRev /= currentDoc.revision ->
+                                        pure (Left (RevisionConflict docId expectedRev currentDoc.revision))
+                                _ -> do
+                                    eDetail <- reconstructRevisionDetailInTx
+                                        handle.connection
+                                        docId
+                                        currentDoc.body
+                                        currentDoc.revision
+                                        targetRev
+                                    case eDetail of
+                                        Left err -> pure (Left err)
+                                        Right targetDetail ->
+                                            case computeRevisionContentHash currentDoc.title currentDoc.format currentDoc.body of
+                                                Left err -> pure (Left err)
+                                                Right currentHash
+                                                    | currentHash == targetDetail.contentHash ->
+                                                        pure (Right currentDoc)
+                                                    | otherwise -> do
+                                                        let updatedAt :: UTCTime
+                                                            updatedAt = truncateToMicros now
+                                                        eAppended <- appendRevisionInTx
+                                                            handle.connection
+                                                            docId
+                                                            currentDoc.revision
+                                                            currentDoc.body
+                                                            targetDetail.title
+                                                            targetDetail.format
+                                                            targetDetail.body
+                                                            updatedAt
+                                                        case eAppended of
+                                                            Left err -> pure (Left err)
+                                                            Right (_, nextRev) -> do
+                                                                SQLite.execute
+                                                                    handle.connection
+                                                                    "UPDATE documents\
+                                                                    \ SET title = ?, body = ?, format = ?, revision = ?, updated_at = ?\
+                                                                    \ WHERE id = ? AND owner_id = ?"
+                                                                    ( toText targetDetail.title
+                                                                    , toText targetDetail.body
+                                                                    , toText targetDetail.format
+                                                                    , revisionNumberValue nextRev
+                                                                    , formatSqliteUtcTime updatedAt
+                                                                    , toText docId
+                                                                    , toText ownerId
+                                                                    )
+                                                                pure $ Right Document
+                                                                    { id        = currentDoc.id
+                                                                    , title     = targetDetail.title
+                                                                    , body      = targetDetail.body
+                                                                    , format    = targetDetail.format
+                                                                    , folder    = currentDoc.folder
+                                                                    , tags      = currentDoc.tags
+                                                                    , revision  = nextRev
+                                                                    , createdAt = currentDoc.createdAt
+                                                                    , updatedAt = updatedAt
+                                                                    , deletedAt = Nothing
+                                                                    }
 
 -- | 指定ユーザーの稼働中文書で使用されている重複なし・昇順ソート済みのタグ一覧を返す。
 listTags :: StorageHandle -> UserId -> IO (Either StorageError TagListResponse)
@@ -541,7 +707,7 @@ fetchDocumentInTx :: SQLite.Connection -> UserId -> DocumentId -> IO (Either Sto
 fetchDocumentInTx conn ownerId docId = do
     rows <- SQLite.query
         conn
-        "SELECT id, title, body, format, folder, created_at, updated_at, deleted_at\
+        "SELECT id, title, body, format, folder, revision, created_at, updated_at, deleted_at\
         \ FROM documents\
         \ WHERE id = ? AND owner_id = ?"
         (toText docId, toText ownerId)
@@ -645,11 +811,12 @@ buildListFilter ownerId query =
         )
 
 decodeDocumentRow :: DocumentRow -> [Text] -> Either StorageError Document
-decodeDocumentRow (rawId, rawTitle, rawBody, rawFormat, mRawFolder, rawCreatedAt, rawUpdatedAt, mRawDeletedAt) rawTags = do
+decodeDocumentRow (rawId, rawTitle, rawBody, rawFormat, mRawFolder, rawRev, rawCreatedAt, rawUpdatedAt, mRawDeletedAt) rawTags = do
     docId     <- mapValidationToCorrupted "id" (mkDocumentId rawId)
     title     <- mapValidationToCorrupted "title" (mkDocumentTitle rawTitle)
     format    <- decodeFormat rawFormat
     mFolder   <- traverse (mapValidationToCorrupted "folder" . mkFolderPath) mRawFolder
+    rev       <- mapValidationToCorrupted "revision" (mkRevisionNumber rawRev)
     tags      <- mapValidationToCorrupted "tags" (mkTagSetFromTexts rawTags)
     createdAt <- parseSqliteUtcTime rawCreatedAt
     updatedAt <- parseSqliteUtcTime rawUpdatedAt
@@ -661,18 +828,19 @@ decodeDocumentRow (rawId, rawTitle, rawBody, rawFormat, mRawFolder, rawCreatedAt
         , format    = format
         , folder    = mFolder
         , tags      = tags
-        , revision  = initialRevisionNumber
+        , revision  = rev
         , createdAt = createdAt
         , updatedAt = updatedAt
         , deletedAt = mDeleted
         }
 
 decodeSummaryBase :: SummaryRow -> Either StorageError DocumentSummary
-decodeSummaryBase (rawId, rawTitle, rawFormat, mRawFolder, rawCreatedAt, rawUpdatedAt, mRawDeletedAt) = do
+decodeSummaryBase (rawId, rawTitle, rawFormat, mRawFolder, rawRev, rawCreatedAt, rawUpdatedAt, mRawDeletedAt) = do
     docId     <- mapValidationToCorrupted "id" (mkDocumentId rawId)
     title     <- mapValidationToCorrupted "title" (mkDocumentTitle rawTitle)
     format    <- decodeFormat rawFormat
     mFolder   <- traverse (mapValidationToCorrupted "folder" . mkFolderPath) mRawFolder
+    rev       <- mapValidationToCorrupted "revision" (mkRevisionNumber rawRev)
     createdAt <- parseSqliteUtcTime rawCreatedAt
     updatedAt <- parseSqliteUtcTime rawUpdatedAt
     mDeleted  <- traverse parseSqliteUtcTime mRawDeletedAt
@@ -682,7 +850,7 @@ decodeSummaryBase (rawId, rawTitle, rawFormat, mRawFolder, rawCreatedAt, rawUpda
         , format    = format
         , folder    = mFolder
         , tags      = emptyTagSet
-        , revision  = initialRevisionNumber
+        , revision  = rev
         , createdAt = createdAt
         , updatedAt = updatedAt
         , deletedAt = mDeleted
@@ -690,10 +858,6 @@ decodeSummaryBase (rawId, rawTitle, rawFormat, mRawFolder, rawCreatedAt, rawUpda
 
 decodeFormat :: Text -> Either StorageError DocumentFormat
 decodeFormat raw = mapValidationToCorrupted "format" (parseDocumentFormat raw)
-
-mapValidationToCorrupted :: Text -> Either ValidationError a -> Either StorageError a
-mapValidationToCorrupted columnName =
-    first (\ err -> CorruptedData ("Invalid " <> columnName <> " in database: " <> toText err))
 
 setDocumentDeletedAt :: Maybe UTCTime -> Document -> Document
 setDocumentDeletedAt mDeletedAt doc = Document

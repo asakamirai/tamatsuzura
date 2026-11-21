@@ -838,15 +838,17 @@ ownerIsolationSpec = describe "Multi-user document and metadata owner isolation"
             aliceStillIntact <- mustRight =<< withStorage cfg (\ h -> getDocument h aliceId aliceActive.id)
             aliceStillIntact `shouldBe` aliceActive
 
-            -- Alice ユーザー削除時は ON DELETE CASCADE で Alice の文書・タグのみが削除され Bob の文書は残る
+            -- Alice ユーザー削除時は ON DELETE CASCADE で Alice の文書・タグ・リビジョンのみが削除され Bob の文書は残る
             dbStr <- OS.decodeFS dbPath
             SQLite.withConnection dbStr $ \ conn -> do
                 SQLite.execute_ conn "PRAGMA foreign_keys = ON"
                 SQLite.execute conn "DELETE FROM users WHERE id = ?" (Only (toText aliceId))
                 docCount <- SQLite.query_ conn "SELECT COUNT(*) FROM documents" :: IO [Only Int]
                 tagCount <- SQLite.query_ conn "SELECT COUNT(*) FROM document_tags" :: IO [Only Int]
+                revCount <- SQLite.query_ conn "SELECT COUNT(*) FROM document_revisions" :: IO [Only Int]
                 docCount `shouldBe` [Only 1]
                 tagCount `shouldBe` [Only 1]
+                revCount `shouldBe` [Only 1]
             bobStillIntact <- mustRight =<< withStorage cfg (\ h -> getDocument h bobId bobDoc.id)
             bobStillIntact `shouldBe` bobDoc
 

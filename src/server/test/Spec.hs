@@ -7,6 +7,7 @@ import           AuthApiSpec     (authApiSpec)
 import           AuthCryptoSpec  (authCryptoSpec)
 import           AuthStorageSpec (authStorageSpec)
 import           IntegrationSpec (integrationSpec)
+import           RevisionSpec    (revisionSpec)
 import           StaticSpec      (staticSpec)
 import           StorageSpec     (storageSpec)
 import           Test.Hspec      (Spec, hspec)
@@ -21,5 +22,6 @@ spec = do
     authStorageSpec
     authApiSpec
     apiSpec
+    revisionSpec
     staticSpec
     integrationSpec

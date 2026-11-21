@@ -10,7 +10,7 @@
 
 ## 現在地
 
-**M4（差分管理 Phase 1: リビジョン履歴）進行中。Phase 1（`src/common/` 純粋 unified diff・リビジョンドメイン型・OpenAPI 拡張）完了、次は Phase 2（SQLite リビジョン履歴テーブルおよび履歴取得・復元 API）へ着手予定。**
+**M4（差分管理 Phase 1: リビジョン履歴）進行中。Phase 2（SQLite リビジョン履歴テーブルおよび履歴取得・復元 API）完了、次は Phase 3（Miso クライアントへの過去リビジョン閲覧・復元 UI 統合）へ着手予定。**
 
 | マイルストーン | 内容 | 状態 | 完了記録 |
 | --- | --- | --- | --- |
@@ -18,7 +18,7 @@
 | M1 | MVP サーバ (文書 CRUD + CGI / Warp 両対応) | **完了** | [M1.md](./project/history/M1.md) |
 | M2 | MVP クライアント (モバイルファースト Miso/Wasm UI) | **完了** | [M2.md](./project/history/M2.md) |
 | M3 | 認証・ユーザ管理 (CGI 互換 SQLite セッション) | **完了** | [M3.md](./project/history/M3.md) |
-| **M4** | **差分管理 Phase 1 (リビジョン履歴)** | **進行中 (Phase 1 完了)** | — |
+| **M4** | **差分管理 Phase 1 (リビジョン履歴)** | **進行中 (Phase 2 完了)** | — |
 | M5 | Haskell 拡張機構 (MVP: 同梱拡張) | 未着手 | — |
 | M6 | PWA / オフライン対応と同期 | 未着手 | — |
 | M7 | 差分管理 Phase 2 (リビジョン比較・マージ) | 未着手 | — |
@@ -32,7 +32,7 @@
 **M4: 差分管理 Phase 1 (リビジョン履歴)**
 
 - [x] Phase 1: `src/common/` での純粋な unified diff 生成・適用ロジックとリビジョンドメイン型・OpenAPI 仕様拡張（`hspec` + `QuickCheck`）
-- [ ] Phase 2: SQLite リビジョン履歴テーブル（追記型差分保存）および履歴取得・復元 API の実装（CGI / Warp 両検証）
+- [x] Phase 2: SQLite リビジョン履歴テーブル（追記型差分保存）および履歴取得・復元 API の実装（CGI / Warp 両検証）
 - [ ] Phase 3: Miso クライアントへの過去リビジョン閲覧・復元 UI（モバイル対応）統合と疎通検証
 
 ※ マイルストーンの新規追加や調整は Antigravity スキル `add-milestone` を利用してください。

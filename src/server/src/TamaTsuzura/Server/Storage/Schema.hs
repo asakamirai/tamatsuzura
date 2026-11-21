@@ -21,10 +21,12 @@ module TamaTsuzura.Server.Storage.Schema
     , parseSqliteUtcTime
     , asciiToLower
     , escapeLikePattern
+    , mapValidationToCorrupted
     ) where
 
 import           Control.Exception                (Handler(..), IOException, catches, mask, onException, try)
 import           Control.Monad                    (when)
+import           Data.Bifunctor                   (first)
 import qualified Data.Char                        as Char
 import           Data.Text                        (Text)
 import qualified Data.Text                        as Txt
@@ -36,6 +38,8 @@ import           Data.Time.Clock
 import           Data.Time.Format                 (defaultTimeLocale, formatTime, parseTimeM)
 import           Database.SQLite.Simple           (Only(..))
 import qualified Database.SQLite.Simple           as SQLite
+import           TamaTsuzura.Common.Text          (ToText(..))
+import           TamaTsuzura.Common.Validation    (ValidationError)
 import           TamaTsuzura.Server.Storage.Types
     ( SqlitePragmas(..)
     , StorageConfig(..)
@@ -57,9 +61,9 @@ newtype StorageHandle = StorageHandle
     }
 
 -- | 本バイナリが期待・サポートする SQLite スキーマバージョン (@PRAGMA user_version@)。
--- v3 で @documents.owner_id@ (外部キー @users(id)@) および所有者分離向けインデックスを追加した。
+-- v4 で @documents.revision@ 列および追記型差分履歴テーブル @document_revisions@ を追加した。
 currentSchemaVersion :: Int
-currentSchemaVersion = 3
+currentSchemaVersion = 4
 
 -- | 新規に開いた SQLite 接続へ CGI / Warp 運用で必須の PRAGMA 設定を適用する。
 -- ロック競合時に後続 PRAGMA 自体が即座に @SQLITE_BUSY@ とならないよう、
@@ -252,15 +256,22 @@ escapeLikePattern raw = "%" <> Txt.concatMap escapeChar raw <> "%"
     escapeChar '_'  = "\\_"
     escapeChar ch   = Txt.singleton ch
 
+-- | DB から読み出した値のドメイン検証エラーを 'CorruptedData' へ変換する。
+mapValidationToCorrupted :: Text -> Either ValidationError a -> Either StorageError a
+mapValidationToCorrupted columnName =
+    first (\ err -> CorruptedData ("Invalid " <> columnName <> " in database: " <> toText err))
+
 applyInitialSchema :: SQLite.Connection -> IO ()
 applyInitialSchema conn = do
     SQLite.execute_ conn createUsersTableSql
     SQLite.execute_ conn createSessionsTableSql
     SQLite.execute_ conn createDocumentsTableSql
     SQLite.execute_ conn createDocumentTagsTableSql
+    SQLite.execute_ conn createDocumentRevisionsTableSql
     SQLite.execute_ conn createOwnerDeletedUpdatedIndexSql
     SQLite.execute_ conn createOwnerFolderIndexSql
     SQLite.execute_ conn createTagIndexSql
+    SQLite.execute_ conn createRevisionsParentIndexSql
     SQLite.execute_ conn createSessionsUserIndexSql
     SQLite.execute_ conn createSessionsExpiresIndexSql
     SQLite.execute_ conn (SQLite.Query ("PRAGMA user_version = " <> Txt.pack (show currentSchemaVersion)))
@@ -274,6 +285,7 @@ createDocumentsTableSql =
     \ body TEXT NOT NULL,\
     \ format TEXT NOT NULL CHECK (format IN ('markdown', 'plain_text')),\
     \ folder TEXT,\
+    \ revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),\
     \ created_at TEXT NOT NULL,\
     \ updated_at TEXT NOT NULL,\
     \ deleted_at TEXT,\
@@ -287,6 +299,28 @@ createDocumentTagsTableSql =
     \ tag TEXT NOT NULL,\
     \ PRIMARY KEY (document_id, tag),\
     \ FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE\
+    \)"
+
+createDocumentRevisionsTableSql :: SQLite.Query
+createDocumentRevisionsTableSql =
+    -- parent_revision_id に ON DELETE CASCADE を付けると 1,000 超の深いリビジョン連鎖削除時に
+    -- SQLite のトリガ再帰上限 (SQLITE_MAX_TRIGGER_DEPTH = 1000) へ到達して失敗するため、
+    -- DEFERRABLE INITIALLY DEFERRED とし、document_id 側の一括 CASCADE 削除時は安全に通過させつつ
+    -- 個別リビジョンの不正削除は外部キー制約で防止する。
+    "CREATE TABLE IF NOT EXISTS document_revisions (\
+    \ id TEXT PRIMARY KEY NOT NULL,\
+    \ document_id TEXT NOT NULL,\
+    \ revision INTEGER NOT NULL CHECK (revision >= 1),\
+    \ parent_revision_id TEXT,\
+    \ title TEXT NOT NULL,\
+    \ format TEXT NOT NULL CHECK (format IN ('markdown', 'plain_text')),\
+    \ diff TEXT NOT NULL,\
+    \ content_hash TEXT NOT NULL CHECK (length(content_hash) = 64 AND content_hash NOT GLOB '*[^0-9a-f]*'),\
+    \ created_at TEXT NOT NULL,\
+    \ CHECK ((revision = 1 AND parent_revision_id IS NULL) OR (revision > 1 AND parent_revision_id IS NOT NULL)),\
+    \ UNIQUE (document_id, revision),\
+    \ FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,\
+    \ FOREIGN KEY (parent_revision_id) REFERENCES document_revisions(id) DEFERRABLE INITIALLY DEFERRED\
     \)"
 
 createUsersTableSql :: SQLite.Query
@@ -326,6 +360,11 @@ createTagIndexSql :: SQLite.Query
 createTagIndexSql =
     "CREATE INDEX IF NOT EXISTS idx_document_tags_tag\
     \ ON document_tags (tag, document_id)"
+
+createRevisionsParentIndexSql :: SQLite.Query
+createRevisionsParentIndexSql =
+    "CREATE INDEX IF NOT EXISTS idx_document_revisions_parent\
+    \ ON document_revisions (parent_revision_id) WHERE parent_revision_id IS NOT NULL"
 
 createSessionsUserIndexSql :: SQLite.Query
 createSessionsUserIndexSql =

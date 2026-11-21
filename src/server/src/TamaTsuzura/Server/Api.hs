@@ -19,12 +19,20 @@ module TamaTsuzura.Server.Api
     , AuthApi
     , DocumentsApi
     , DocumentByIdApi
+    , DocumentRevisionsApi
+    , DocumentRevisionByNumberApi
     , tamaTsuzuraApiProxy
       -- * リクエストパラメータ検証
     , RawDocumentListQuery(..)
     , emptyRawDocumentListQuery
     , parseDocumentListQuery
+    , RawRevisionListQuery(..)
+    , emptyRawRevisionListQuery
+    , RevisionListQuery(..)
+    , defaultRevisionListQuery
+    , parseRevisionListQuery
     , parseDocumentIdParam
+    , parseRevisionNumberParam
       -- * エラーレスポンス変換・フォーマッタ
     , jsonContentType
     , apiErrorHttpStatus
@@ -99,12 +107,19 @@ import           TamaTsuzura.Common.Document
     ( Document
     , DocumentId
     , FolderPath
+    , RevisionNumber
     , Tag
     , mkDocumentId
     , mkFolderPath
+    , mkRevisionNumber
     , mkTag
     )
-import           TamaTsuzura.Common.Validation    (maxListLimit, minListLimit)
+import           TamaTsuzura.Common.Revision
+    ( RestoreRevisionRequest
+    , RevisionDetail
+    , RevisionListResponse
+    )
+import           TamaTsuzura.Common.Validation    (maxListLimit, minListLimit, minRevisionNumber)
 import           TamaTsuzura.Server.Storage.Auth  (AuthenticatedSession)
 import           Text.Read                        (readMaybe)
 
@@ -223,6 +238,26 @@ type DocumentByIdApi
       :<|> "permanent"
         :> SessionCsrfAuth
         :> Verb 'DELETE 204 '[JSON] NoContent
+      :<|> "revisions"
+        :> DocumentRevisionsApi
+
+-- | 単一文書のリビジョン履歴リソース (@/api/documents/{id}/revisions...@) の Servant 型定義。
+type DocumentRevisionsApi
+    =      SessionAuth
+        :> QueryParam "limit" Text
+        :> QueryParam "offset" Text
+        :> Get '[JSON] RevisionListResponse
+      :<|> Capture "revision" Text
+        :> DocumentRevisionByNumberApi
+
+-- | 特定リビジョンリソース (@/api/documents/{id}/revisions/{revision}...@) の Servant 型定義。
+type DocumentRevisionByNumberApi
+    =      SessionAuth
+        :> Get '[JSON] RevisionDetail
+      :<|> "restore"
+        :> SessionCsrfAuth
+        :> ReqBody '[JSON] RestoreRevisionRequest
+        :> Post '[JSON] Document
 
 -- | Servant のルーティング解決に用いる API プロキシ。
 tamaTsuzuraApiProxy :: Proxy TamaTsuzuraApi
@@ -308,11 +343,86 @@ parseDocumentListQuery raw = do
     parseSearch (Just s) = first validationErrorToApiError (mkSearchQuery s)
 
     parseLimit :: Maybe Text -> Either ApiError ListLimit
-    parseLimit Nothing  = Right defaultListLimitValue
-    parseLimit (Just s) = do
-        rawInt <- parseBoundedInteger "limit" s (toInteger minListLimit) (toInteger maxListLimit) limitRangeMessage
-        first validationErrorToApiError (mkListLimit rawInt)
+    parseLimit = parseListLimitParam
 
+    parseOffset :: Maybe Text -> Either ApiError ListOffset
+    parseOffset = parseListOffsetParam
+
+    withField :: Text -> ApiError -> ApiError
+    withField fieldName err = ApiError
+        { code    = err.code
+        , message = err.message
+        , field   = Just fieldName
+        }
+
+-- | @GET /api/documents/{id}/revisions@ の未検証クエリパラメータ群。
+data RawRevisionListQuery = RawRevisionListQuery
+    { rawLimit  :: !(Maybe Text)
+      -- ^ @limit@ クエリ文字列
+    , rawOffset :: !(Maybe Text)
+      -- ^ @offset@ クエリ文字列
+    } deriving (Eq, Show)
+
+-- | 全クエリパラメータ未指定を表す 'RawRevisionListQuery'。
+emptyRawRevisionListQuery :: RawRevisionListQuery
+emptyRawRevisionListQuery = RawRevisionListQuery
+    { rawLimit  = Nothing
+    , rawOffset = Nothing
+    }
+
+-- | リビジョン履歴一覧取得の検証済みページネーション条件。
+data RevisionListQuery = RevisionListQuery
+    { limit  :: !ListLimit
+      -- ^ 1 回の取得件数上限
+    , offset :: !ListOffset
+      -- ^ 取得開始位置のオフセット
+    } deriving (Eq, Show)
+
+-- | パラメータ未指定時の既定リビジョン一覧クエリ条件。
+defaultRevisionListQuery :: RevisionListQuery
+defaultRevisionListQuery = RevisionListQuery
+    { limit  = defaultListLimitValue
+    , offset = defaultListOffsetValue
+    }
+
+-- | 未検証リビジョン一覧クエリを検証済み 'RevisionListQuery' へ変換する。
+parseRevisionListQuery :: RawRevisionListQuery -> Either ApiError RevisionListQuery
+parseRevisionListQuery raw = do
+    limit  <- parseListLimitParam raw.rawLimit
+    offset <- parseListOffsetParam raw.rawOffset
+    Right RevisionListQuery
+        { limit  = limit
+        , offset = offset
+        }
+
+-- | URL パスセグメントの文書 ID を検証して 'DocumentId' へ変換する。
+parseDocumentIdParam :: Text -> Either ApiError DocumentId
+parseDocumentIdParam raw = first validationErrorToApiError (mkDocumentId raw)
+
+-- | URL パスセグメントのリビジョン番号 (1 以上の整数) を検証して 'RevisionNumber' へ変換する。
+parseRevisionNumberParam :: Text -> Either ApiError RevisionNumber
+parseRevisionNumberParam raw = do
+    rawInt <- parseBoundedInteger
+        "revision"
+        raw
+        (toInteger minRevisionNumber)
+        (toInteger (maxBound :: Int))
+        revisionRangeMessage
+    first validationErrorToApiError (mkRevisionNumber rawInt)
+  where
+    revisionRangeMessage :: Text -> Text
+    revisionRangeMessage rawVal =
+        "Revision number must be an integer >= "
+            <> Txt.pack (show minRevisionNumber)
+            <> " within supported range, got "
+            <> rawVal
+
+parseListLimitParam :: Maybe Text -> Either ApiError ListLimit
+parseListLimitParam Nothing  = Right defaultListLimitValue
+parseListLimitParam (Just s) = do
+    rawInt <- parseBoundedInteger "limit" s (toInteger minListLimit) (toInteger maxListLimit) limitRangeMessage
+    first validationErrorToApiError (mkListLimit rawInt)
+  where
     limitRangeMessage :: Text -> Text
     limitRangeMessage rawVal =
         "List limit "
@@ -323,26 +433,15 @@ parseDocumentListQuery raw = do
             <> Txt.pack (show maxListLimit)
             <> ")"
 
-    parseOffset :: Maybe Text -> Either ApiError ListOffset
-    parseOffset Nothing  = Right defaultListOffsetValue
-    parseOffset (Just s) = do
-        rawInt <- parseBoundedInteger "offset" s 0 (toInteger (maxBound :: Int)) offsetRangeMessage
-        first validationErrorToApiError (mkListOffset rawInt)
-
+parseListOffsetParam :: Maybe Text -> Either ApiError ListOffset
+parseListOffsetParam Nothing  = Right defaultListOffsetValue
+parseListOffsetParam (Just s) = do
+    rawInt <- parseBoundedInteger "offset" s 0 (toInteger (maxBound :: Int)) offsetRangeMessage
+    first validationErrorToApiError (mkListOffset rawInt)
+  where
     offsetRangeMessage :: Text -> Text
     offsetRangeMessage rawVal =
         "List offset must be a non-negative integer within supported range, got " <> rawVal
-
-    withField :: Text -> ApiError -> ApiError
-    withField fieldName err = ApiError
-        { code    = err.code
-        , message = err.message
-        , field   = Just fieldName
-        }
-
--- | URL パスセグメントの文書 ID を検証して 'DocumentId' へ変換する。
-parseDocumentIdParam :: Text -> Either ApiError DocumentId
-parseDocumentIdParam raw = first validationErrorToApiError (mkDocumentId raw)
 
 -- | REST API の標準 JSON Content-Type ヘッダ値。
 jsonContentType :: ByteString
@@ -420,11 +519,17 @@ parseBoundedInteger paramName raw minVal maxVal mkOutOfRangeMsg =
             | otherwise -> Right (fromInteger val)
 
 parseStrictIntegerText :: Text -> Maybe Integer
-parseStrictIntegerText raw = case Txt.unpack raw of
-    "" -> Nothing
-    '-' : digits
-        | not (null digits) && all Char.isDigit digits -> readMaybe ('-' : digits)
-        | otherwise                                    -> Nothing
-    digits
-        | all Char.isDigit digits -> readMaybe digits
-        | otherwise               -> Nothing
+parseStrictIntegerText raw
+    | Txt.length raw > maxStrictIntChars = Nothing
+    | otherwise = case Txt.unpack raw of
+        "" -> Nothing
+        '-' : digits
+            | not (null digits) && all Char.isDigit digits -> readMaybe ('-' : digits)
+            | otherwise                                    -> Nothing
+        digits
+            | all Char.isDigit digits -> readMaybe digits
+            | otherwise               -> Nothing
+  where
+    -- 64-bit Int (19 桁 + 符号 1 文字) を大きく超える極長数字列での多倍長整数変換を事前に拒否する
+    maxStrictIntChars :: Int
+    maxStrictIntChars = 20

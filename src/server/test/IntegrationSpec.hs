@@ -42,6 +42,12 @@ import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentFormat(..)
     , DocumentSummary(..)
+    , revisionNumberValue
+    )
+import           TamaTsuzura.Common.Revision
+    ( RevisionDetail(..)
+    , RevisionListResponse(..)
+    , RevisionSummary(..)
     )
 import           TamaTsuzura.Common.Text            (ToText(..))
 import           TamaTsuzura.Server.App
@@ -194,6 +200,33 @@ warpIntegrationSpec = describe "Warp standalone server end-to-end integration" $
                 resFolders <- httpJsonWith manager Http.methodGet (baseUrl <> "/api/folders") aliceRead Nothing
                 folderList <- decodeJson (HttpClient.responseBody resFolders) :: IO FolderListResponse
                 map toText folderList.folders `shouldBe` ["warp/updated"]
+
+                -- 7b. Revision history inspection, owner isolation, base_revision conflict, and rollback over Warp
+                resBobRevs <- httpJsonWith manager Http.methodGet (docUrl <> "/revisions") bobRead Nothing
+                Http.statusCode (HttpClient.responseStatus resBobRevs) `shouldBe` 404
+
+                resRevs <- httpJsonWith manager Http.methodGet (docUrl <> "/revisions") aliceRead Nothing
+                Http.statusCode (HttpClient.responseStatus resRevs) `shouldBe` 200
+                revList <- decodeJson (HttpClient.responseBody resRevs) :: IO RevisionListResponse
+                revList.total `shouldBe` 2
+                map (\ s -> revisionNumberValue s.revision) revList.revisions `shouldBe` [2, 1]
+
+                resRev1 <- httpJsonWith manager Http.methodGet (docUrl <> "/revisions/1") aliceRead Nothing
+                Http.statusCode (HttpClient.responseStatus resRev1) `shouldBe` 200
+                rev1 <- decodeJson (HttpClient.responseBody resRev1) :: IO RevisionDetail
+                toText rev1.title `shouldBe` "Warp 疎通文書"
+                toText rev1.body `shouldBe` "# Warp\nTCP 経由の永続化テスト"
+
+                resRollbackConflict <- httpJsonWith manager Http.methodPost (docUrl <> "/revisions/1/restore") aliceWrite (Just "{\"base_revision\":1}")
+                Http.statusCode (HttpClient.responseStatus resRollbackConflict) `shouldBe` 409
+
+                resRollback <- httpJsonWith manager Http.methodPost (docUrl <> "/revisions/1/restore") aliceWrite (Just "{\"base_revision\":2}")
+                Http.statusCode (HttpClient.responseStatus resRollback) `shouldBe` 200
+                rolledBack <- decodeJson (HttpClient.responseBody resRollback) :: IO Document
+                revisionNumberValue rolledBack.revision `shouldBe` 3
+                toText rolledBack.title `shouldBe` "Warp 疎通文書"
+                toText rolledBack.body `shouldBe` "# Warp\nTCP 経由の永続化テスト"
+                fmap toText rolledBack.folder `shouldBe` Just "warp/updated"
 
                 -- 8. Soft delete, conflict on edit, restore, permanent delete (204)
                 resTrash <- httpJsonWith manager Http.methodDelete docUrl aliceWrite Nothing
@@ -400,6 +433,33 @@ cgiIntegrationSpec = describe "CGI/1.1 handler end-to-end integration" $ do
             listed <- decodeJson resList.body :: IO DocumentListResponse
             listed.total `shouldBe` 1
             map (\ s -> s.id) listed.documents `shouldBe` [created.id]
+
+            -- 7b. Revision history inspection, owner isolation, base_revision conflict, and rollback via CGI
+            resBobRevs <- invokeCgi dbPathStr "/api" "GET" ("/documents/" <> idSegment <> "/revisions") "" bobReadEnv Nothing
+            resBobRevs.statusCode `shouldBe` 404
+
+            resCgiRevs <- invokeCgi dbPathStr "/api" "GET" ("/documents/" <> idSegment <> "/revisions") "" aliceReadEnv Nothing
+            resCgiRevs.statusCode `shouldBe` 200
+            cgiRevList <- decodeJson resCgiRevs.body :: IO RevisionListResponse
+            cgiRevList.total `shouldBe` 2
+            map (\ s -> revisionNumberValue s.revision) cgiRevList.revisions `shouldBe` [2, 1]
+
+            resCgiRev1 <- invokeCgi dbPathStr "/cgi-bin/tamatsuzura.cgi" "GET" ("/api/documents/" <> idSegment <> "/revisions/1") "" aliceReadEnv Nothing
+            resCgiRev1.statusCode `shouldBe` 200
+            cgiRev1 <- decodeJson resCgiRev1.body :: IO RevisionDetail
+            toText cgiRev1.title `shouldBe` "CGI 疎通メモ"
+            toText cgiRev1.body `shouldBe` "レンタルサーバ CGI 互換テスト"
+
+            resCgiRollbackConflict <- invokeCgi dbPathStr "/api" "POST" ("/documents/" <> idSegment <> "/revisions/1/restore") "" aliceWriteEnv (Just "{\"base_revision\":1}")
+            resCgiRollbackConflict.statusCode `shouldBe` 409
+
+            resCgiRollback <- invokeCgi dbPathStr "/api" "POST" ("/documents/" <> idSegment <> "/revisions/1/restore") "" aliceWriteEnv (Just "{\"base_revision\":2}")
+            resCgiRollback.statusCode `shouldBe` 200
+            cgiRolledBack <- decodeJson resCgiRollback.body :: IO Document
+            revisionNumberValue cgiRolledBack.revision `shouldBe` 3
+            toText cgiRolledBack.title `shouldBe` "CGI 疎通メモ"
+            toText cgiRolledBack.body `shouldBe` "レンタルサーバ CGI 互換テスト"
+            fmap toText cgiRolledBack.folder `shouldBe` Just "cgi/archive"
 
             resTrash <- invokeCgi dbPathStr "/cgi-bin/tamatsuzura.cgi" "DELETE" ("/api/documents/" <> idSegment) "" aliceWriteEnv Nothing
             resTrash.statusCode `shouldBe` 200

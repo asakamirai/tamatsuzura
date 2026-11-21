@@ -31,7 +31,7 @@ import           TamaTsuzura.Common.Api
     , validationErrorToApiError
     )
 import           TamaTsuzura.Common.Auth       (UserId, Username)
-import           TamaTsuzura.Common.Document   (DocumentId)
+import           TamaTsuzura.Common.Document   (DocumentId, RevisionNumber)
 import           TamaTsuzura.Common.Text       (ToText(..))
 import           TamaTsuzura.Common.Validation (ValidationError)
 
@@ -129,6 +129,10 @@ data StorageError
       -- ^ 稼働中の文書に対して完全削除を試みた (HTTP 409 相当)
     | DocumentIdAlreadyExists !DocumentId
       -- ^ 既に存在する文書 ID での新規作成を試みた (HTTP 409 相当)
+    | RevisionNotFound !DocumentId !RevisionNumber
+      -- ^ 指定された文書のリビジョン番号が存在しない (HTTP 404 相当)
+    | RevisionConflict !DocumentId !RevisionNumber !RevisionNumber
+      -- ^ 楽観的排他制御の @base_revision@ が現在の最新リビジョンと一致しない (文書 ID, 期待リビジョン, 現在リビジョン、HTTP 409 相当)
     | UsernameAlreadyExists !Username
       -- ^ 既に登録済みのユーザー名で新規登録を試みた (HTTP 409 相当)
     | UserIdAlreadyExists !UserId
@@ -156,6 +160,15 @@ instance ToText StorageError where
         "Document must be moved to trash before permanent deletion: " <> toText docId
     toText (DocumentIdAlreadyExists docId) =
         "Document ID already exists: " <> toText docId
+    toText (RevisionNotFound docId rev) =
+        "Revision " <> toText rev <> " not found for document: " <> toText docId
+    toText (RevisionConflict docId expectedRev actualRev) =
+        "Revision conflict for document "
+            <> toText docId
+            <> ": expected base_revision "
+            <> toText expectedRev
+            <> ", current revision is "
+            <> toText actualRev
     toText (UsernameAlreadyExists uname) =
         "Username is already registered: " <> toText uname
     toText (UserIdAlreadyExists uid) =
@@ -205,6 +218,16 @@ storageErrorToApiError err@DocumentIdAlreadyExists{} = ApiError
     { code    = ErrConflict
     , message = toText err
     , field   = Nothing
+    }
+storageErrorToApiError err@RevisionNotFound{}        = ApiError
+    { code    = ErrNotFound
+    , message = toText err
+    , field   = Nothing
+    }
+storageErrorToApiError err@RevisionConflict{}        = ApiError
+    { code    = ErrConflict
+    , message = toText err
+    , field   = Just "base_revision"
     }
 storageErrorToApiError err@UsernameAlreadyExists{}   = ApiError
     { code    = ErrConflict
