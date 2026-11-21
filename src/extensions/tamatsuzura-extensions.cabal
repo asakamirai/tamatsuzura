@@ -21,9 +21,15 @@ library
   import:          shared-options
   hs-source-dirs:  src
   exposed-modules:
+    TamaTsuzura.Extensions
+    TamaTsuzura.Extensions.MarkdownFormatter
+    TamaTsuzura.Extensions.TextTransform
     TamaTsuzura.Extensions.TrimTrailingSpaces
+  other-modules:
+    TamaTsuzura.Extensions.Internal
   build-depends:
       base                      >= 4.18 && < 5
+    , containers                >= 0.6  && < 0.8
     , tamatsuzura-common
     , tamatsuzura-extension-api
     , text                      >= 2.0 && < 2.2
@@ -35,6 +41,7 @@ test-suite tamatsuzura-extensions-test
   main-is:        Spec.hs
   build-depends:
       base                      >= 4.18 && < 5
+    , containers                >= 0.6  && < 0.8
     , hspec                     >= 2.11 && < 2.12
     , QuickCheck                >= 2.14 && < 2.16
     , tamatsuzura-common

@@ -10,7 +10,7 @@
 
 ## 現在地
 
-**M4（差分管理 Phase 1: リビジョン履歴）完了。次は M5（Haskell 拡張機構 MVP: 同梱拡張）の Phase 1 へ着手予定。**
+**M5（Haskell 拡張機構 MVP: 同梱拡張）進行中。Phase 1（`src/extension-api/` 公開契約拡張および `src/extensions/` 同梱拡張群実装）完了、次は Phase 2（Miso クライアントへの拡張レジストリ・有効化/設定 UI・コマンド実行基盤統合）へ着手予定。**
 
 | マイルストーン | 内容 | 状態 | 完了記録 |
 | --- | --- | --- | --- |
@@ -19,7 +19,7 @@
 | M2 | MVP クライアント (モバイルファースト Miso/Wasm UI) | **完了** | [M2.md](./project/history/M2.md) |
 | M3 | 認証・ユーザ管理 (CGI 互換 SQLite セッション) | **完了** | [M3.md](./project/history/M3.md) |
 | M4 | 差分管理 Phase 1 (リビジョン履歴) | **完了** | [M4.md](./project/history/M4.md) |
-| **M5** | **Haskell 拡張機構 (MVP: 同梱拡張)** | **進行中 (Phase 1 着手前)** | — |
+| **M5** | **Haskell 拡張機構 (MVP: 同梱拡張)** | **進行中 (Phase 1 完了)** | — |
 | M6 | PWA / オフライン対応と同期 | 未着手 | — |
 | M7 | 差分管理 Phase 2 (リビジョン比較・マージ) | 未着手 | — |
 
@@ -31,7 +31,7 @@
 
 **M5: Haskell 拡張機構 (MVP: 同梱拡張)**
 
-- [ ] Phase 1: `src/extension-api/` の公開契約拡張（コマンド・バージョン・変換結果型・Haddock 整備）と `src/extensions/` への同梱サンプル拡張群（Markdown 書式整形・文字列変換等）の実装・テスト
+- [x] Phase 1: `src/extension-api/` の公開契約拡張（コマンド・バージョン・変換結果型・Haddock 整備）と `src/extensions/` への同梱サンプル拡張群（Markdown 書式整形・文字列変換等）の実装・テスト
 - [ ] Phase 2: Miso クライアントへの同梱拡張レジストリ・有効化/設定 UI（モバイル対応）・拡張コマンド実行基盤の統合と疎通検証
 
 ※ マイルストーンの新規追加や調整は Antigravity スキル `add-milestone` を利用してください。
