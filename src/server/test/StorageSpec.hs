@@ -430,11 +430,12 @@ documentCrudSpec = describe "Document CRUD operations" $ do
             created <- mustRight =<< createDocument storage ownerId defaultCreateDocumentRequest
             let badUpdate :: UpdateDocumentRequest
                 badUpdate = UpdateDocumentRequest
-                    { title  = emptyDocumentTitle
-                    , body   = oversizedBody
-                    , format = FormatMarkdown
-                    , folder = Nothing
-                    , tags   = emptyTagSet
+                    { title        = emptyDocumentTitle
+                    , body         = oversizedBody
+                    , format       = FormatMarkdown
+                    , folder       = Nothing
+                    , tags         = emptyTagSet
+                    , baseRevision = Nothing
                     }
             eUpdate <- updateDocumentAt storage ownerId created.id (utcAt 2026 11 20 9 0 0 0) badUpdate
             eUpdate `shouldBe`
@@ -449,11 +450,12 @@ documentCrudSpec = describe "Document CRUD operations" $ do
             getDocument storage ownerId missingId `shouldReturnEq` Left (DocumentNotFound missingId)
             let req :: UpdateDocumentRequest
                 req = UpdateDocumentRequest
-                    { title  = emptyDocumentTitle
-                    , body   = emptyDocumentBody
-                    , format = FormatMarkdown
-                    , folder = Nothing
-                    , tags   = emptyTagSet
+                    { title        = emptyDocumentTitle
+                    , body         = emptyDocumentBody
+                    , format       = FormatMarkdown
+                    , folder       = Nothing
+                    , tags         = emptyTagSet
+                    , baseRevision = Nothing
                     }
             updateDocumentAt storage ownerId missingId (utcAt 2026 11 20 9 0 0 0) req
                 `shouldReturnEq` Left (DocumentNotFound missingId)
@@ -480,11 +482,12 @@ documentCrudSpec = describe "Document CRUD operations" $ do
                 , tags   = tags1
                 }
             updated <- mustRight =<< updateDocumentAt storage ownerId docId t2 UpdateDocumentRequest
-                { title  = title2
-                , body   = DocumentBody "after"
-                , format = FormatPlainText
-                , folder = Nothing
-                , tags   = tags2
+                { title        = title2
+                , body         = DocumentBody "after"
+                , format       = FormatPlainText
+                , folder       = Nothing
+                , tags         = tags2
+                , baseRevision = Nothing
                 }
             updated.title `shouldBe` title2
             updated.body `shouldBe` DocumentBody "after"
@@ -501,11 +504,12 @@ documentCrudSpec = describe "Document CRUD operations" $ do
             -- getCurrentTime を使う updateDocument ラッパーの疎通検証
             title3 <- mustRight (mkDocumentTitle "現在時刻更新")
             updatedNow <- mustRight =<< updateDocument storage ownerId docId UpdateDocumentRequest
-                { title  = title3
-                , body   = DocumentBody "after-now"
-                , format = FormatMarkdown
-                , folder = Just folder1
-                , tags   = emptyTagSet
+                { title        = title3
+                , body         = DocumentBody "after-now"
+                , format       = FormatMarkdown
+                , folder       = Just folder1
+                , tags         = emptyTagSet
+                , baseRevision = Nothing
                 }
             updatedNow.title `shouldBe` title3
             updatedNow.createdAt `shouldBe` t1
@@ -541,11 +545,12 @@ trashLifecycleSpec = describe "Trash, restore, and permanent delete lifecycle" $
 
             -- ゴミ箱内文書の更新は DocumentInTrash (409 Conflict)
             eUpdate <- updateDocumentAt storage ownerId docId tDelete2 UpdateDocumentRequest
-                { title  = emptyDocumentTitle
-                , body   = DocumentBody "cannot edit"
-                , format = FormatMarkdown
-                , folder = Nothing
-                , tags   = emptyTagSet
+                { title        = emptyDocumentTitle
+                , body         = DocumentBody "cannot edit"
+                , format       = FormatMarkdown
+                , folder       = Nothing
+                , tags         = emptyTagSet
+                , baseRevision = Nothing
                 }
             eUpdate `shouldBe` Left (DocumentInTrash docId)
 
@@ -807,11 +812,12 @@ ownerIsolationSpec = describe "Multi-user document and metadata owner isolation"
             -- Bob から Alice の文書 (稼働中/ゴミ箱双方) への全操作は存在・状態を漏らさず DocumentNotFound を返す
             let dummyUpdate :: UpdateDocumentRequest
                 dummyUpdate = UpdateDocumentRequest
-                    { title  = emptyDocumentTitle
-                    , body   = DocumentBody "hijack"
-                    , format = FormatMarkdown
-                    , folder = Nothing
-                    , tags   = emptyTagSet
+                    { title        = emptyDocumentTitle
+                    , body         = DocumentBody "hijack"
+                    , format       = FormatMarkdown
+                    , folder       = Nothing
+                    , tags         = emptyTagSet
+                    , baseRevision = Nothing
                     }
             withStorage cfg (\ h -> getDocument h bobId aliceActive.id) `shouldReturnEq` Left (DocumentNotFound aliceActive.id)
             withStorage cfg (\ h -> getDocument h bobId aliceTrashed.id) `shouldReturnEq` Left (DocumentNotFound aliceTrashed.id)

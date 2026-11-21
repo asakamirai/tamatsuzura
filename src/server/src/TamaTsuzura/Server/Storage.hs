@@ -78,6 +78,7 @@ import           TamaTsuzura.Common.Document
     , Tag
     , TagSet
     , emptyTagSet
+    , initialRevisionNumber
     , mkDocumentId
     , mkDocumentTitle
     , mkFolderPath
@@ -196,6 +197,7 @@ createDocumentWith handle ownerId docId now req =
                                             , format    = validatedReq.format
                                             , folder    = validatedReq.folder
                                             , tags      = validatedReq.tags
+                                            , revision  = initialRevisionNumber
                                             , createdAt = timestamp
                                             , updatedAt = timestamp
                                             , deletedAt = Nothing
@@ -289,6 +291,7 @@ listDocuments handle ownerId query =
         , format    = summary.format
         , folder    = summary.folder
         , tags      = fromMaybe emptyTagSet (Map.lookup summary.id tagMap)
+        , revision  = summary.revision
         , createdAt = summary.createdAt
         , updatedAt = summary.updatedAt
         , deletedAt = summary.deletedAt
@@ -343,6 +346,7 @@ updateDocumentAt handle ownerId docId now req =
                                             , format    = validatedReq.format
                                             , folder    = validatedReq.folder
                                             , tags      = validatedReq.tags
+                                            , revision  = initialRevisionNumber
                                             , createdAt = createdAt
                                             , updatedAt = updatedAt
                                             , deletedAt = Nothing
@@ -657,6 +661,7 @@ decodeDocumentRow (rawId, rawTitle, rawBody, rawFormat, mRawFolder, rawCreatedAt
         , format    = format
         , folder    = mFolder
         , tags      = tags
+        , revision  = initialRevisionNumber
         , createdAt = createdAt
         , updatedAt = updatedAt
         , deletedAt = mDeleted
@@ -677,6 +682,7 @@ decodeSummaryBase (rawId, rawTitle, rawFormat, mRawFolder, rawCreatedAt, rawUpda
         , format    = format
         , folder    = mFolder
         , tags      = emptyTagSet
+        , revision  = initialRevisionNumber
         , createdAt = createdAt
         , updatedAt = updatedAt
         , deletedAt = mDeleted
@@ -697,6 +703,7 @@ setDocumentDeletedAt mDeletedAt doc = Document
     , format    = doc.format
     , folder    = doc.folder
     , tags      = doc.tags
+    , revision  = doc.revision
     , createdAt = doc.createdAt
     , updatedAt = doc.updatedAt
     , deletedAt = mDeletedAt

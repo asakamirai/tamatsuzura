@@ -240,6 +240,7 @@ import           TamaTsuzura.Common.Document
     , TagSet
     , emptyDocumentTitle
     , emptyTagSet
+    , initialRevisionNumber
     , mkDocumentId
     , mkDocumentTitle
     , mkFolderPath
@@ -410,11 +411,12 @@ spec = do
             lookup csrfHeaderName createReq.headers `shouldBe` Just (toText csrf)
 
             updateReq <- expectRight $ buildUpdateDocumentRequest base csrf docId UpdateDocumentRequest
-                { title  = emptyDocumentTitle
-                , body   = DocumentBody "updated"
-                , format = FormatPlainText
-                , folder = Nothing
-                , tags   = emptyTagSet
+                { title        = emptyDocumentTitle
+                , body         = DocumentBody "updated"
+                , format       = FormatPlainText
+                , folder       = Nothing
+                , tags         = emptyTagSet
+                , baseRevision = Nothing
                 }
             updateReq.method `shouldBe` MethodPut
             updateReq.url `shouldBe` "/app/api/documents/doc-123"
@@ -454,11 +456,12 @@ spec = do
             docId <- expectRight (mkDocumentId "doc-huge")
             let updReq :: UpdateDocumentRequest
                 updReq = UpdateDocumentRequest
-                    { title  = emptyDocumentTitle
-                    , body   = hugeBody
-                    , format = FormatMarkdown
-                    , folder = Nothing
-                    , tags   = emptyTagSet
+                    { title        = emptyDocumentTitle
+                    , body         = hugeBody
+                    , format       = FormatMarkdown
+                    , folder       = Nothing
+                    , tags         = emptyTagSet
+                    , baseRevision = Nothing
                     }
             updRes <- updateDocument client csrf docId updReq
             case updRes of
@@ -568,11 +571,12 @@ spec = do
 
             let updReq :: UpdateDocumentRequest
                 updReq = UpdateDocumentRequest
-                    { title  = sampleDoc.title
-                    , body   = DocumentBody "更新本文"
-                    , format = FormatMarkdown
-                    , folder = Nothing
-                    , tags   = emptyTagSet
+                    { title        = sampleDoc.title
+                    , body         = DocumentBody "更新本文"
+                    , format       = FormatMarkdown
+                    , folder       = Nothing
+                    , tags         = emptyTagSet
+                    , baseRevision = Nothing
                     }
             eUpdated <- updateDocument (mkClient (HttpResponse 200 (encodeStrict sampleDoc))) csrf sampleDoc.id updReq
             eUpdated `shouldBe` Right sampleDoc
@@ -799,6 +803,7 @@ spec = do
                     , format    = doc.format
                     , folder    = doc.folder
                     , tags      = doc.tags
+                    , revision  = doc.revision
                     , createdAt = doc.createdAt
                     , updatedAt = doc.updatedAt
                     , deletedAt = Nothing
@@ -2352,6 +2357,7 @@ mkSampleDocument rawId rawTitle = do
         , format    = FormatMarkdown
         , folder    = Nothing
         , tags      = emptyTagSet
+        , revision  = initialRevisionNumber
         , createdAt = sampleUtcTime
         , updatedAt = sampleUtcTime
         , deletedAt = Nothing
@@ -2375,6 +2381,7 @@ withDocBody nextBody doc = Document
     , format    = doc.format
     , folder    = doc.folder
     , tags      = doc.tags
+    , revision  = doc.revision
     , createdAt = doc.createdAt
     , updatedAt = doc.updatedAt
     , deletedAt = doc.deletedAt
@@ -2388,6 +2395,7 @@ withDocDeletedAt mDel doc = Document
     , format    = doc.format
     , folder    = doc.folder
     , tags      = doc.tags
+    , revision  = doc.revision
     , createdAt = doc.createdAt
     , updatedAt = doc.updatedAt
     , deletedAt = mDel
@@ -2401,6 +2409,7 @@ withDocUpdatedAt ts doc = Document
     , format    = doc.format
     , folder    = doc.folder
     , tags      = doc.tags
+    , revision  = doc.revision
     , createdAt = doc.createdAt
     , updatedAt = ts
     , deletedAt = doc.deletedAt

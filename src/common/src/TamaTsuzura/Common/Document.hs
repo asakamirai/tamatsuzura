@@ -19,6 +19,11 @@ module TamaTsuzura.Common.Document
     , DocumentFormat(..)
     , defaultDocumentFormat
     , parseDocumentFormat
+    , RevisionNumber
+    , mkRevisionNumber
+    , initialRevisionNumber
+    , nextRevisionNumber
+    , revisionNumberValue
       -- * 整理メタデータ (タグ・フォルダ)
     , Tag
     , mkTag
@@ -65,6 +70,7 @@ import           TamaTsuzura.Common.Validation
     , maxFolderPathLength
     , maxTagLength
     , maxTagsPerDocument
+    , minRevisionNumber
     )
 
 -- | 文書を一意に識別する ID。
@@ -207,6 +213,44 @@ parseDocumentFormat :: Text -> Either ValidationError DocumentFormat
 parseDocumentFormat "markdown"   = Right FormatMarkdown
 parseDocumentFormat "plain_text" = Right FormatPlainText
 parseDocumentFormat raw          = Left (InvalidDocumentFormat raw)
+
+-- | 文書内で単調増加する 1 始まりのリビジョン番号。
+-- 0 以下の不正な版番号の混入を防ぐためコンストラクタを非公開とする。
+newtype RevisionNumber = RevisionNumber
+    { unWrap :: Int
+    } deriving (Eq, Ord)
+
+instance ToText RevisionNumber where
+    toText rev = Txt.pack (show rev.unWrap)
+
+instance Show RevisionNumber where
+    show = Txt.unpack . toText
+
+instance ToJSON RevisionNumber where
+    toJSON rev = toJSON rev.unWrap
+
+instance FromJSON RevisionNumber where
+    parseJSON v = do
+        raw <- parseJSON v
+        either (fail . Txt.unpack . toText) pure (mkRevisionNumber raw)
+
+-- | 1 以上であることを検証して 'RevisionNumber' を構築するスマートコンストラクタ。
+mkRevisionNumber :: Int -> Either ValidationError RevisionNumber
+mkRevisionNumber n
+    | n < minRevisionNumber = Left (InvalidRevisionNumber n)
+    | otherwise             = Right (RevisionNumber n)
+
+-- | 新規作成時の初期リビジョン番号 (1)。
+initialRevisionNumber :: RevisionNumber
+initialRevisionNumber = RevisionNumber minRevisionNumber
+
+-- | 次のリビジョン番号 (+1) を返す。
+nextRevisionNumber :: RevisionNumber -> RevisionNumber
+nextRevisionNumber rev = RevisionNumber (rev.unWrap + 1)
+
+-- | 検証済み 'RevisionNumber' から生の 'Int' 値を取り出す。
+revisionNumberValue :: RevisionNumber -> Int
+revisionNumberValue rev = rev.unWrap
 
 -- | 文書に付与する分類タグ。
 -- 前後空白除去後に空でなく、制御文字を含まない 1〜'maxTagLength' 文字の文字列であることを保証する。
@@ -375,6 +419,8 @@ data DocumentSummary = DocumentSummary
       -- ^ 所属フォルダパス (ルート直下は 'Nothing')
     , tags      :: !TagSet
       -- ^ 付与されたタグ集合
+    , revision  :: !RevisionNumber
+      -- ^ 現在の最新リビジョン番号 (1 始まり)
     , createdAt :: !UTCTime
       -- ^ 作成日時 (UTC)
     , updatedAt :: !UTCTime
@@ -393,6 +439,7 @@ instance ToJSON DocumentSummary where
         , "format"     Aeson..= summary.format
         , "folder"     Aeson..= summary.folder
         , "tags"       Aeson..= summary.tags
+        , "revision"   Aeson..= summary.revision
         , "created_at" Aeson..= summary.createdAt
         , "updated_at" Aeson..= summary.updatedAt
         , "deleted_at" Aeson..= summary.deletedAt
@@ -406,6 +453,7 @@ instance FromJSON DocumentSummary where
             <*> obj Aeson..: "format"
             <*> obj Aeson..: "folder"
             <*> obj Aeson..: "tags"
+            <*> obj Aeson..: "revision"
             <*> obj Aeson..: "created_at"
             <*> obj Aeson..: "updated_at"
             <*> obj Aeson..: "deleted_at"
@@ -424,6 +472,8 @@ data Document = Document
       -- ^ 所属フォルダパス (ルート直下は 'Nothing')
     , tags      :: !TagSet
       -- ^ 付与されたタグ集合
+    , revision  :: !RevisionNumber
+      -- ^ 現在の最新リビジョン番号 (1 始まり)
     , createdAt :: !UTCTime
       -- ^ 作成日時 (UTC)
     , updatedAt :: !UTCTime
@@ -443,6 +493,7 @@ instance ToJSON Document where
         , "format"     Aeson..= doc.format
         , "folder"     Aeson..= doc.folder
         , "tags"       Aeson..= doc.tags
+        , "revision"   Aeson..= doc.revision
         , "created_at" Aeson..= doc.createdAt
         , "updated_at" Aeson..= doc.updatedAt
         , "deleted_at" Aeson..= doc.deletedAt
@@ -457,6 +508,7 @@ instance FromJSON Document where
             <*> obj Aeson..: "format"
             <*> obj Aeson..: "folder"
             <*> obj Aeson..: "tags"
+            <*> obj Aeson..: "revision"
             <*> obj Aeson..: "created_at"
             <*> obj Aeson..: "updated_at"
             <*> obj Aeson..: "deleted_at"
@@ -469,6 +521,7 @@ toDocumentSummary doc = DocumentSummary
     , format    = doc.format
     , folder    = doc.folder
     , tags      = doc.tags
+    , revision  = doc.revision
     , createdAt = doc.createdAt
     , updatedAt = doc.updatedAt
     , deletedAt = doc.deletedAt

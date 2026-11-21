@@ -983,11 +983,12 @@ validateEditorDraft currentDraft = do
     validFolder <- parseFolderInput currentDraft.folderInput
     validTags   <- parseTagsInput currentDraft.tagsInput
     Right UpdateDocumentRequest
-        { title  = validTitle
-        , body   = validBody
-        , format = currentDraft.format
-        , folder = validFolder
-        , tags   = validTags
+        { title        = validTitle
+        , body         = validBody
+        , format       = currentDraft.format
+        , folder       = validFolder
+        , tags         = validTags
+        , baseRevision = Nothing
         }
 
 -- | 保存送信時点のドラフト (@sentDraft@)、サーバ正規化済みドラフト (@savedDraft@)、

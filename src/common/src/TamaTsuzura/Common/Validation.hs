@@ -21,6 +21,9 @@ module TamaTsuzura.Common.Validation
     , maxPasswordBytes
     , minCsrfTokenLength
     , maxCsrfTokenLength
+    , maxRevisionIdLength
+    , minRevisionNumber
+    , contentHashHexLength
       -- * バリデーションエラー型
     , ValidationError(..)
     , validationErrorField
@@ -107,6 +110,18 @@ minCsrfTokenLength = 32
 maxCsrfTokenLength :: Int
 maxCsrfTokenLength = 128
 
+-- | リビジョン ID の最大文字数 (UUIDv4 36 文字や将来のプレフィックス付き ID を収容する上限)。
+maxRevisionIdLength :: Int
+maxRevisionIdLength = 64
+
+-- | リビジョン番号の最小値 (1 始まりの単調増加連番)。
+minRevisionNumber :: Int
+minRevisionNumber = 1
+
+-- | コンテンツハッシュ (SHA-256 小文字 16 進表現) の固定文字数。
+contentHashHexLength :: Int
+contentHashHexLength = 64
+
 -- | 共通ドメイン型および API 入力パラメータの検証失敗理由。
 -- 例外ではなく戻り値 ('Either') として扱うため、呼び出し側が機械的にエラー分類できる ADT として定義する。
 data ValidationError
@@ -178,6 +193,16 @@ data ValidationError
       -- ^ パスワードに NUL 文字が含まれている
     | InvalidCsrfToken
       -- ^ CSRF トークンの書式または長さが不正である
+    | EmptyRevisionId
+      -- ^ リビジョン ID が空文字列である
+    | RevisionIdTooLong !Int !Int
+      -- ^ リビジョン ID が上限文字数を超えている (実際値, 上限)
+    | InvalidRevisionIdChar !Text
+      -- ^ リビジョン ID に URL セーフな ASCII 英数字・ハイフン・アンダースコア以外の文字が含まれている
+    | InvalidRevisionNumber !Int
+      -- ^ リビジョン番号が 1 未満である (実際値)
+    | InvalidContentHash !Text
+      -- ^ コンテンツハッシュが 64 文字の小文字 16 進文字列 (SHA-256) ではない
     deriving (Eq)
 
 instance ToText ValidationError where
@@ -249,6 +274,16 @@ instance ToText ValidationError where
         "Password must not contain NUL characters"
     toText InvalidCsrfToken =
         "CSRF token is malformed"
+    toText EmptyRevisionId =
+        "Revision ID must not be empty"
+    toText (RevisionIdTooLong actual limit) =
+        "Revision ID length " <> showInt actual <> " exceeds maximum " <> showInt limit
+    toText (InvalidRevisionIdChar raw) =
+        "Revision ID contains invalid characters: " <> raw
+    toText (InvalidRevisionNumber actual) =
+        "Revision number must be at least " <> showInt minRevisionNumber <> ", got " <> showInt actual
+    toText (InvalidContentHash raw) =
+        "Content hash must be a " <> showInt contentHashHexLength <> "-character lowercase hexadecimal SHA-256 digest: " <> raw
 
 instance Show ValidationError where
     show = Txt.unpack . toText
@@ -292,6 +327,11 @@ validationErrorField PasswordTooShort{}             = "password"
 validationErrorField PasswordTooLong{}              = "password"
 validationErrorField PasswordContainsNullChar       = "password"
 validationErrorField InvalidCsrfToken               = "csrf_token"
+validationErrorField EmptyRevisionId                = "revision_id"
+validationErrorField RevisionIdTooLong{}            = "revision_id"
+validationErrorField InvalidRevisionIdChar{}        = "revision_id"
+validationErrorField InvalidRevisionNumber{}        = "revision"
+validationErrorField InvalidContentHash{}           = "content_hash"
 
 showInt :: Int -> Text
 showInt = Txt.pack . show

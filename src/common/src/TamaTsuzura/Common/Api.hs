@@ -55,6 +55,7 @@ import           TamaTsuzura.Common.Document
     , DocumentSummary
     , DocumentTitle
     , FolderPath
+    , RevisionNumber
     , Tag
     , TagSet
     , defaultDocumentFormat
@@ -328,30 +329,39 @@ validateCreateDocumentRequest req = do
 
 -- | 文書更新 API (@PUT /api/documents/{id}@) のリクエスト DTO。
 -- PUT による全体置換の意図せぬフィールド消失を防ぐため、@title@・@body@・@format@・@tags@ を必須とする。
+-- @baseRevision@ を指定した場合はサーバ側の最新リビジョン番号と照合し、不一致時は 409 Conflict を返却する
+-- (省略または @null@ の場合は楽観的排他チェックを行わず上書きする)。
 data UpdateDocumentRequest = UpdateDocumentRequest
-    { title  :: !DocumentTitle
+    { title        :: !DocumentTitle
       -- ^ 更新後タイトル (空文字可)
-    , body   :: !DocumentBody
+    , body         :: !DocumentBody
       -- ^ 更新後本文 (UTF-8)
-    , format :: !DocumentFormat
+    , format       :: !DocumentFormat
       -- ^ 更新後フォーマット種別
-    , folder :: !(Maybe FolderPath)
+    , folder       :: !(Maybe FolderPath)
       -- ^ 更新後フォルダパス (@null@ または省略時はルートへ移動)
-    , tags   :: !TagSet
+    , tags         :: !TagSet
       -- ^ 更新後タグ集合
+    , baseRevision :: !(Maybe RevisionNumber)
+      -- ^ 楽観的排他制御用の期待リビジョン番号 (任意)
     } deriving (Eq, Show)
 
 instance ToText UpdateDocumentRequest where
     toText req = "UpdateDocument(" <> toText req.title <> ", " <> toText req.format <> ")"
 
 instance ToJSON UpdateDocumentRequest where
-    toJSON req = Aeson.object
+    toJSON req = Aeson.object $
         [ "title"  Aeson..= req.title
         , "body"   Aeson..= req.body
         , "format" Aeson..= req.format
         , "folder" Aeson..= req.folder
         , "tags"   Aeson..= req.tags
-        ]
+        ] <> baseRevisionPair
+      where
+        baseRevisionPair :: [Pair]
+        baseRevisionPair = case req.baseRevision of
+            Nothing  -> []
+            Just rev -> ["base_revision" Aeson..= rev]
 
 instance FromJSON UpdateDocumentRequest where
     parseJSON = Aeson.withObject "UpdateDocumentRequest" $ \ obj ->
@@ -361,6 +371,7 @@ instance FromJSON UpdateDocumentRequest where
             <*> obj Aeson..:  "format"
             <*> obj Aeson..:? "folder"
             <*> obj Aeson..:  "tags"
+            <*> obj Aeson..:? "base_revision"
 
 -- | 更新リクエストの追加ドメイン制約 (本文バイト長上限) を検証する。
 validateUpdateDocumentRequest :: UpdateDocumentRequest -> Either ValidationError UpdateDocumentRequest

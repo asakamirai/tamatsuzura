@@ -23,7 +23,9 @@ library
   exposed-modules:
     TamaTsuzura.Common.Api
     TamaTsuzura.Common.Auth
+    TamaTsuzura.Common.Diff
     TamaTsuzura.Common.Document
+    TamaTsuzura.Common.Revision
     TamaTsuzura.Common.Text
     TamaTsuzura.Common.Validation
   build-depends:

@@ -2,9 +2,9 @@ openapi: 3.0.3
 info:
   title: TamaTsuzura API
   description: |
-    TamaTsuzura Web API specification (M1 Document CRUD + M3 CGI-Compatible SQLite Cookie Authentication and User Isolation).
+    TamaTsuzura Web API specification (M1 Document CRUD + M3 CGI-Compatible SQLite Cookie Authentication and User Isolation + M4 Revision History).
     Designed to run identically on both shared-hosting CGI (wai-extra) and standalone Warp servers.
-  version: 0.3.0
+  version: 0.4.0
 tags:
   - name: health
     description: Server health check
@@ -12,6 +12,8 @@ tags:
     description: User registration, login, logout, and current session inspection
   - name: documents
     description: Document CRUD, search/filtering, and soft-delete (trash) lifecycle (scoped to authenticated owner)
+  - name: revisions
+    description: Append-only document revision history inspection and rollback (scoped to authenticated owner)
   - name: metadata
     description: Organization metadata listing (tags and folders scoped to authenticated owner)
 
@@ -288,6 +290,9 @@ paths:
       summary: Replace/update an active document
       description: |
         Replaces title, body, format, folder, and tags of an active document owned by the authenticated user.
+        Appends a new revision only when revision-tracked content (`title`, `format`, or `body`) has changed;
+        changes limited to organization metadata (`folder` or `tags`) are persisted without creating a duplicate revision.
+        When `base_revision` is provided, it must match the document's current `revision` or `409 Conflict` is returned.
         Returns `409 Conflict` if the document is currently in the trash (restore it before editing).
       operationId: updateDocument
       security:
@@ -407,6 +412,127 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
 
+  /api/documents/{id}/revisions:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
+
+    get:
+      tags:
+        - revisions
+      summary: List revision history summaries for a document
+      description: |
+        Returns append-only revision summaries (excluding body and diff text) for a document owned by the authenticated user,
+        ordered by `revision` descending (newest first).
+        Accessing another user's document returns `404 Not Found`.
+      operationId: listDocumentRevisions
+      security:
+        - SessionCookie: []
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum number of revisions to return (1..200).
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: offset
+          in: query
+          description: Zero-based pagination offset.
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Revision summaries and total count
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevisionListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/documents/{id}/revisions/{revision}:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
+      - $ref: '#/components/parameters/RevisionNumberPath'
+
+    get:
+      tags:
+        - revisions
+      summary: Get a specific revision detail with reconstructed body and unified diff
+      description: |
+        Reconstructs and returns the document snapshot (`title`, `format`, `body`) and stored unified diff
+        for the specified 1-based revision number of a document owned by the authenticated user.
+        Returns `404 Not Found` if the document or revision does not exist or belongs to another user.
+      operationId: getDocumentRevision
+      security:
+        - SessionCookie: []
+      responses:
+        '200':
+          description: Reconstructed revision detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RevisionDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/documents/{id}/revisions/{revision}/restore:
+    parameters:
+      - $ref: '#/components/parameters/DocumentIdPath'
+      - $ref: '#/components/parameters/RevisionNumberPath'
+
+    post:
+      tags:
+        - revisions
+      summary: Roll back an active document to a historical revision
+      description: |
+        Restores `title`, `format`, and `body` from the specified historical revision while preserving
+        current organization metadata (`folder`, `tags`).
+        Because history is append-only, restoring different content appends a new revision (`current + 1`);
+        if the target revision already matches the current content hash, returns the current document without adding a duplicate revision.
+        When `base_revision` is provided, it must match the document's current `revision` or `409 Conflict` is returned.
+        Returns `409 Conflict` if the document is currently in the trash.
+      operationId: restoreDocumentRevision
+      security:
+        - SessionCookie: []
+          CsrfHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreRevisionRequest'
+      responses:
+        '200':
+          description: Updated document after restoring the historical revision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
   /api/tags:
     get:
       tags:
@@ -466,6 +592,13 @@ components:
       description: URL-safe document identifier (1..64 ASCII alphanumeric, hyphen, or underscore characters)
       schema:
         $ref: '#/components/schemas/DocumentId'
+    RevisionNumberPath:
+      name: revision
+      in: path
+      required: true
+      description: 1-based monotonically increasing revision number within the document
+      schema:
+        $ref: '#/components/schemas/RevisionNumber'
 
   responses:
     BadRequest:
@@ -493,7 +626,7 @@ components:
           schema:
             $ref: '#/components/schemas/ApiError'
     Conflict:
-      description: Resource state conflict (e.g. duplicate username, updating a trashed document, or permanently deleting an active document)
+      description: Resource state conflict (e.g. duplicate username, base_revision mismatch, updating a trashed document, or permanently deleting an active document)
       content:
         application/json:
           schema:
@@ -693,6 +826,7 @@ components:
         - format
         - folder
         - tags
+        - revision
         - created_at
         - updated_at
         - deleted_at
@@ -711,6 +845,8 @@ components:
           uniqueItems: true
           items:
             $ref: '#/components/schemas/Tag'
+        revision:
+          $ref: '#/components/schemas/RevisionNumber'
         created_at:
           type: string
           format: date-time
@@ -734,6 +870,7 @@ components:
         - format
         - folder
         - tags
+        - revision
         - created_at
         - updated_at
         - deleted_at
@@ -754,6 +891,8 @@ components:
           uniqueItems: true
           items:
             $ref: '#/components/schemas/Tag'
+        revision:
+          $ref: '#/components/schemas/RevisionNumber'
         created_at:
           type: string
           format: date-time
@@ -808,6 +947,140 @@ components:
           description: Up to 50 tag labels. Duplicate entries are deduplicated and normalized in ascending order.
           items:
             $ref: '#/components/schemas/Tag'
+        base_revision:
+          $ref: '#/components/schemas/NullableRevisionNumber'
+
+    RevisionId:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[A-Za-z0-9_-]+$'
+      example: 9c4f1e2a-6b3d-4a8e-9f12-0123456789ab
+
+    NullableRevisionId:
+      type: string
+      nullable: true
+      minLength: 1
+      maxLength: 64
+      pattern: '^[A-Za-z0-9_-]+$'
+      description: Parent revision identifier, or `null` for the initial revision (revision 1)
+      example: null
+
+    RevisionNumber:
+      type: integer
+      minimum: 1
+      description: 1-based monotonically increasing revision number within a document
+      example: 1
+
+    NullableRevisionNumber:
+      type: integer
+      nullable: true
+      minimum: 1
+      description: Optional expected current revision number for optimistic concurrency control (`409 Conflict` on mismatch)
+      example: 3
+
+    ContentHash:
+      type: string
+      minLength: 64
+      maxLength: 64
+      pattern: '^[0-9a-f]{64}$'
+      description: Lowercase 64-character hexadecimal SHA-256 digest of canonicalized revision content (`title`, `format`, `body`)
+      example: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+
+    UnifiedDiff:
+      type: string
+      description: Standard unified diff text from parent revision body to this revision body (empty string when body is unchanged)
+      example: "@@ -1 +1 @@\n-old line\n+new line\n"
+
+    RevisionSummary:
+      type: object
+      required:
+        - id
+        - document_id
+        - revision
+        - parent_revision_id
+        - title
+        - format
+        - content_hash
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/RevisionId'
+        document_id:
+          $ref: '#/components/schemas/DocumentId'
+        revision:
+          $ref: '#/components/schemas/RevisionNumber'
+        parent_revision_id:
+          $ref: '#/components/schemas/NullableRevisionId'
+        title:
+          $ref: '#/components/schemas/DocumentTitle'
+        format:
+          $ref: '#/components/schemas/DocumentFormat'
+        content_hash:
+          $ref: '#/components/schemas/ContentHash'
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-11-21T12:00:00Z'
+
+    RevisionDetail:
+      type: object
+      required:
+        - id
+        - document_id
+        - revision
+        - parent_revision_id
+        - title
+        - body
+        - format
+        - diff
+        - content_hash
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/RevisionId'
+        document_id:
+          $ref: '#/components/schemas/DocumentId'
+        revision:
+          $ref: '#/components/schemas/RevisionNumber'
+        parent_revision_id:
+          $ref: '#/components/schemas/NullableRevisionId'
+        title:
+          $ref: '#/components/schemas/DocumentTitle'
+        body:
+          $ref: '#/components/schemas/DocumentBody'
+        format:
+          $ref: '#/components/schemas/DocumentFormat'
+        diff:
+          $ref: '#/components/schemas/UnifiedDiff'
+        content_hash:
+          $ref: '#/components/schemas/ContentHash'
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-11-21T12:00:00Z'
+
+    RevisionListResponse:
+      type: object
+      required:
+        - revisions
+        - total
+      properties:
+        revisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RevisionSummary'
+        total:
+          type: integer
+          minimum: 0
+          description: Total revision count before limit/offset pagination
+          example: 5
+
+    RestoreRevisionRequest:
+      type: object
+      properties:
+        base_revision:
+          $ref: '#/components/schemas/NullableRevisionNumber'
 
     DocumentListResponse:
       type: object

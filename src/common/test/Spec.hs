@@ -62,6 +62,24 @@ import           TamaTsuzura.Common.Auth
     , validateNewPassword
     , validateRegisterRequest
     )
+import           TamaTsuzura.Common.Diff
+    ( DiffError(..)
+    , ParsedDiff(..)
+    , UnifiedDiff(..)
+    , applyParsedDiff
+    , applyUnifiedDiff
+    , applyUnifiedDiffReverse
+    , defaultContextLines
+    , emptyUnifiedDiff
+    , generateDiff
+    , generateDiffWithContext
+    , generateUnifiedDiff
+    , generateUnifiedDiffWithContext
+    , parseUnifiedDiff
+    , renderUnifiedDiff
+    , reverseParsedDiff
+    , reverseUnifiedDiff
+    )
 import           TamaTsuzura.Common.Document
     ( Document(..)
     , DocumentBody(..)
@@ -70,6 +88,7 @@ import           TamaTsuzura.Common.Document
     , DocumentSummary(..)
     , DocumentTitle
     , FolderPath
+    , RevisionNumber
     , Tag
     , TagSet
     , defaultDocumentFormat
@@ -79,6 +98,7 @@ import           TamaTsuzura.Common.Document
     , emptyTagSet
     , folderParent
     , folderSegments
+    , initialRevisionNumber
     , isFolderPrefixOf
     , isSummaryTrashed
     , isTrashed
@@ -87,17 +107,34 @@ import           TamaTsuzura.Common.Document
     , mkDocumentId
     , mkDocumentTitle
     , mkFolderPath
+    , mkRevisionNumber
     , mkTag
     , mkTagSet
     , mkTagSetFromTexts
+    , nextRevisionNumber
     , parseDocumentFormat
+    , revisionNumberValue
     , tagSetSize
     , tagSetToList
     , toDocumentSummary
     )
+import           TamaTsuzura.Common.Revision
+    ( ContentHash
+    , RestoreRevisionRequest(..)
+    , RevisionDetail(..)
+    , RevisionId
+    , RevisionListResponse(..)
+    , RevisionSummary(..)
+    , defaultRestoreRevisionRequest
+    , mkContentHash
+    , mkRevisionId
+    , revisionContentCanonicalText
+    , toRevisionSummary
+    )
 import           TamaTsuzura.Common.Text       (ToText(..))
 import           TamaTsuzura.Common.Validation
     ( ValidationError(..)
+    , contentHashHexLength
     , defaultListLimit
     , maxCsrfTokenLength
     , maxDisplayNameLength
@@ -108,6 +145,7 @@ import           TamaTsuzura.Common.Validation
     , maxFolderPathLength
     , maxListLimit
     , maxPasswordBytes
+    , maxRevisionIdLength
     , maxSearchQueryLength
     , maxTagLength
     , maxTagsPerDocument
@@ -116,11 +154,12 @@ import           TamaTsuzura.Common.Validation
     , minCsrfTokenLength
     , minListLimit
     , minPasswordLength
+    , minRevisionNumber
     , minUsernameLength
     , validationErrorField
     )
 import           Test.Hspec                    (Spec, describe, expectationFailure, hspec, it, shouldBe, shouldSatisfy)
-import           Test.QuickCheck               (Gen, chooseInt, elements, forAll, listOf1, property, vectorOf)
+import           Test.QuickCheck               (Gen, chooseInt, elements, forAll, listOf, listOf1, property, vectorOf)
 
 main :: IO ()
 main = hspec spec
@@ -164,6 +203,35 @@ genValidUsernameText = do
     restLen <- chooseInt (minUsernameLength - 1, maxUsernameLength - 1)
     rest <- vectorOf restLen (elements (['a' .. 'z'] <> ['A' .. 'Z'] <> ['0' .. '9'] <> ['_', '-']))
     pure (Txt.pack (hd : rest))
+
+-- | 差分アルゴリズム検証用の多様なテキスト生成器。
+-- 空行・重複行・日本語マルチバイト・CRLF・@\\ No newline at end of file@ 文字列・末尾改行有無を網羅する。
+genDiffText :: Gen Text
+genDiffText = do
+    lineList <- listOf genLine
+    hasTrailingNewline <- elements [True, False]
+    pure $ case lineList of
+        [] -> ""
+        _  ->
+            let joined :: Text
+                joined = Txt.intercalate "\n" lineList
+            in  if hasTrailingNewline then joined <> "\n" else joined
+  where
+    genLine :: Gen Text
+    genLine = elements
+        [ ""
+        , "alpha"
+        , "beta"
+        , "gamma"
+        , "delta"
+        , "日本語の行"
+        , "line with \r"
+        , "\\ No newline at end of file"
+        , "@@ -1,2 +1,2 @@"
+        , "+plus-prefixed"
+        , "-minus-prefixed"
+        , " space-prefixed"
+        ]
 
 isStrictlyAscending :: Ord a => [a] -> Bool
 isStrictlyAscending []             = True
@@ -403,6 +471,7 @@ spec = do
                             , format    = FormatMarkdown
                             , folder    = Just docFolder
                             , tags      = docTags
+                            , revision  = initialRevisionNumber
                             , createdAt = sampleTime
                             , updatedAt = sampleLaterTime
                             , deletedAt = Nothing
@@ -417,6 +486,7 @@ spec = do
                             , format    = doc.format
                             , folder    = doc.folder
                             , tags      = doc.tags
+                            , revision  = nextRevisionNumber doc.revision
                             , createdAt = doc.createdAt
                             , updatedAt = doc.updatedAt
                             , deletedAt = Just sampleLaterTime
@@ -429,6 +499,7 @@ spec = do
                             , "format"     Aeson..= ("markdown" :: Text)
                             , "folder"     Aeson..= ("diary/2026" :: Text)
                             , "tags"       Aeson..= (["daily", "memo"] :: [Text])
+                            , "revision"   Aeson..= (1 :: Int)
                             , "created_at" Aeson..= sampleTime
                             , "updated_at" Aeson..= sampleLaterTime
                             , "deleted_at" Aeson..= Aeson.Null
@@ -440,6 +511,7 @@ spec = do
                             , "format"     Aeson..= ("markdown" :: Text)
                             , "folder"     Aeson..= ("diary/2026" :: Text)
                             , "tags"       Aeson..= (["daily", "memo"] :: [Text])
+                            , "revision"   Aeson..= (1 :: Int)
                             , "created_at" Aeson..= sampleTime
                             , "updated_at" Aeson..= sampleLaterTime
                             , "deleted_at" Aeson..= Aeson.Null
@@ -534,15 +606,35 @@ spec = do
             validateCreateDocumentRequest oversizedReq
                 `shouldBe` Left (BodyTooLarge (maxDocumentBodyBytes + 1) maxDocumentBodyBytes)
 
-        it "requires explicit fields on UpdateDocumentRequest and allows null or omitted folder" $ do
+        it "requires explicit fields on UpdateDocumentRequest and allows optional folder and base_revision" $ do
             let validJson :: Maybe UpdateDocumentRequest
                 validJson = Aeson.decode "{\"title\":\"\",\"body\":\"updated\",\"format\":\"plain_text\",\"tags\":[\"work\"]}"
+                nullBaseRevJson :: Maybe UpdateDocumentRequest
+                nullBaseRevJson = Aeson.decode "{\"title\":\"\",\"body\":\"updated\",\"format\":\"plain_text\",\"tags\":[\"work\"],\"base_revision\":null}"
+                withBaseRevJson :: Maybe UpdateDocumentRequest
+                withBaseRevJson = Aeson.decode "{\"title\":\"\",\"body\":\"updated\",\"format\":\"plain_text\",\"tags\":[\"work\"],\"base_revision\":3}"
             case validJson of
                 Nothing  -> expectationFailure "Expected valid UpdateDocumentRequest JSON to decode"
                 Just req -> do
                     req.folder `shouldSatisfy` isNothing
+                    req.baseRevision `shouldSatisfy` isNothing
                     validateUpdateDocumentRequest req `shouldBe` Right req
                     Aeson.decode (Aeson.encode req) `shouldBe` Just req
+                    Aeson.toJSON req `shouldBe` Aeson.object
+                        [ "title"  Aeson..= ("" :: Text)
+                        , "body"   Aeson..= ("updated" :: Text)
+                        , "format" Aeson..= ("plain_text" :: Text)
+                        , "folder" Aeson..= Aeson.Null
+                        , "tags"   Aeson..= (["work"] :: [Text])
+                        ]
+            nullBaseRevJson `shouldBe` validJson
+            case withBaseRevJson of
+                Nothing  -> expectationFailure "Expected UpdateDocumentRequest with base_revision to decode"
+                Just req -> do
+                    fmap revisionNumberValue req.baseRevision `shouldBe` Just 3
+                    Aeson.decode (Aeson.encode req) `shouldBe` Just req
+            (Aeson.decode "{\"title\":\"\",\"body\":\"updated\",\"format\":\"plain_text\",\"tags\":[],\"base_revision\":0}" :: Maybe UpdateDocumentRequest)
+                `shouldBe` Nothing
             (Aeson.decode "{\"title\":\"only-title\"}" :: Maybe UpdateDocumentRequest) `shouldBe` Nothing
 
         it "roundtrips DocumentListResponse, TagListResponse, and FolderListResponse and rejects negative total" $ do
@@ -635,6 +727,11 @@ spec = do
                     , (PasswordTooLong 129 128,                 "password")
                     , (PasswordContainsNullChar,                "password")
                     , (InvalidCsrfToken,                        "csrf_token")
+                    , (EmptyRevisionId,                         "revision_id")
+                    , (RevisionIdTooLong 65 64,                 "revision_id")
+                    , (InvalidRevisionIdChar "bad/rev",         "revision_id")
+                    , (InvalidRevisionNumber 0,                 "revision")
+                    , (InvalidContentHash "short",              "content_hash")
                     ]
             map (validationErrorField . fst) cases `shouldBe` map snd cases
 
@@ -832,3 +929,322 @@ spec = do
                     Txt.isInfixOf "password123" (Txt.pack (show loginReq)) `shouldBe` False
                     Txt.isInfixOf (toText csrf) (Txt.pack (show sessionRes)) `shouldBe` False
                 _ -> expectationFailure "Expected sample auth DTO components to construct successfully"
+
+    describe "Unified diff generation, parsing, application, and reversal" $ do
+        it "returns emptyUnifiedDiff for identical texts and applies it as identity" $ do
+            generateUnifiedDiff "" "" `shouldBe` emptyUnifiedDiff
+            generateUnifiedDiff "hello\nworld\n" "hello\nworld\n" `shouldBe` emptyUnifiedDiff
+            applyUnifiedDiff "hello\nworld\n" emptyUnifiedDiff `shouldBe` Right "hello\nworld\n"
+            applyUnifiedDiffReverse "hello\nworld\n" emptyUnifiedDiff `shouldBe` Right "hello\nworld\n"
+
+        it "handles empty-to-non-empty, non-empty-to-empty, and single-newline edge cases" $ do
+            let cases :: [(Text, Text)]
+                cases =
+                    [ ("", "hello\n")
+                    , ("hello\n", "")
+                    , ("", "hello")
+                    , ("hello", "")
+                    , ("", "\n")
+                    , ("\n", "")
+                    , ("a", "a\n")
+                    , ("a\n", "a")
+                    , ("a\r\nb\r\n", "a\r\nc\r\n")
+                    , ("日本語\nテスト\n", "日本語\n改訂テスト\n追記")
+                    , ("line1\n\\ No newline at end of file\n", "line1\n\\ No newline at end of file")
+                    ]
+                verifyPair :: (Text, Text) -> IO ()
+                verifyPair (oldTxt, newTxt) = do
+                    let diff :: UnifiedDiff
+                        diff = generateUnifiedDiff oldTxt newTxt
+                    applyUnifiedDiff oldTxt diff `shouldBe` Right newTxt
+                    applyUnifiedDiffReverse newTxt diff `shouldBe` Right oldTxt
+            mapM_ verifyPair cases
+
+        it "splits distant edits into separate hunks and merges nearby edits within 2*context lines" $ do
+            let baseLines :: [Text]
+                baseLines = map (\ n -> "line-" <> Txt.pack (show n)) [1 :: Int .. 20]
+                oldTxt :: Text
+                oldTxt = Txt.unlines baseLines
+                distantNew :: Text
+                distantNew = Txt.unlines $
+                    ["line-1-edited"] <> drop 1 (take 19 baseLines) <> ["line-20-edited"]
+                nearbyNew :: Text
+                nearbyNew = Txt.unlines $
+                    ["line-1-edited"] <> drop 1 (take 6 baseLines) <> ["line-7-edited"] <> drop 7 baseLines
+                distantParsed :: ParsedDiff
+                distantParsed = generateDiff oldTxt distantNew
+                nearbyParsed :: ParsedDiff
+                nearbyParsed = generateDiff oldTxt nearbyNew
+            defaultContextLines `shouldBe` 3
+            length distantParsed.hunks `shouldBe` 2
+            length nearbyParsed.hunks `shouldBe` 1
+            generateDiffWithContext (-1) oldTxt distantNew `shouldBe` generateDiffWithContext 0 oldTxt distantNew
+            applyParsedDiff oldTxt distantParsed `shouldBe` Right distantNew
+            applyParsedDiff oldTxt nearbyParsed `shouldBe` Right nearbyNew
+
+        it "parses external unified diff with file headers and optional hunk heading text" $ do
+            let externalDiff :: UnifiedDiff
+                externalDiff = UnifiedDiff
+                    "--- a/note.md\n\
+                    \+++ b/note.md\n\
+                    \@@ -1,3 +1,3 @@ section heading\n\
+                    \ line1\n\
+                    \-line2\n\
+                    \+line2-updated\n\
+                    \ line3\n"
+            applyUnifiedDiff "line1\nline2\nline3\n" externalDiff
+                `shouldBe` Right "line1\nline2-updated\nline3\n"
+
+        it "reports structured DiffError on malformed headers, bad prefixes, count mismatch, overlap, offset mismatch, and newline violations" $ do
+            parseUnifiedDiff (UnifiedDiff "not a diff header\n")
+                `shouldBe` Left (UnexpectedDiffLine 1 "not a diff header")
+            parseUnifiedDiff (UnifiedDiff "--- a/only-one-header\n@@ -1 +1 @@\n-a\n+b\n")
+                `shouldBe` Left (UnexpectedDiffLine 1 "--- a/only-one-header")
+            parseUnifiedDiff (UnifiedDiff "@@ -bad +1 @@\n")
+                `shouldBe` Left (MalformedHunkHeader 1 "@@ -bad +1 @@")
+            parseUnifiedDiff (UnifiedDiff "@@ -0,1 +1,1 @@\n-a\n+b\n")
+                `shouldBe` Left (MalformedHunkHeader 1 "@@ -0,1 +1,1 @@")
+            parseUnifiedDiff (UnifiedDiff "@@ -0,0 +0,0 @@\n")
+                `shouldBe` Left (MalformedHunkHeader 1 "@@ -0,0 +0,0 @@")
+            parseUnifiedDiff (UnifiedDiff "@@ -4294967297,1 +1,1 @@\n-a\n+b\n")
+                `shouldBe` Left (MalformedHunkHeader 1 "@@ -4294967297,1 +1,1 @@")
+            parseUnifiedDiff (UnifiedDiff "@@ -1 +1 @@\n\\ No newline at end of file\n")
+                `shouldBe` Left (UnexpectedNoNewlineMarker 2)
+            parseUnifiedDiff (UnifiedDiff "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n\\ No newline at end of file\n+b\n")
+                `shouldBe` Left (UnexpectedNoNewlineMarker 4)
+            parseUnifiedDiff (UnifiedDiff "@@ -1,2 +1,1 @@\n-only-one\n")
+                `shouldBe` Left (HunkLineCountMismatch 1 2 1)
+            parseUnifiedDiff (UnifiedDiff "@@ -1,1 +1,2 @@\n-old\n+only-one-new\n")
+                `shouldBe` Left (HunkLineCountMismatch 1 2 1)
+            parseUnifiedDiff (UnifiedDiff "@@ -2,2 +2,2 @@\n a\n b\n@@ -3,1 +3,1 @@\n c\n")
+                `shouldBe` Left (OverlappingHunks 2)
+            parseUnifiedDiff (UnifiedDiff "@@ -1,1 +1,1 @@\n-a\n+X\n@@ -2,1 +1,1 @@\n-b\n+Y\n")
+                `shouldBe` Left (OverlappingHunks 2)
+            parseUnifiedDiff (UnifiedDiff "@@ -1,1 +5,1 @@\n-a\n+b\n")
+                `shouldBe` Left (HunkOffsetMismatch 1 0 4)
+            -- ファイル末尾以外の行に \ No newline at end of file が付いた場合は拒否する
+            parseUnifiedDiff (UnifiedDiff "@@ -1,1 +1,2 @@\n-old\n+new1\n\\ No newline at end of file\n+new2\n")
+                `shouldBe` Left (HunkNewlineMismatch 1 2)
+            case applyUnifiedDiff "a\nb\n" (UnifiedDiff "@@ -1,1 +1,1 @@\n-a\n+X\n\\ No newline at end of file\n") of
+                Left (HunkNewlineMismatch 1 2) -> pure ()
+                other -> expectationFailure ("Expected HunkNewlineMismatch on trailing lines after no-newline, got: " <> show other)
+
+            let validDiff :: UnifiedDiff
+                validDiff = generateUnifiedDiff "a\nb\nc\n" "a\nB\nc\n"
+            case applyUnifiedDiff "a\nX\nc\n" validDiff of
+                Left (HunkContextMismatch 1 2 "b" "X") -> pure ()
+                other -> expectationFailure ("Expected HunkContextMismatch, got: " <> show other)
+            case applyUnifiedDiff "a\nb\nc" validDiff of
+                Left (HunkNewlineMismatch 1 3) -> pure ()
+                other -> expectationFailure ("Expected HunkNewlineMismatch, got: " <> show other)
+            case applyUnifiedDiff "only-one\n" validDiff of
+                Left HunkOutOfRange{} -> pure ()
+                other -> expectationFailure ("Expected HunkOutOfRange, got: " <> show other)
+
+        it "handles large documents with localized edits and full-replacement Myers fallback reversibly" $ do
+            let largeOld :: Text
+                largeOld = Txt.unlines (map (\ n -> "row-" <> Txt.pack (show n)) [1 :: Int .. 5000])
+                largeNew :: Text
+                largeNew = Txt.unlines
+                    ( map (\ n -> "row-" <> Txt.pack (show n)) [1 :: Int .. 2500]
+                        <> ["inserted-middle-row"]
+                        <> map (\ n -> "row-" <> Txt.pack (show n)) [2501 :: Int .. 5000]
+                    )
+                diff :: UnifiedDiff
+                diff = generateUnifiedDiff largeOld largeNew
+            applyUnifiedDiff largeOld diff `shouldBe` Right largeNew
+            applyUnifiedDiffReverse largeNew diff `shouldBe` Right largeOld
+
+            -- 2500 行 × 2500 行の完全置換 (編集距離 5000 > maxMyersEditDistance = 4096) のフォールバック経路
+            let fullOld :: Text
+                fullOld = Txt.unlines (map (\ n -> "old-" <> Txt.pack (show n)) [1 :: Int .. 2500])
+                fullNew :: Text
+                fullNew = Txt.unlines (map (\ n -> "new-" <> Txt.pack (show n)) [1 :: Int .. 2500])
+                fullDiff :: UnifiedDiff
+                fullDiff = generateUnifiedDiff fullOld fullNew
+            applyUnifiedDiff fullOld fullDiff `shouldBe` Right fullNew
+            applyUnifiedDiffReverse fullNew fullDiff `shouldBe` Right fullOld
+
+        it "satisfies forward/reverse roundtrip and parse/render roundtrip for arbitrary texts (QuickCheck)" $
+            forAll ((,) <$> genDiffText <*> genDiffText) $ \ (oldTxt, newTxt) ->
+                let parsed :: ParsedDiff
+                    parsed = generateDiff oldTxt newTxt
+                    rendered :: UnifiedDiff
+                    rendered = renderUnifiedDiff parsed
+                in  parseUnifiedDiff rendered == Right parsed
+                        && applyUnifiedDiff oldTxt rendered == Right newTxt
+                        && applyUnifiedDiffReverse newTxt rendered == Right oldTxt
+                        && reverseParsedDiff (reverseParsedDiff parsed) == parsed
+                        && case reverseUnifiedDiff rendered of
+                            Left _    -> False
+                            Right rev -> applyUnifiedDiff newTxt rev == Right oldTxt
+
+        it "satisfies roundtrip across arbitrary context line counts 0..5 (QuickCheck)" $
+            forAll ((,,) <$> chooseInt (0, 5) <*> genDiffText <*> genDiffText) $ \ (ctx, oldTxt, newTxt) ->
+                let diff :: UnifiedDiff
+                    diff = generateUnifiedDiffWithContext ctx oldTxt newTxt
+                in  applyUnifiedDiff oldTxt diff == Right newTxt
+                        && applyUnifiedDiffReverse newTxt diff == Right oldTxt
+
+        it "reconstructs every step of a 3-step revision diff chain both forward and backward (QuickCheck)" $
+            forAll ((,,,) <$> genDiffText <*> genDiffText <*> genDiffText <*> genDiffText) $ \ (v0, v1, v2, v3) ->
+                let d1 :: UnifiedDiff
+                    d1 = generateUnifiedDiff v0 v1
+                    d2 :: UnifiedDiff
+                    d2 = generateUnifiedDiff v1 v2
+                    d3 :: UnifiedDiff
+                    d3 = generateUnifiedDiff v2 v3
+                    fwd :: Either DiffError Text
+                    fwd = applyUnifiedDiff v0 d1 >>= (`applyUnifiedDiff` d2) >>= (`applyUnifiedDiff` d3)
+                    bwd :: Either DiffError Text
+                    bwd = applyUnifiedDiffReverse v3 d3 >>= (`applyUnifiedDiffReverse` d2) >>= (`applyUnifiedDiffReverse` d1)
+                in  fwd == Right v3 && bwd == Right v0
+
+    describe "Revision domain types and DTOs" $ do
+        it "validates RevisionId, RevisionNumber, and ContentHash boundaries and JSON" $ do
+            fmap toText (mkRevisionId "rev_01-abc") `shouldBe` Right "rev_01-abc"
+            let maxRevId :: Text
+                maxRevId = Txt.replicate maxRevisionIdLength "r"
+            fmap toText (mkRevisionId maxRevId) `shouldBe` Right maxRevId
+            mkRevisionId "" `shouldBe` Left EmptyRevisionId
+            mkRevisionId (Txt.replicate (maxRevisionIdLength + 1) "r")
+                `shouldBe` Left (RevisionIdTooLong (maxRevisionIdLength + 1) maxRevisionIdLength)
+            mkRevisionId "rev/1" `shouldBe` Left (InvalidRevisionIdChar "rev/1")
+            (Aeson.decode "\"rev/1\"" :: Maybe RevisionId) `shouldBe` Nothing
+
+            revisionNumberValue initialRevisionNumber `shouldBe` minRevisionNumber
+            revisionNumberValue (nextRevisionNumber initialRevisionNumber) `shouldBe` 2
+            fmap revisionNumberValue (mkRevisionNumber 1) `shouldBe` Right 1
+            mkRevisionNumber 0 `shouldBe` Left (InvalidRevisionNumber 0)
+            mkRevisionNumber (-5) `shouldBe` Left (InvalidRevisionNumber (-5))
+            (Aeson.decode "0" :: Maybe RevisionNumber) `shouldBe` Nothing
+            Aeson.decode (Aeson.encode initialRevisionNumber) `shouldBe` Just initialRevisionNumber
+
+            let validHash :: Text
+                validHash = Txt.replicate contentHashHexLength "a"
+                upperHash :: Text
+                upperHash = Txt.replicate contentHashHexLength "A"
+                nonHexHash :: Text
+                nonHexHash = Txt.replicate contentHashHexLength "g"
+            fmap toText (mkContentHash validHash) `shouldBe` Right validHash
+            mkContentHash upperHash `shouldBe` Left (InvalidContentHash upperHash)
+            mkContentHash nonHexHash `shouldBe` Left (InvalidContentHash nonHexHash)
+            mkContentHash "deadbeef" `shouldBe` Left (InvalidContentHash "deadbeef")
+            (Aeson.decode "\"deadbeef\"" :: Maybe ContentHash) `shouldBe` Nothing
+            (Aeson.decode (Aeson.encode upperHash) :: Maybe ContentHash) `shouldBe` Nothing
+            (Aeson.decode (Aeson.encode nonHexHash) :: Maybe ContentHash) `shouldBe` Nothing
+
+        it "encodes and decodes RevisionSummary, RevisionDetail, RevisionListResponse, and RestoreRevisionRequest matching OpenAPI" $ do
+            let validHash :: Text
+                validHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            case (mkRevisionId "rev-2", mkRevisionId "rev-1", mkDocumentId "doc-1", mkRevisionNumber 2, mkDocumentTitle "第2版", mkContentHash validHash) of
+                (Right revId, Right parentId, Right docId, Right revNum, Right revTitle, Right hashVal) -> do
+                    let sampleDiff :: UnifiedDiff
+                        sampleDiff = generateUnifiedDiff "old\n" "new\n"
+                        detail :: RevisionDetail
+                        detail = RevisionDetail
+                            { id               = revId
+                            , documentId       = docId
+                            , revision         = revNum
+                            , parentRevisionId = Just parentId
+                            , title            = revTitle
+                            , body             = DocumentBody "new\n"
+                            , format           = FormatMarkdown
+                            , diff             = sampleDiff
+                            , contentHash      = hashVal
+                            , createdAt        = sampleLaterTime
+                            }
+                        summary :: RevisionSummary
+                        summary = toRevisionSummary detail
+                        listRes :: RevisionListResponse
+                        listRes = RevisionListResponse
+                            { revisions = [summary]
+                            , total     = 2
+                            }
+                        restoreReq :: RestoreRevisionRequest
+                        restoreReq = RestoreRevisionRequest
+                            { baseRevision = Just revNum
+                            }
+                    Aeson.toJSON summary `shouldBe` Aeson.object
+                        [ "id"                 Aeson..= ("rev-2" :: Text)
+                        , "document_id"        Aeson..= ("doc-1" :: Text)
+                        , "revision"           Aeson..= (2 :: Int)
+                        , "parent_revision_id" Aeson..= ("rev-1" :: Text)
+                        , "title"              Aeson..= ("第2版" :: Text)
+                        , "format"             Aeson..= ("markdown" :: Text)
+                        , "content_hash"       Aeson..= validHash
+                        , "created_at"         Aeson..= sampleLaterTime
+                        ]
+                    Aeson.toJSON detail `shouldBe` Aeson.object
+                        [ "id"                 Aeson..= ("rev-2" :: Text)
+                        , "document_id"        Aeson..= ("doc-1" :: Text)
+                        , "revision"           Aeson..= (2 :: Int)
+                        , "parent_revision_id" Aeson..= ("rev-1" :: Text)
+                        , "title"              Aeson..= ("第2版" :: Text)
+                        , "body"               Aeson..= ("new\n" :: Text)
+                        , "format"             Aeson..= ("markdown" :: Text)
+                        , "diff"               Aeson..= toText sampleDiff
+                        , "content_hash"       Aeson..= validHash
+                        , "created_at"         Aeson..= sampleLaterTime
+                        ]
+                    Aeson.decode (Aeson.encode summary) `shouldBe` Just summary
+                    Aeson.decode (Aeson.encode detail) `shouldBe` Just detail
+                    Aeson.decode (Aeson.encode listRes) `shouldBe` Just listRes
+                    (Aeson.decode "{\"revisions\":[],\"total\":-1}" :: Maybe RevisionListResponse) `shouldBe` Nothing
+
+                    Aeson.decode "{}" `shouldBe` Just defaultRestoreRevisionRequest
+                    Aeson.decode "{\"base_revision\":null}" `shouldBe` Just defaultRestoreRevisionRequest
+                    Aeson.encode defaultRestoreRevisionRequest `shouldBe` "{}"
+                    Aeson.decode (Aeson.encode restoreReq) `shouldBe` Just restoreReq
+                    (Aeson.decode "{\"base_revision\":0}" :: Maybe RestoreRevisionRequest) `shouldBe` Nothing
+
+                    -- 初期リビジョン (parent_revision_id = null) の往復
+                    let initialDetail :: RevisionDetail
+                        initialDetail = RevisionDetail
+                            { id               = parentId
+                            , documentId       = docId
+                            , revision         = initialRevisionNumber
+                            , parentRevisionId = Nothing
+                            , title            = emptyDocumentTitle
+                            , body             = DocumentBody "old\n"
+                            , format           = FormatMarkdown
+                            , diff             = generateUnifiedDiff "" "old\n"
+                            , contentHash      = hashVal
+                            , createdAt        = sampleTime
+                            }
+                    Aeson.decode (Aeson.encode initialDetail) `shouldBe` Just initialDetail
+
+                    -- 必須 nullable キー parent_revision_id が欠落した JSON は Summary / Detail 双方で拒否される
+                    let missingParentKey :: Aeson.Value
+                        missingParentKey = Aeson.object
+                            [ "id"           Aeson..= ("rev-2" :: Text)
+                            , "document_id"  Aeson..= ("doc-1" :: Text)
+                            , "revision"     Aeson..= (2 :: Int)
+                            , "title"        Aeson..= ("第2版" :: Text)
+                            , "body"         Aeson..= ("new\n" :: Text)
+                            , "format"       Aeson..= ("markdown" :: Text)
+                            , "diff"         Aeson..= toText sampleDiff
+                            , "content_hash" Aeson..= validHash
+                            , "created_at"   Aeson..= sampleLaterTime
+                            ]
+                    (Aeson.decode (Aeson.encode missingParentKey) :: Maybe RevisionSummary) `shouldBe` Nothing
+                    (Aeson.decode (Aeson.encode missingParentKey) :: Maybe RevisionDetail) `shouldBe` Nothing
+                _ -> expectationFailure "Expected sample revision DTO components to construct successfully"
+
+        it "canonicalizes (title, format, body) injectively for content hashing (QuickCheck)" $
+            property $ \ t1Raw t2Raw isMd1 isMd2 b1Raw b2Raw ->
+                let cleanTitle :: String -> Either ValidationError DocumentTitle
+                    cleanTitle s = mkDocumentTitle (Txt.take 32 (Txt.filter (not . Char.isControl) (Txt.pack s)))
+                    f1 :: DocumentFormat
+                    f1 = if isMd1 then FormatMarkdown else FormatPlainText
+                    f2 :: DocumentFormat
+                    f2 = if isMd2 then FormatMarkdown else FormatPlainText
+                    b1 :: DocumentBody
+                    b1 = DocumentBody (Txt.pack b1Raw)
+                    b2 :: DocumentBody
+                    b2 = DocumentBody (Txt.pack b2Raw)
+                in  case (cleanTitle t1Raw, cleanTitle t2Raw) of
+                        (Right t1, Right t2) ->
+                            (revisionContentCanonicalText t1 f1 b1 == revisionContentCanonicalText t2 f2 b2)
+                                == ((t1, f1, b1) == (t2, f2, b2))
+                        _ -> False
