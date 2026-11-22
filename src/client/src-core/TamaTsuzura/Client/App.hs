@@ -33,6 +33,8 @@ module TamaTsuzura.Client.App
     , RevisionHistoryState(..)
     , emptyRevisionHistoryState
     , resetRevisionHistory
+    , MergeSession(..)
+    , ConflictMergeState(..)
     , ExtensionCatalogEntry(..)
     , defaultEnabledExtensions
     , ClientState(..)
@@ -75,6 +77,7 @@ module TamaTsuzura.Client.App
     , applyDocumentPermanentlyDeleted
     , applyRevisionListLoaded
     , applyRevisionDetailLoaded
+    , applyRevisionCompareLoaded
     , applyRevisionRestored
     , applyEditorEvent
     , dismissError
@@ -84,6 +87,7 @@ module TamaTsuzura.Client.App
     , mkClientComponent
     ) where
 
+import           Control.Applicative             ((<|>))
 import           Control.Monad                   (unless, when)
 import           Control.Monad.State.Class       (get)
 import           Data.Either                     (fromRight)
@@ -101,6 +105,7 @@ import           Miso                            (App, Component(..), Effect, Vi
 import           TamaTsuzura.Client.Api
     ( ApiClient
     , ApiClientError(..)
+    , compareDocumentRevisions
     , createDocument
     , fetchHealth
     , getCurrentUser
@@ -227,8 +232,15 @@ import           TamaTsuzura.Common.Document
     , toDocumentSummary
     , validateDocumentBody
     )
+import           TamaTsuzura.Common.Merge
+    ( ConflictChoice(..)
+    , MergeOutcome(..)
+    , mergeThreeWay
+    , resolveMergeOutcome
+    )
 import           TamaTsuzura.Common.Revision
     ( RestoreRevisionRequest(..)
+    , RevisionCompareResponse(..)
     , RevisionDetail(..)
     , RevisionListResponse(..)
     , RevisionSummary(..)
@@ -566,9 +578,11 @@ data RevisionDetailTab
       -- ^ 再構成済み本文スナップショット表示
     | RevTabDiff
       -- ^ 親リビジョンからの unified diff 表示
+    | RevTabCompare
+      -- ^ 任意 2 リビジョン間の差分比較表示
     deriving (Eq, Show)
 
--- | 編集履歴パネル (過去リビジョン一覧・詳細閲覧・復元) の状態。
+-- | 編集履歴パネル (過去リビジョン一覧・詳細閲覧・任意 2 版比較・復元) の状態。
 -- 文書切替やログアウト時に 'resetRevisionHistory' で世代番号を進めつつ初期化することで、
 -- 旧文書の遅延 API 応答による履歴混入を構造的に防ぐ。
 data RevisionHistoryState = RevisionHistoryState
@@ -595,7 +609,17 @@ data RevisionHistoryState = RevisionHistoryState
     , revisionDetail    :: !(Maybe RevisionDetail)
       -- ^ 取得済みの選択リビジョン詳細
     , activeTab         :: !RevisionDetailTab
-      -- ^ 詳細ビューの表示タブ (本文 / 差分)
+      -- ^ 詳細ビューの表示タブ (本文 / 差分 / 2 版比較)
+    , compareFromRev    :: !(Maybe RevisionNumber)
+      -- ^ 任意 2 版比較の比較元リビジョン番号
+    , compareToRev      :: !(Maybe RevisionNumber)
+      -- ^ 任意 2 版比較の比較先リビジョン番号
+    , compareRequestSeq :: !Int
+      -- ^ 任意 2 版比較取得の世代番号
+    , isLoadingCompare  :: !Bool
+      -- ^ 任意 2 版比較取得中フラグ
+    , compareResult     :: !(Maybe RevisionCompareResponse)
+      -- ^ 取得済みの任意 2 版比較レスポンス
     , confirmRestoreRev :: !(Maybe RevisionNumber)
       -- ^ 復元確認モーダル表示中の対象リビジョン番号
     } deriving (Eq, Show)
@@ -615,15 +639,49 @@ emptyRevisionHistoryState = RevisionHistoryState
     , isLoadingDetail   = False
     , revisionDetail    = Nothing
     , activeTab         = RevTabBody
+    , compareFromRev    = Nothing
+    , compareToRev      = Nothing
+    , compareRequestSeq = 0
+    , isLoadingCompare  = False
+    , compareResult     = Nothing
     , confirmRestoreRev = Nothing
     }
 
 -- | 履歴パネルを閉じ、進行中の非同期応答を無効化するよう世代番号を進めて初期化する。
 resetRevisionHistory :: RevisionHistoryState -> RevisionHistoryState
 resetRevisionHistory rh = emptyRevisionHistoryState
-    { listRequestSeq   = rh.listRequestSeq + 1
-    , detailRequestSeq = rh.detailRequestSeq + 1
+    { listRequestSeq    = rh.listRequestSeq + 1
+    , detailRequestSeq  = rh.detailRequestSeq + 1
+    , compareRequestSeq = rh.compareRequestSeq + 1
     }
+
+-- | 3-way マージ手動解決セッションの確定状態。
+data MergeSession = MergeSession
+    { docId          :: !DocumentId
+      -- ^ マージ対象文書 ID
+    , baseRevision   :: !RevisionNumber
+      -- ^ 共通祖先リビジョン番号
+    , serverDocument :: !Document
+      -- ^ サーバ側の最新文書スナップショット (@base_revision@ 基準)
+    , localSave      :: !PendingSyncSave
+      -- ^ 競合退避されたローカル変更
+    , baseBody       :: !DocumentBody
+      -- ^ 共通祖先リビジョンの再構成済み本文
+    , mergeOutcome   :: !MergeOutcome
+      -- ^ 純粋 3-way マージ ('mergeThreeWay') の構造化結果
+    , choices        :: !(Map Int ConflictChoice)
+      -- ^ 競合ブロックインデックスごとの選択済み解決方針
+    , isSavingMerge  :: !Bool
+      -- ^ マージ結果保存 (@PUT@) 実行中フラグ
+    } deriving (Eq, Show)
+
+-- | 競合 3-way マージ解決モーダルのライフサイクル状態。
+data ConflictMergeState
+    = MergeLoading !Int !DocumentId
+      -- ^ 共通祖先リビジョンおよびサーバ最新文書を取得中 (リクエスト世代番号, 文書 ID)
+    | MergeReady !MergeSession
+      -- ^ 3-way マージ結果を表示・手動解決中
+    deriving (Eq, Show)
 
 -- | Miso Model 内で保持する拡張機能の純粋カタログエントリ (メタデータ＋コマンドメタデータ)。
 -- 実行関数を含めないことで 'ClientState' の 'Eq' / 'Show' 導出を維持する。
@@ -717,6 +775,10 @@ data ClientState = ClientState
       -- ^ 現在バックグラウンド同期 PUT 実行中の文書 ID
     , isServingOfflineCache        :: !Bool
       -- ^ 現在の文書一覧がオフラインキャッシュから表示されているか
+    , conflictMerge                :: !(Maybe ConflictMergeState)
+      -- ^ 競合解決用 3-way マージモーダルの現在状態
+    , mergeRequestSeq              :: !Int
+      -- ^ 3-way マージ読み込みリクエストの世代番号
     , editorSyncVersion            :: !Int
       -- ^ CodeMirror 6 へ外部変更を同期するたびにインクリメントされるバージョン番号
     , editorStats                  :: !EditorStats
@@ -914,7 +976,15 @@ data ClientAction
     | RevisionDetailLoaded !Int !Int !DocumentId !RevisionNumber !(Either ApiClientError RevisionDetail)
       -- ^ @GET /api/documents/{id}/revisions/{revision}@ の結果受信 (認証世代, 詳細世代, 文書 ID, リビジョン番号, 結果)
     | SetRevisionDetailTab !RevisionDetailTab
-      -- ^ リビジョン詳細ビューの本文 / 差分タブ切替
+      -- ^ リビジョン詳細ビューの本文 / 差分 / 2 版比較タブ切替
+    | SetCompareFromRevision !RevisionNumber
+      -- ^ 任意 2 版比較の比較元リビジョン番号を選択する
+    | SetCompareToRevision !RevisionNumber
+      -- ^ 任意 2 版比較の比較先リビジョン番号を選択する
+    | CompareRevisions
+      -- ^ 現在選択中の比較元・比較先リビジョンで比較 API を実行する
+    | RevisionsCompared !Int !Int !DocumentId !(Either ApiClientError RevisionCompareResponse)
+      -- ^ @GET /api/documents/{id}/revisions/compare@ の結果受信 (認証世代, 比較世代, 文書 ID, 結果)
     | RequestRestoreRevision !RevisionNumber
       -- ^ 選択リビジョンへの復元確認ダイアログを表示する
     | CancelRestoreRevision
@@ -941,6 +1011,20 @@ data ClientAction
       -- ^ 競合退避からの別文書作成応答 (認証世代, 元文書 ID, 結果)
     | DismissSyncConflict !DocumentId
       -- ^ 競合退避レコードをローカルから破棄する
+    | OpenConflictMerge !DocumentId
+      -- ^ 競合退避レコードに対して 3-way マージ解決モーダルを開く
+    | ConflictMergeLoaded !Int !Int !DocumentId !(Either ApiClientError Document) !(Either ApiClientError RevisionDetail)
+      -- ^ 3-way マージ用のサーバ最新版・共通祖先リビジョン取得応答
+    | SelectMergeChoice !Int !ConflictChoice
+      -- ^ 3-way マージ内の特定競合ブロックの解決方針を選択する
+    | SelectAllMergeChoices !ConflictChoice
+      -- ^ 3-way マージ内の全競合ブロックへ一括で解決方針を設定する
+    | SaveResolvedMerge
+      -- ^ 3-way マージ結果をサーバへ保存 (@PUT /api/documents/{id}@ with @base_revision@) する
+    | ConflictMergeSaved !Int !DocumentId !(Either ApiClientError Document)
+      -- ^ 3-way マージ保存の応答受信 (認証世代, 文書 ID, 結果)
+    | CloseConflictMerge
+      -- ^ 3-way マージ解決モーダルを閉じる
     | DismissError
       -- ^ 表示中のエラーバナーを閉じる
     | DismissNotice
@@ -988,6 +1072,8 @@ initialClientState exts =
             , syncConflicts                = Map.empty
             , syncingDocId                 = Nothing
             , isServingOfflineCache        = False
+            , conflictMerge                = Nothing
+            , mergeRequestSeq              = 0
             , editorSyncVersion            = 0
             , editorStats                  = emptyEditorStats
             , canUndo                      = False
@@ -1054,6 +1140,8 @@ resetWorkspaceForUnauthenticated nextForm mErr mNotice state = state
     , syncConflicts                = Map.empty
     , syncingDocId                 = Nothing
     , isServingOfflineCache        = False
+    , conflictMerge                = Nothing
+    , mergeRequestSeq              = state.mergeRequestSeq + 1
     , editorSyncVersion            = state.editorSyncVersion + 1
     , editorStats                  = emptyEditorStats
     , canUndo                      = False
@@ -2021,6 +2109,37 @@ applyRevisionDetailLoaded msgs reqSeq docId revNo result state
                 , lastError = Just (formatApiClientError msgs err)
                 }
 
+-- | 任意 2 リビジョン比較 (@GET /api/documents/{id}/revisions/compare@) の応答を状態へ純粋に反映する。
+-- パネルが閉じられている場合・比較世代番号・対象文書 ID が一致しない陳腐応答は無視する。
+applyRevisionCompareLoaded ::
+       UiMessages
+    -> Int
+    -> DocumentId
+    -> Either ApiClientError RevisionCompareResponse
+    -> ClientState
+    -> ClientState
+applyRevisionCompareLoaded msgs reqSeq docId result state
+    | not state.revisionHistory.isHistoryOpen           = state
+    | reqSeq /= state.revisionHistory.compareRequestSeq = state
+    | state.revisionHistory.documentId /= Just docId    = state
+    | otherwise = case result of
+        Right cmpRes ->
+            state
+                { revisionHistory = state.revisionHistory
+                    { isLoadingCompare = False
+                    , compareResult    = Just cmpRes
+                    }
+                , lastError = Nothing
+                }
+        Left err ->
+            state
+                { revisionHistory = state.revisionHistory
+                    { isLoadingCompare = False
+                    , compareResult    = Nothing
+                    }
+                , lastError = Just (formatApiClientError msgs err)
+                }
+
 -- | 過去リビジョン復元 (@POST /api/documents/{id}/revisions/{revision}/restore@) の応答を状態へ反映する。
 -- 進行中の復元対象文書 ID ('restoringRevisionDoc') と一致しない陳腐応答は無視する。
 -- 成功時は本文・タイトル・形式を復元済み最新文書へ同期し、未保存ローカルドラフトを破棄する。
@@ -2955,10 +3074,52 @@ updateClient env action = case action of
     RevisionDetailLoaded seqNo reqSeq docId revNo eDetail ->
         guardAuthResponse seqNo eDetail $
             modify (applyRevisionDetailLoaded env.messages reqSeq docId revNo eDetail)
-    SetRevisionDetailTab nextTab ->
+    SetRevisionDetailTab nextTab -> do
+        st <- get
+        case nextTab of
+            RevTabCompare -> do
+                let rh :: RevisionHistoryState
+                    rh = st.revisionHistory
+
+                    (defFrom, defTo) = defaultComparePair rh.selectedRevision rh.revisions
+
+                    nextFrom :: Maybe RevisionNumber
+                    nextFrom = rh.compareFromRev <|> defFrom
+
+                    nextTo :: Maybe RevisionNumber
+                    nextTo = rh.compareToRev <|> defTo
+                modify $ \ s -> s
+                    { revisionHistory = s.revisionHistory
+                        { activeTab      = RevTabCompare
+                        , compareFromRev = nextFrom
+                        , compareToRev   = nextTo
+                        }
+                    }
+                case (st.selectedDocument, nextFrom, nextTo) of
+                    (Just doc, Just fromRev, Just toRev)
+                        | isNothing rh.compareResult -> loadRevisionCompare doc.id fromRev toRev
+                    _ -> pure ()
+            _ ->
+                modify $ \ s -> s
+                    { revisionHistory = s.revisionHistory { activeTab = nextTab }
+                    }
+    SetCompareFromRevision revNo ->
         modify $ \ s -> s
-            { revisionHistory = s.revisionHistory { activeTab = nextTab }
+            { revisionHistory = s.revisionHistory { compareFromRev = Just revNo }
             }
+    SetCompareToRevision revNo ->
+        modify $ \ s -> s
+            { revisionHistory = s.revisionHistory { compareToRev = Just revNo }
+            }
+    CompareRevisions -> do
+        st <- get
+        case (st.selectedDocument, st.revisionHistory.compareFromRev, st.revisionHistory.compareToRev) of
+            (Just doc, Just fromRev, Just toRev) | st.revisionHistory.isHistoryOpen ->
+                loadRevisionCompare doc.id fromRev toRev
+            _ -> pure ()
+    RevisionsCompared seqNo reqSeq docId eCmp ->
+        guardAuthResponse seqNo eCmp $
+            modify (applyRevisionCompareLoaded env.messages reqSeq docId eCmp)
     RequestRestoreRevision revNo -> do
         st <- get
         case st.selectedDocument of
@@ -3195,9 +3356,187 @@ updateClient env action = case action of
     DismissSyncConflict docId -> do
         modify $ \ s -> s
             { syncConflicts = Map.delete docId s.syncConflicts
+            , conflictMerge = case s.conflictMerge of
+                Just (MergeLoading _ mid) | mid == docId      -> Nothing
+                Just (MergeReady ms)      | ms.docId == docId -> Nothing
+                other                                         -> other
             , statusNotice  = Just env.messages.noticeConflictDismissed
             }
         io_ (env.offlineStore.deleteSyncConflict docId)
+    OpenConflictMerge docId -> do
+        st <- get
+        case (currentAuthSession st, Map.lookup docId st.syncConflicts) of
+            (Just _, Just conflict) | st.networkStatus == NetworkOnline && isNothing st.conflictMerge -> do
+                let nextSeq :: Int
+                    nextSeq = st.mergeRequestSeq + 1
+
+                    authSeq :: Int
+                    authSeq = st.authSessionSeq
+                modify $ \ s -> s
+                    { mergeRequestSeq = nextSeq
+                    , conflictMerge   = Just (MergeLoading nextSeq docId)
+                    , lastError       = Nothing
+                    }
+                io $ do
+                    eServerDoc <- getDocument env.apiClient docId
+                    eBaseRev   <- getDocumentRevision env.apiClient docId conflict.localSave.baseRevision
+                    pure (ConflictMergeLoaded authSeq nextSeq docId eServerDoc eBaseRev)
+            _ -> pure ()
+    ConflictMergeLoaded seqNo reqSeq docId eServerDoc eBaseRev -> do
+        let firstAuthErr :: Either ApiClientError ()
+            firstAuthErr = case (eServerDoc, eBaseRev) of
+                (Left err, _) | isUnauthorizedError err -> Left err
+                (_, Left err) | isUnauthorizedError err -> Left err
+                _                                       -> Right ()
+        guardAuthResponse seqNo firstAuthErr $ do
+            st <- get
+            case (st.conflictMerge, Map.lookup docId st.syncConflicts) of
+                (Just (MergeLoading activeSeq activeDocId), Just conflict)
+                    | activeSeq == reqSeq && activeDocId == docId ->
+                        case (eServerDoc, eBaseRev) of
+                            (Right serverDoc, Right baseDetail) -> do
+                                let outcome :: MergeOutcome
+                                    outcome = mergeThreeWay
+                                        (toText baseDetail.body)
+                                        (toText conflict.localSave.body)
+                                        (toText serverDoc.body)
+
+                                    session :: MergeSession
+                                    session = MergeSession
+                                        { docId          = docId
+                                        , baseRevision   = conflict.localSave.baseRevision
+                                        , serverDocument = serverDoc
+                                        , localSave      = conflict.localSave
+                                        , baseBody       = baseDetail.body
+                                        , mergeOutcome   = outcome
+                                        , choices        = Map.empty
+                                        , isSavingMerge  = False
+                                        }
+                                modify $ \ s -> s
+                                    { conflictMerge = Just (MergeReady session)
+                                    , lastError     = Nothing
+                                    }
+                            (Left err, _) ->
+                                modify $ \ s -> s
+                                    { conflictMerge = Nothing
+                                    , lastError     = Just (formatApiClientError env.messages err)
+                                    }
+                            (_, Left err) ->
+                                modify $ \ s -> s
+                                    { conflictMerge = Nothing
+                                    , lastError     = Just (formatApiClientError env.messages err)
+                                    }
+                _ -> pure ()
+    SelectMergeChoice idx choice ->
+        modify $ \ s -> case s.conflictMerge of
+            Just (MergeReady ms) | not ms.isSavingMerge ->
+                s
+                    { conflictMerge = Just (MergeReady ms { choices = Map.insert idx choice ms.choices })
+                    , lastError     = Nothing
+                    }
+            _ -> s
+    SelectAllMergeChoices choice ->
+        modify $ \ s -> case s.conflictMerge of
+            Just (MergeReady ms) | not ms.isSavingMerge ->
+                let allChoices :: Map Int ConflictChoice
+                    allChoices = Map.fromList [ (i, choice) | i <- [0 .. ms.mergeOutcome.conflictCount - 1] ]
+                in  s
+                        { conflictMerge = Just (MergeReady ms { choices = allChoices })
+                        , lastError     = Nothing
+                        }
+            _ -> s
+    SaveResolvedMerge -> do
+        st <- get
+        case (currentAuthSession st, st.conflictMerge) of
+            (Just session, Just (MergeReady ms)) | not ms.isSavingMerge ->
+                case resolveMergeOutcome ms.choices ms.mergeOutcome of
+                    Left _ ->
+                        modify (\ s -> s { lastError = Just env.messages.errMergeUnresolved })
+                    Right mergedText ->
+                        case validateDocumentBody (DocumentBody mergedText) of
+                            Left vErr ->
+                                modify (\ s -> s { lastError = Just (formatValidationError env.messages vErr) })
+                            Right validBody -> do
+                                let updateReq :: UpdateDocumentRequest
+                                    updateReq = UpdateDocumentRequest
+                                        { title        = ms.localSave.title
+                                        , body         = validBody
+                                        , format       = ms.localSave.format
+                                        , folder       = ms.localSave.folder
+                                        , tags         = ms.localSave.tags
+                                        , baseRevision = Just ms.serverDocument.revision
+                                        }
+                                modify $ \ s -> s
+                                    { conflictMerge = Just (MergeReady ms { isSavingMerge = True })
+                                    , lastError     = Nothing
+                                    }
+                                io (ConflictMergeSaved st.authSessionSeq ms.docId <$> updateDocument env.apiClient session.csrfToken ms.docId updateReq)
+            _ -> pure ()
+    ConflictMergeSaved seqNo docId eDoc ->
+        guardAuthResponse seqNo eDoc $ do
+            stBefore <- get
+            case eDoc of
+                Right doc -> do
+                    let shouldOpenOrSync :: Bool
+                        shouldOpenOrSync =
+                            isNothing stBefore.selectedDocument
+                                || fmap (.id) stBefore.selectedDocument == Just doc.id
+                    modify $ \ s ->
+                        let summary :: DocumentSummary
+                            summary = toDocumentSummary doc
+
+                            nextSummaries :: [DocumentSummary]
+                            nextSummaries = case s.filterState.status of
+                                StatusTrashed -> s.documentSummaries
+                                _             ->
+                                    if any (\ item -> item.id == doc.id) s.documentSummaries
+                                        then summary : filter (\ item -> item.id /= doc.id) s.documentSummaries
+                                        else s.documentSummaries
+                        in  s
+                                { conflictMerge      = Nothing
+                                , syncConflicts      = Map.delete doc.id s.syncConflicts
+                                , pendingSaves       = Map.delete doc.id s.pendingSaves
+                                , storedDrafts       = Map.delete doc.id s.storedDrafts
+                                , documentSummaries  = nextSummaries
+                                , selectedDocument   = if shouldOpenOrSync then Just doc else s.selectedDocument
+                                , draft              = if shouldOpenOrSync then draftFromDocument doc else s.draft
+                                , draftSyncState     = if shouldOpenOrSync then DraftSyncIdle else s.draftSyncState
+                                , restoredDraftDocId = if shouldOpenOrSync then Nothing else s.restoredDraftDocId
+                                , staleDraftPrompt   = if shouldOpenOrSync then Nothing else s.staleDraftPrompt
+                                , editorSyncVersion  = if shouldOpenOrSync then s.editorSyncVersion + 1 else s.editorSyncVersion
+                                , editorStats        = if shouldOpenOrSync then computeTextStats (toText doc.body) else s.editorStats
+                                , editorViewMode     = if shouldOpenOrSync then normalizeViewMode doc.format s.editorViewMode else s.editorViewMode
+                                , canUndo            = not shouldOpenOrSync && s.canUndo
+                                , canRedo            = not shouldOpenOrSync && s.canRedo
+                                , lastError          = Nothing
+                                , statusNotice       = Just env.messages.noticeMergeSaved
+                                }
+                    cacheDocumentLocally doc
+                    io_ $ do
+                        env.offlineStore.deleteSyncConflict doc.id
+                        env.offlineStore.deletePendingSave doc.id
+                        env.draftStorage.deleteStoredDraft doc.id
+                    when shouldOpenOrSync (syncEditorFromCurrentState True)
+                    stAfter <- get
+                    when (stAfter.revisionHistory.isHistoryOpen && stAfter.revisionHistory.documentId == Just doc.id) $
+                        loadRevisionListForDocument doc.id False
+                    reloadDocumentsForCurrentFilter
+                    io (TagsLoaded seqNo <$> listTags env.apiClient)
+                    io (FoldersLoaded seqNo <$> listFolders env.apiClient)
+                Left err ->
+                    modify $ \ s -> s
+                        { conflictMerge = case s.conflictMerge of
+                            Just (MergeReady ms) | ms.docId == docId -> Just (MergeReady ms { isSavingMerge = False })
+                            other                                    -> other
+                        , lastError     = Just (formatApiClientError env.messages err)
+                        }
+    CloseConflictMerge ->
+        modify $ \ s -> case s.conflictMerge of
+            Just (MergeReady ms) | ms.isSavingMerge -> s
+            _ -> s
+                { conflictMerge   = Nothing
+                , mergeRequestSeq = s.mergeRequestSeq + 1
+                }
     DismissError ->
         modify dismissError
     DismissNotice ->
@@ -3494,6 +3833,7 @@ updateClient env action = case action of
                 | not (isTrashed doc)
                     && isNothing st.savingDocument
                     && isNothing st.restoringRevisionDoc
+                    && isNothing st.conflictMerge
                     && st.syncingDocId /= Just doc.id ->
                     case validateEditorDraft st.draft of
                         Left vErr ->
@@ -3790,6 +4130,43 @@ updateClient env action = case action of
                     }
                 io (RevisionDetailLoaded authSeq nextDetailSeq docId revNo <$> getDocumentRevision env.apiClient docId revNo)
 
+    loadRevisionCompare :: DocumentId -> RevisionNumber -> RevisionNumber -> Effect () () ClientState ClientAction
+    loadRevisionCompare docId fromRev toRev = do
+        st <- get
+        case currentAuthSession st of
+            Nothing -> pure ()
+            Just _ -> do
+                let authSeq :: Int
+                    authSeq = st.authSessionSeq
+
+                    nextCmpSeq :: Int
+                    nextCmpSeq = st.revisionHistory.compareRequestSeq + 1
+                modify $ \ s -> s
+                    { revisionHistory = s.revisionHistory
+                        { documentId        = Just docId
+                        , compareFromRev    = Just fromRev
+                        , compareToRev      = Just toRev
+                        , compareRequestSeq = nextCmpSeq
+                        , isLoadingCompare  = True
+                        }
+                    , lastError = Nothing
+                    }
+                io (RevisionsCompared authSeq nextCmpSeq docId <$> compareDocumentRevisions env.apiClient docId fromRev toRev)
+
+    defaultComparePair ::
+           Maybe RevisionNumber
+        -> [RevisionSummary]
+        -> (Maybe RevisionNumber, Maybe RevisionNumber)
+    defaultComparePair mSelected revs = case revs of
+        []      -> (Nothing, Nothing)
+        [only]  -> (Just only.revision, Just only.revision)
+        newest : second : _ ->
+            let fromCandidate :: RevisionNumber
+                fromCandidate = case mSelected of
+                    Just sel | sel /= newest.revision -> sel
+                    _                                 -> second.revision
+            in  (Just fromCandidate, Just newest.revision)
+
     dispatchCurrentSearch :: Effect () () ClientState ClientAction
     dispatchCurrentSearch = do
         st <- get
@@ -3843,6 +4220,8 @@ resetWorkspaceForAuthenticated session mNotice state = state
     , syncConflicts                = Map.empty
     , syncingDocId                 = Nothing
     , isServingOfflineCache        = False
+    , conflictMerge                = Nothing
+    , mergeRequestSeq              = state.mergeRequestSeq + 1
     , editorSyncVersion            = state.editorSyncVersion + 1
     , editorStats                  = emptyEditorStats
     , canUndo                      = False

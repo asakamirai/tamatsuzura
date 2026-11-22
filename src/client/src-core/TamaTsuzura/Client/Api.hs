@@ -40,6 +40,7 @@ module TamaTsuzura.Client.Api
     , buildRevisionListQueryString
     , buildListRevisionsRequest
     , buildGetRevisionRequest
+    , buildCompareRevisionsRequest
     , buildRestoreRevisionRequest
     , parseJsonResponse
     , parseNoContentResponse
@@ -62,6 +63,7 @@ module TamaTsuzura.Client.Api
       -- * リビジョン履歴 REST API クライアント操作
     , listDocumentRevisions
     , getDocumentRevision
+    , compareDocumentRevisions
     , restoreDocumentRevision
     ) where
 
@@ -105,6 +107,7 @@ import           TamaTsuzura.Common.Auth
 import           TamaTsuzura.Common.Document   (Document, DocumentId, RevisionNumber)
 import           TamaTsuzura.Common.Revision
     ( RestoreRevisionRequest
+    , RevisionCompareResponse
     , RevisionDetail
     , RevisionListResponse
     )
@@ -487,6 +490,23 @@ buildGetRevisionRequest base docId revNo = HttpRequest
     , body    = Nothing
     }
 
+-- | @GET /api/documents/{id}/revisions/compare?from={r1}&to={r2}@ のリクエストを構築する。
+buildCompareRevisionsRequest ::
+       ApiBaseUrl
+    -> DocumentId
+    -> RevisionNumber
+    -> RevisionNumber
+    -> HttpRequest
+buildCompareRevisionsRequest base docId fromRev toRev = HttpRequest
+    { method  = MethodGet
+    , url     = documentEndpointUrl
+        base
+        docId
+        ("/revisions/compare?from=" <> toText fromRev <> "&to=" <> toText toRev)
+    , headers = acceptJsonHeaders
+    , body    = Nothing
+    }
+
 -- | @POST /api/documents/{id}/revisions/{revision}/restore@ のリクエストを CSRF ヘッダ付きで構築する。
 buildRestoreRevisionRequest ::
        ApiBaseUrl
@@ -618,6 +638,16 @@ getDocumentRevision ::
     -> IO (Either ApiClientError RevisionDetail)
 getDocumentRevision client docId revNo =
     executeRequest client (buildGetRevisionRequest client.baseUrl docId revNo) (parseJsonResponse 200)
+
+-- | 任意 2 リビジョン間の差分比較 (@GET /api/documents/{id}/revisions/compare?from={r1}&to={r2}@) を取得する。
+compareDocumentRevisions ::
+       ApiClient
+    -> DocumentId
+    -> RevisionNumber
+    -> RevisionNumber
+    -> IO (Either ApiClientError RevisionCompareResponse)
+compareDocumentRevisions client docId fromRev toRev =
+    executeRequest client (buildCompareRevisionsRequest client.baseUrl docId fromRev toRev) (parseJsonResponse 200)
 
 -- | 稼働中文書を過去リビジョンへ復元 (@POST /api/documents/{id}/revisions/{revision}/restore@) する。
 restoreDocumentRevision ::

@@ -13,7 +13,7 @@ import           Data.ByteString                      (ByteString)
 import qualified Data.ByteString.Lazy                 as LazyBS
 import           Data.IORef                           (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict                      as Map
-import           Data.Maybe                           (isNothing)
+import           Data.Maybe                           (isJust, isNothing)
 import qualified Data.Set                             as Set
 import           Data.Text                            (Text)
 import qualified Data.Text                            as Txt
@@ -31,6 +31,7 @@ import           TamaTsuzura.Client.Api
     , HttpRequest(..)
     , HttpResponse(..)
     , HttpTransport(..)
+    , buildCompareRevisionsRequest
     , buildCreateDocumentRequest
     , buildDocumentListQueryString
     , buildGetCurrentUserRequest
@@ -50,6 +51,7 @@ import           TamaTsuzura.Client.Api
     , buildRevisionListQueryString
     , buildSoftDeleteDocumentRequest
     , buildUpdateDocumentRequest
+    , compareDocumentRevisions
     , createDocument
     , csrfHeaderName
     , defaultApiBaseUrl
@@ -82,11 +84,13 @@ import           TamaTsuzura.Client.App
     , ClientAction(..)
     , ClientEnv(..)
     , ClientState(..)
+    , ConflictMergeState(..)
     , ConnectionStatus(..)
     , DraftReconcileResult(..)
     , EditorDraft(..)
     , EditorViewMode(..)
     , FilterState(..)
+    , MergeSession(..)
     , MobilePane(..)
     , PendingNavigation(..)
     , RevisionDetailTab(..)
@@ -110,6 +114,7 @@ import           TamaTsuzura.Client.App
     , applyExtensionCommand
     , applyFoldersResult
     , applyHealthResult
+    , applyRevisionCompareLoaded
     , applyRevisionDetailLoaded
     , applyRevisionListLoaded
     , applyRevisionRestored
@@ -293,8 +298,10 @@ import           TamaTsuzura.Common.Document
     , nextRevisionNumber
     , toDocumentSummary
     )
+import           TamaTsuzura.Common.Merge        (ConflictChoice(..), MergeOutcome(..))
 import           TamaTsuzura.Common.Revision
     ( RestoreRevisionRequest(..)
+    , RevisionCompareResponse(..)
     , RevisionDetail(..)
     , RevisionListResponse(..)
     , RevisionSummary(..)
@@ -3555,6 +3562,350 @@ spec = do
                 fallbackState = applyDocumentsResult jaMessages 0 (Left (ClientNetworkError "down")) errState
             fallbackState.isServingOfflineCache `shouldBe` True
             fallbackState.lastError `shouldBe` Just "サーバへ接続できませんでした (down)"
+
+    describe "M7 Phase 2: Revision comparison UI and 3-way conflict merge resolution" $ do
+        it "builds and executes GET /api/documents/{id}/revisions/compare and updates RevisionHistoryState" $ do
+            doc <- mkSampleDocument "doc-m7-cmp" "比較テスト"
+            revId1 <- expectRight (mkRevisionId "rev-m7-1")
+            revId2 <- expectRight (mkRevisionId "rev-m7-2")
+            hashVal <- expectRight (mkContentHash (Txt.replicate 64 "a"))
+            let rev1 :: RevisionNumber
+                rev1 = initialRevisionNumber
+
+                rev2 :: RevisionNumber
+                rev2 = nextRevisionNumber rev1
+
+                sum1 :: RevisionSummary
+                sum1 = RevisionSummary revId1 doc.id rev1 Nothing doc.title FormatMarkdown hashVal sampleUtcTime
+
+                sum2 :: RevisionSummary
+                sum2 = RevisionSummary revId2 doc.id rev2 (Just revId1) doc.title FormatMarkdown hashVal sampleLaterUtcTime
+
+                cmpResp :: RevisionCompareResponse
+                cmpResp = RevisionCompareResponse
+                    { documentId    = doc.id
+                    , fromRevision  = sum1
+                    , toRevision    = sum2
+                    , titleChanged  = False
+                    , formatChanged = False
+                    , bodyDiff      = generateUnifiedDiff "old\n" "new\n"
+                    }
+
+                req :: HttpRequest
+                req = buildCompareRevisionsRequest (mkApiBaseUrl "/app") doc.id rev1 rev2
+            req.method `shouldBe` MethodGet
+            req.url `shouldBe` "/app/api/documents/doc-m7-cmp/revisions/compare?from=1&to=2"
+
+            authBase <- mkAuthenticatedState
+            (env, _, _) <- mkMockClientEnv $ \ httpReq ->
+                if httpReq.method == MethodGet && httpReq.url == "/api/documents/doc-m7-cmp/revisions/compare?from=1&to=2"
+                    then pure (Right (HttpResponse 200 (encodeStrict cmpResp)))
+                    else pure (Left "unexpected request")
+
+            eCmp <- compareDocumentRevisions env.apiClient doc.id rev1 rev2
+            eCmp `shouldBe` Right cmpResp
+
+            let histState :: ClientState
+                histState = authBase
+                    { selectedDocument = Just doc
+                    , revisionHistory  = emptyRevisionHistoryState
+                        { isHistoryOpen    = True
+                        , documentId       = Just doc.id
+                        , revisions        = [sum2, sum1]
+                        , totalRevisions   = 2
+                        , selectedRevision = Just rev2
+                        }
+                    }
+
+            -- Switching to RevTabCompare picks default pair (r1 -> r2) and loads comparison automatically
+            (sCompared, _) <- runActionQueue env [SetRevisionDetailTab RevTabCompare] histState
+            sCompared.revisionHistory.activeTab `shouldBe` RevTabCompare
+            sCompared.revisionHistory.compareFromRev `shouldBe` Just rev1
+            sCompared.revisionHistory.compareToRev `shouldBe` Just rev2
+            sCompared.revisionHistory.compareResult `shouldBe` Just cmpResp
+
+        it "runs full 3-way conflict merge flow: loads base+server, blocks unresolved save, resolves conflict, and saves with server base_revision" $ do
+            docBase <- mkSampleDocument "doc-m7-merge" "マージ対象"
+            uid <- mkSampleUserId "user-alice"
+            revId1 <- expectRight (mkRevisionId "rev-merge-1")
+            hashVal <- expectRight (mkContentHash (Txt.replicate 64 "b"))
+            let rev1 :: RevisionNumber
+                rev1 = initialRevisionNumber
+
+                rev2 :: RevisionNumber
+                rev2 = nextRevisionNumber rev1
+
+                rev3 :: RevisionNumber
+                rev3 = nextRevisionNumber rev2
+
+                baseDetail :: RevisionDetail
+                baseDetail = RevisionDetail
+                    { id               = revId1
+                    , documentId       = docBase.id
+                    , revision         = rev1
+                    , parentRevisionId = Nothing
+                    , title            = docBase.title
+                    , body             = DocumentBody "header\noriginal\nfooter\n"
+                    , format           = FormatMarkdown
+                    , diff             = generateUnifiedDiff "" "header\noriginal\nfooter\n"
+                    , contentHash      = hashVal
+                    , createdAt        = sampleUtcTime
+                    }
+
+                serverDoc :: Document
+                serverDoc = Document
+                    { id        = docBase.id
+                    , title     = docBase.title
+                    , body      = DocumentBody "header\nserver-edit\nfooter\n"
+                    , format    = FormatMarkdown
+                    , folder    = Nothing
+                    , tags      = emptyTagSet
+                    , revision  = rev2
+                    , createdAt = sampleUtcTime
+                    , updatedAt = sampleLaterUtcTime
+                    , deletedAt = Nothing
+                    }
+
+                mergedSavedDoc :: Document
+                mergedSavedDoc = Document
+                    { id        = docBase.id
+                    , title     = docBase.title
+                    , body      = DocumentBody "header\nlocal-edit\nserver-edit\nfooter\n"
+                    , format    = FormatMarkdown
+                    , folder    = Nothing
+                    , tags      = emptyTagSet
+                    , revision  = rev3
+                    , createdAt = sampleUtcTime
+                    , updatedAt = sampleLaterUtcTime
+                    , deletedAt = Nothing
+                    }
+
+                conflict :: SyncConflict
+                conflict = SyncConflict
+                    { docId      = docBase.id
+                    , ownerId    = uid
+                    , localSave  = PendingSyncSave docBase.id uid docBase.title (DocumentBody "header\nlocal-edit\nfooter\n") FormatMarkdown Nothing emptyTagSet rev1 sampleUtcTime
+                    , detectedAt = sampleLaterUtcTime
+                    , reason     = jaMessages.errSyncConflictReason
+                    }
+
+            authBase <- mkAuthenticatedState
+            delConflictRef <- newIORef []
+            (baseEnv, reqRef, _) <- mkMockClientEnv $ \ httpReq ->
+                case (httpReq.method, httpReq.url) of
+                    (MethodGet, "/api/documents/doc-m7-merge") ->
+                        pure (Right (HttpResponse 200 (encodeStrict serverDoc)))
+                    (MethodGet, "/api/documents/doc-m7-merge/revisions/1") ->
+                        pure (Right (HttpResponse 200 (encodeStrict baseDetail)))
+                    (MethodPut, "/api/documents/doc-m7-merge") ->
+                        pure (Right (HttpResponse 200 (encodeStrict mergedSavedDoc)))
+                    (MethodGet, "/api/tags") ->
+                        pure (Right (HttpResponse 200 "{\"tags\":[]}"))
+                    (MethodGet, "/api/folders") ->
+                        pure (Right (HttpResponse 200 "{\"folders\":[]}"))
+                    _ | httpReq.method == MethodGet && Txt.isPrefixOf "/api/documents" httpReq.url ->
+                        pure (Right (HttpResponse 200 (encodeStrict (DocumentListResponse [toDocumentSummary mergedSavedDoc] 1))))
+                    _ -> pure (Left ("unexpected request: " <> httpReq.url))
+            let env :: ClientEnv
+                env = baseEnv
+                    { offlineStore = noopOfflineStore
+                        { deleteSyncConflict = \ did -> modifyIORef' delConflictRef (\ xs -> xs <> [did])
+                        }
+                    }
+
+                conflictState :: ClientState
+                conflictState = authBase
+                    { syncConflicts = Map.singleton docBase.id conflict
+                    }
+
+            -- 1. OpenConflictMerge loads serverDoc + baseDetail and detects 1 conflict block
+            (sReady, _) <- runActionQueue env [OpenConflictMerge docBase.id] conflictState
+            case sReady.conflictMerge of
+                Just (MergeReady ms) -> do
+                    ms.mergeOutcome.hasConflicts `shouldBe` True
+                    ms.mergeOutcome.conflictCount `shouldBe` 1
+                other -> expectationFailure ("Expected MergeReady, got: " <> show other)
+
+            -- 2. Saving before resolving conflicts returns validation error without PUT
+            writeIORef reqRef []
+            (sUnresolved, _) <- runUpdateStep env SaveResolvedMerge sReady
+            sUnresolved.lastError `shouldBe` Just jaMessages.errMergeUnresolved
+            readIORef reqRef >>= (`shouldBe` [])
+
+            -- 3. Selecting ChooseBothOursFirst and saving sends PUT with base_revision = r2 and clears conflict
+            (sChosen, _) <- runUpdateStep env (SelectMergeChoice 0 ChooseBothOursFirst) sReady
+            (sMerged, _) <- runActionQueue env [SaveResolvedMerge] sChosen
+            sMerged.conflictMerge `shouldBe` Nothing
+            sMerged.syncConflicts `shouldBe` Map.empty
+            fmap (.revision) sMerged.selectedDocument `shouldBe` Just rev3
+            sMerged.statusNotice `shouldBe` Just jaMessages.noticeMergeSaved
+            readIORef delConflictRef >>= (`shouldBe` [docBase.id])
+
+            putReqs <- filter (\ r -> r.method == MethodPut) <$> readIORef reqRef
+            case putReqs of
+                [putReq] -> case putReq.body of
+                    Just rawBody -> case Aeson.eitherDecodeStrict' rawBody :: Either String UpdateDocumentRequest of
+                        Right upd -> do
+                            upd.baseRevision `shouldBe` Just rev2
+                            upd.body `shouldBe` DocumentBody "header\nlocal-edit\nserver-edit\nfooter\n"
+                        Left err -> expectationFailure ("Decode PUT failed: " <> err)
+                    Nothing -> expectationFailure "Expected PUT JSON body"
+                _ -> expectationFailure "Expected 1 PUT request"
+
+        it "handles compare manual selection, stale/closed/error/401 guards, and renders compare & merge views" $ do
+            doc <- mkSampleDocument "doc-m7-edge" "エッジ比較"
+            docOther <- mkSampleDocument "doc-m7-other" "別文書"
+            uid <- mkSampleUserId "user-alice"
+            revId1 <- expectRight (mkRevisionId "rev-edge-1")
+            revId2 <- expectRight (mkRevisionId "rev-edge-2")
+            hashVal <- expectRight (mkContentHash (Txt.replicate 64 "c"))
+            let rev1 :: RevisionNumber
+                rev1 = initialRevisionNumber
+
+                rev2 :: RevisionNumber
+                rev2 = nextRevisionNumber rev1
+
+                sum1 :: RevisionSummary
+                sum1 = RevisionSummary revId1 doc.id rev1 Nothing doc.title FormatMarkdown hashVal sampleUtcTime
+
+                sum2 :: RevisionSummary
+                sum2 = RevisionSummary revId2 doc.id rev2 (Just revId1) doc.title FormatPlainText hashVal sampleLaterUtcTime
+
+                cmpResp :: RevisionCompareResponse
+                cmpResp = RevisionCompareResponse
+                    { documentId    = doc.id
+                    , fromRevision  = sum2
+                    , toRevision    = sum1
+                    , titleChanged  = True
+                    , formatChanged = True
+                    , bodyDiff      = generateUnifiedDiff "new\n" "old\n"
+                    }
+
+                detail2 :: RevisionDetail
+                detail2 = RevisionDetail revId2 doc.id rev2 (Just revId1) doc.title (DocumentBody "new\n") FormatPlainText (generateUnifiedDiff "old\n" "new\n") hashVal sampleLaterUtcTime
+
+            authBase <- mkAuthenticatedState
+            let histOpen :: ClientState
+                histOpen = authBase
+                    { selectedDocument = Just doc
+                    , revisionHistory  = emptyRevisionHistoryState
+                        { isHistoryOpen     = True
+                        , documentId        = Just doc.id
+                        , revisions         = [sum2, sum1]
+                        , totalRevisions    = 2
+                        , selectedRevision  = Just rev2
+                        , revisionDetail    = Just detail2
+                        , compareRequestSeq = 5
+                        }
+                    }
+
+            -- 1. Pure stale seq / closed panel / docId mismatch / error guards
+            (applyRevisionCompareLoaded jaMessages 4 doc.id (Right cmpResp) histOpen).revisionHistory.compareResult
+                `shouldBe` Nothing
+            (applyRevisionCompareLoaded jaMessages 5 docOther.id (Right cmpResp) histOpen).revisionHistory.compareResult
+                `shouldBe` Nothing
+            (applyRevisionCompareLoaded jaMessages 5 doc.id (Right cmpResp) (histOpen { revisionHistory = resetRevisionHistory histOpen.revisionHistory })).revisionHistory.compareResult
+                `shouldBe` Nothing
+            let errCmp :: ClientState
+                errCmp = applyRevisionCompareLoaded jaMessages 5 doc.id (Left (ClientNetworkError "timeout")) histOpen
+            errCmp.revisionHistory.compareResult `shouldBe` Nothing
+            errCmp.lastError `shouldSatisfy` isJust
+
+            -- 2. Manual SetCompareFromRevision / SetCompareToRevision / CompareRevisions and 401 expiry
+            (envCmp, _, _) <- mkMockClientEnv $ \ req ->
+                if req.method == MethodGet && req.url == "/api/documents/doc-m7-edge/revisions/compare?from=2&to=1"
+                    then pure (Right (HttpResponse 200 (encodeStrict cmpResp)))
+                    else pure (Left "unexpected")
+            (sPicked, _) <- runActionQueue envCmp [SetCompareFromRevision rev2, SetCompareToRevision rev1, CompareRevisions] histOpen
+            sPicked.revisionHistory.compareResult `shouldBe` Just cmpResp
+
+            let sCompareView :: ClientState
+                sCompareView = sPicked { revisionHistory = sPicked.revisionHistory { activeTab = RevTabCompare } }
+
+                htmlCompare :: Text
+                htmlCompare = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () sCompareView (viewClient jaMessages sCompareView)))
+            htmlCompare `shouldSatisfy` Txt.isInfixOf jaMessages.historyCompareTitleChanged
+            htmlCompare `shouldSatisfy` Txt.isInfixOf jaMessages.historyCompareFmtChanged
+
+            -- 401 on RevisionsCompared expires session
+            (sExpiredCmp, _) <- runUpdateStep envCmp (RevisionsCompared 1 6 doc.id (Left (ClientApiError 401 (ApiError ErrUnauthorized "expired" Nothing)))) sPicked
+            case sExpiredCmp.authState of
+                AuthUnauthenticated{} -> pure ()
+                other                 -> expectationFailure ("Expected AuthUnauthenticated, got: " <> show other)
+
+            -- 3. 3-way merge edge cases: SelectAllMergeChoices, 409 re-conflict, CloseConflictMerge guard, auto-clean merge, and other-doc preservation
+            let baseDet :: RevisionDetail
+                baseDet = RevisionDetail revId1 doc.id rev1 Nothing doc.title (DocumentBody "a\nb\nc\n") FormatMarkdown (generateUnifiedDiff "" "a\nb\nc\n") hashVal sampleUtcTime
+
+                serverCleanDoc :: Document
+                serverCleanDoc = Document doc.id doc.title (DocumentBody "a\nb\nC-SERVER\n") FormatMarkdown Nothing emptyTagSet rev2 sampleUtcTime sampleLaterUtcTime Nothing
+
+                conflictClean :: SyncConflict
+                conflictClean = SyncConflict
+                    { docId      = doc.id
+                    , ownerId    = uid
+                    , localSave  = PendingSyncSave doc.id uid doc.title (DocumentBody "A-LOCAL\nb\nc\n") FormatMarkdown Nothing emptyTagSet rev1 sampleUtcTime
+                    , detectedAt = sampleLaterUtcTime
+                    , reason     = jaMessages.errSyncConflictReason
+                    }
+
+            (envClean, _, _) <- mkMockClientEnv $ \ req ->
+                case (req.method, req.url) of
+                    (MethodGet, "/api/documents/doc-m7-edge")             -> pure (Right (HttpResponse 200 (encodeStrict serverCleanDoc)))
+                    (MethodGet, "/api/documents/doc-m7-edge/revisions/1") -> pure (Right (HttpResponse 200 (encodeStrict baseDet)))
+                    (MethodPut, "/api/documents/doc-m7-edge")             -> pure (Right (HttpResponse 409 "{\"error\":\"conflict\",\"message\":\"stale\"}"))
+                    _                                                     -> pure (Left "unexpected")
+
+            -- Auto-clean merge (0 conflicts) allows immediate save; 409 re-conflict keeps modal open and shows error inside modal
+            let initConflict :: ClientState
+                initConflict = authBase
+                    { selectedDocument = Just docOther
+                    , draft            = draftFromDocument docOther
+                    , syncConflicts    = Map.singleton doc.id conflictClean
+                    }
+            (sLoading, _) <- runUpdateStep envClean (OpenConflictMerge doc.id) initConflict
+            let htmlLoading :: Text
+                htmlLoading = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () sLoading (viewClient jaMessages sLoading)))
+            htmlLoading `shouldSatisfy` Txt.isInfixOf jaMessages.mergeLoadingMessage
+
+            -- Closing while loading invalidates late ConflictMergeLoaded
+            (sClosed, _) <- runUpdateStep envClean CloseConflictMerge sLoading
+            sClosed.conflictMerge `shouldBe` Nothing
+            (sIgnoredLate, _) <- runUpdateStep envClean (ConflictMergeLoaded 1 1 doc.id (Right serverCleanDoc) (Right baseDet)) sClosed
+            sIgnoredLate.conflictMerge `shouldBe` Nothing
+
+            -- Load clean merge -> Save -> 409 re-conflict keeps modal open with error rendered inside modal
+            (sAutoReady, _) <- runActionQueue envClean [OpenConflictMerge doc.id] initConflict
+            (sAfter409, _) <- runActionQueue envClean [SaveResolvedMerge] sAutoReady
+            case sAfter409.conflictMerge of
+                Just (MergeReady ms) -> ms.isSavingMerge `shouldBe` False
+                other                -> expectationFailure ("Expected MergeReady after 409, got: " <> show other)
+            sAfter409.lastError `shouldSatisfy` isJust
+            let htmlErrModal :: Text
+                htmlErrModal = TxtEnc.decodeUtf8Lenient (LazyBS.toStrict (toHtmlWith () () sAfter409 (viewClient jaMessages sAfter409)))
+            htmlErrModal `shouldSatisfy` Txt.isInfixOf "tt-merge-modal"
+            htmlErrModal `shouldSatisfy` Txt.isInfixOf jaMessages.errConflictMessage
+
+            -- CloseConflictMerge is blocked while isSavingMerge == True
+            let savingModalState :: ClientState
+                savingModalState = case sAfter409.conflictMerge of
+                    Just (MergeReady ms) -> sAfter409 { conflictMerge = Just (MergeReady ms { isSavingMerge = True }) }
+                    _                    -> sAfter409
+            (sStillSaving, _) <- runUpdateStep envClean CloseConflictMerge savingModalState
+            sStillSaving.conflictMerge `shouldSatisfy` isJust
+
+            -- SelectAllMergeChoices populates all conflicts, and ConflictMergeSaved while another doc is open preserves selectedDocument
+            let mergedOtherRes :: Document
+                mergedOtherRes = withDocBody (DocumentBody "A-LOCAL\nb\nC-SERVER\n") serverCleanDoc
+            (sSavedOther, _) <- runUpdateStep envClean (ConflictMergeSaved 1 doc.id (Right mergedOtherRes)) sAutoReady
+            fmap (.id) sSavedOther.selectedDocument `shouldBe` Just docOther.id
+            sSavedOther.syncConflicts `shouldBe` Map.empty
+
+            -- 401 on ConflictMergeLoaded expires session
+            (sExpiredMerge, _) <- runUpdateStep envClean (ConflictMergeLoaded 1 1 doc.id (Left (ClientApiError 401 (ApiError ErrUnauthorized "expired" Nothing))) (Right baseDet)) sLoading
+            case sExpiredMerge.authState of
+                AuthUnauthenticated{} -> pure ()
+                other                 -> expectationFailure ("Expected AuthUnauthenticated, got: " <> show other)
 
 recordingTransport ::
        IORef (Maybe HttpRequest)

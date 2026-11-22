@@ -30,11 +30,13 @@ import           TamaTsuzura.Client.App
     , AuthState(..)
     , ClientAction(..)
     , ClientState(..)
+    , ConflictMergeState(..)
     , ConnectionStatus(..)
     , EditorDraft(..)
     , EditorViewMode(..)
     , ExtensionCatalogEntry(..)
     , FilterState(..)
+    , MergeSession(..)
     , MobilePane(..)
     , PendingNavigation(..)
     , RevisionDetailTab(..)
@@ -71,17 +73,30 @@ import           TamaTsuzura.Common.Document
     , DocumentSummary(..)
     , DocumentTitle
     , FolderPath
+    , RevisionNumber
     , Tag
     , isSummaryTrashed
     , isTrashed
     , mkFolderPath
+    , mkRevisionNumber
     , mkTag
     , parseDocumentFormat
     , tagSetToList
     )
-import           TamaTsuzura.Common.Revision     (RevisionDetail(..), RevisionSummary(..))
+import           TamaTsuzura.Common.Merge
+    ( ConflictBlock(..)
+    , ConflictChoice(..)
+    , MergeOutcome(..)
+    , MergeRegion(..)
+    )
+import           TamaTsuzura.Common.Revision
+    ( RevisionCompareResponse(..)
+    , RevisionDetail(..)
+    , RevisionSummary(..)
+    )
 import           TamaTsuzura.Common.Text         (ToText(..))
 import           TamaTsuzura.ExtensionApi        (ExtensionCommandInfo(..), ExtensionId, ExtensionMetadata(..))
+import           Text.Read                       (readMaybe)
 
 -- | モバイルファースト日本語 UI をレンダリングする純粋ビュー関数。
 -- 未認証時は中央配置のログイン・新規登録画面を表示し、認証済み時は
@@ -394,7 +409,9 @@ viewSyncStatusIndicator msgs state = case state.authState of
 viewNotifications :: UiMessages -> ClientState -> View () () ClientState ClientAction
 viewNotifications msgs state =
     H.div_ [ HP.class_ "tt-notifications" ]
-        ( [ viewErrorBanner msgs state.lastError
+        ( [ if isJust state.conflictMerge
+                then H.div_ [ HP.class_ "tt-slot-empty" ] []
+                else viewErrorBanner msgs state.lastError
           , viewNoticeBanner msgs state.statusNotice
           , viewOfflineCacheBanner msgs state
           ]
@@ -428,6 +445,13 @@ viewSyncConflictBanner msgs state conflict =
             [ H.button_
                 ( [ HP.type_ "button"
                   , HP.class_ "tt-btn tt-btn-primary tt-btn-xs"
+                  , HE.onClick (OpenConflictMerge conflict.docId)
+                  ] <> disabledAttr (state.networkStatus == NetworkOffline || isJust state.conflictMerge)
+                )
+                [ text (ms msgs.actionOpenConflictMerge) ]
+            , H.button_
+                ( [ HP.type_ "button"
+                  , HP.class_ "tt-btn tt-btn-secondary tt-btn-xs"
                   , HE.onClick (RecoverConflictAsNewDocument conflict.docId)
                   ] <> disabledAttr (state.networkStatus == NetworkOffline || state.isCreatingDocument || state.isImportingDocument)
                 )
@@ -1347,8 +1371,9 @@ viewRevisionHistoryPanel msgs state doc readOnly =
                             , viewRestoreActionBar detail isCurrentRev restoreLabel
                             ]
                         , H.div_ [ HP.class_ "tt-segmented tt-rev-tabs", HP.role_ "tablist" ]
-                            [ detailTabButton RevTabBody msgs.historyTabBody
-                            , detailTabButton RevTabDiff msgs.historyTabDiff
+                            [ detailTabButton RevTabBody    msgs.historyTabBody
+                            , detailTabButton RevTabDiff    msgs.historyTabDiff
+                            , detailTabButton RevTabCompare msgs.historyTabCompare
                             ]
                         , H.div_ [ HP.class_ "tt-rev-content" ]
                             [ case rh.activeTab of
@@ -1357,7 +1382,84 @@ viewRevisionHistoryPanel msgs state doc readOnly =
                                         [ text (ms (toText detail.body)) ]
                                 RevTabDiff ->
                                     viewUnifiedDiff msgs detail.diff
+                                RevTabCompare ->
+                                    viewRevisionCompareTab
                             ]
+                        ]
+
+    viewRevisionCompareTab :: View () () ClientState ClientAction
+    viewRevisionCompareTab =
+        H.div_ [ HP.class_ "tt-compare-tab" ]
+            [ H.div_ [ HP.class_ "tt-compare-bar" ]
+                [ H.label_ [ HP.class_ "tt-compare-select-group" ]
+                    [ H.span_ [] [ text (ms msgs.historyCompareFromLabel) ]
+                    , H.select_
+                        [ HP.class_ "tt-select"
+                        , HP.value_ (ms (maybe "" toText rh.compareFromRev))
+                        , HP.aria_ "label" (ms msgs.historyCompareFromLabel)
+                        , HE.onChange (onCompareRevChange SetCompareFromRevision . toTextFromMiso)
+                        ]
+                        (map (revOption rh.compareFromRev) rh.revisions)
+                    ]
+                , H.label_ [ HP.class_ "tt-compare-select-group" ]
+                    [ H.span_ [] [ text (ms msgs.historyCompareToLabel) ]
+                    , H.select_
+                        [ HP.class_ "tt-select"
+                        , HP.value_ (ms (maybe "" toText rh.compareToRev))
+                        , HP.aria_ "label" (ms msgs.historyCompareToLabel)
+                        , HE.onChange (onCompareRevChange SetCompareToRevision . toTextFromMiso)
+                        ]
+                        (map (revOption rh.compareToRev) rh.revisions)
+                    ]
+                , H.button_
+                    ( [ HP.type_ "button"
+                      , HP.class_ "tt-btn tt-btn-primary tt-btn-xs"
+                      , HE.onClick CompareRevisions
+                      ] <> disabledAttr (rh.isLoadingCompare || isNothing rh.compareFromRev || isNothing rh.compareToRev)
+                    )
+                    [ text (ms msgs.actionRunCompare) ]
+                ]
+            , viewCompareResultBody
+            ]
+      where
+        revOption :: Maybe RevisionNumber -> RevisionSummary -> View () () ClientState ClientAction
+        revOption mSelectedRev summary =
+            H.option_
+                [ HP.value_ (ms (toText summary.revision))
+                , HP.selected_ (mSelectedRev == Just summary.revision)
+                ]
+                [ text (ms ("r" <> toText summary.revision <> " — " <> displayTitle msgs summary.title)) ]
+
+        onCompareRevChange :: (RevisionNumber -> ClientAction) -> Text -> ClientAction
+        onCompareRevChange mkAct rawTxt =
+            maybe
+                (SetRevisionDetailTab rh.activeTab)
+                mkAct
+                (readMaybe (Txt.unpack rawTxt) >>= either (const Nothing) Just . mkRevisionNumber)
+
+        viewCompareResultBody :: View () () ClientState ClientAction
+        viewCompareResultBody
+            | rh.isLoadingCompare =
+                H.p_ [ HP.class_ "tt-empty" ] [ text (ms msgs.historyCompareLoading) ]
+            | otherwise = case rh.compareResult of
+                Nothing ->
+                    H.p_ [ HP.class_ "tt-empty" ] [ text (ms msgs.historyComparePrompt) ]
+                Just cmp ->
+                    H.div_ []
+                        [ H.div_ [ HP.class_ "tt-compare-meta" ]
+                            ( [ H.span_ [ HP.class_ "tt-rev-num" ]
+                                    [ text (ms ("r" <> toText cmp.fromRevision.revision <> " → r" <> toText cmp.toRevision.revision)) ]
+                              ]
+                                <> [ H.span_ [ HP.class_ "tt-doc-draft-badge" ]
+                                        [ text (ms msgs.historyCompareTitleChanged) ]
+                                   | cmp.titleChanged
+                                   ]
+                                <> [ H.span_ [ HP.class_ "tt-doc-sync-badge" ]
+                                        [ text (ms msgs.historyCompareFmtChanged) ]
+                                   | cmp.formatChanged
+                                   ]
+                            )
+                        , viewUnifiedDiff msgs cmp.bodyDiff
                         ]
 
     viewRestoreActionBar ::
@@ -1729,8 +1831,164 @@ viewModals msgs state = case state.authState of
                         (ConfirmRestoreRevision revNo)
                         CancelRestoreRevision
                         "tt-btn tt-btn-primary"
+            , case state.conflictMerge of
+                Nothing         -> H.div_ [ HP.class_ "tt-slot-empty" ] []
+                Just mergeState -> viewConflictMergeModal msgs state.lastError mergeState
             ]
     _ -> H.div_ [ HP.class_ "tt-slot-empty" ] []
+
+viewConflictMergeModal ::
+       UiMessages
+    -> Maybe Text
+    -> ConflictMergeState
+    -> View () () ClientState ClientAction
+viewConflictMergeModal msgs mErr mergeState =
+    H.div_ [ HP.class_ "tt-modal-backdrop", HP.role_ "dialog", HP.aria_ "modal" "true" ]
+        [ case mergeState of
+            MergeLoading{} ->
+                H.div_ [ HP.class_ "tt-modal-card tt-merge-modal" ]
+                    [ H.h2_ [ HP.class_ "tt-modal-title" ] [ text (ms msgs.mergeModalTitle) ]
+                    , viewErrorBanner msgs mErr
+                    , H.p_ [ HP.class_ "tt-modal-body" ] [ text (ms msgs.mergeLoadingMessage) ]
+                    , H.div_ [ HP.class_ "tt-modal-actions" ]
+                        [ H.button_
+                            [ HP.type_ "button"
+                            , HP.class_ "tt-btn tt-btn-secondary"
+                            , HE.onClick CloseConflictMerge
+                            ]
+                            [ text (ms msgs.actionCloseHistory) ]
+                        ]
+                    ]
+            MergeReady mSess ->
+                let totalConflicts :: Int
+                    totalConflicts = mSess.mergeOutcome.conflictCount
+
+                    resolvedCount :: Int
+                    resolvedCount = Map.size mSess.choices
+
+                    unresolvedCount :: Int
+                    unresolvedCount = max 0 (totalConflicts - resolvedCount)
+
+                    summaryText :: Text
+                    summaryText
+                        | totalConflicts == 0 = msgs.mergeAutoCleanHint
+                        | otherwise =
+                            msgs.mergeUnresolvedPrefix
+                                <> Txt.pack (show unresolvedCount)
+                                <> " / "
+                                <> Txt.pack (show totalConflicts)
+                                <> msgs.documentsCountUnit
+
+                    saveLabel :: Text
+                    saveLabel =
+                        if mSess.isSavingMerge
+                            then msgs.actionSavingMerged
+                            else msgs.actionSaveMerged
+                in  H.div_ [ HP.class_ "tt-modal-card tt-merge-modal" ]
+                        [ H.h2_ [ HP.class_ "tt-modal-title" ]
+                            [ text (ms (msgs.mergeModalTitle <> " — " <> displayTitle msgs mSess.localSave.title)) ]
+                        , viewErrorBanner msgs mErr
+                        , H.div_ [ HP.class_ "tt-merge-summary" ]
+                            [ H.span_ []
+                                [ text (ms ("BASE r" <> toText mSess.baseRevision <> " / SERVER r" <> toText mSess.serverDocument.revision <> " — " <> summaryText)) ]
+                            , if totalConflicts > 0
+                                then H.div_ [ HP.class_ "tt-merge-bulk-actions" ]
+                                    [ H.button_
+                                        ( [ HP.type_ "button"
+                                          , HP.class_ "tt-btn tt-btn-secondary tt-btn-xs"
+                                          , HE.onClick (SelectAllMergeChoices ChooseOurs)
+                                          ] <> disabledAttr mSess.isSavingMerge
+                                        )
+                                        [ text (ms msgs.mergeActionAllOurs) ]
+                                    , H.button_
+                                        ( [ HP.type_ "button"
+                                          , HP.class_ "tt-btn tt-btn-secondary tt-btn-xs"
+                                          , HE.onClick (SelectAllMergeChoices ChooseTheirs)
+                                          ] <> disabledAttr mSess.isSavingMerge
+                                        )
+                                        [ text (ms msgs.mergeActionAllTheirs) ]
+                                    ]
+                                else H.div_ [ HP.class_ "tt-slot-empty" ] []
+                            ]
+                        , H.div_ [ HP.class_ "tt-merge-regions" ]
+                            (map (viewMergeRegion mSess) mSess.mergeOutcome.regions)
+                        , H.div_ [ HP.class_ "tt-modal-actions" ]
+                            [ H.button_
+                                ( [ HP.type_ "button"
+                                  , HP.class_ "tt-btn tt-btn-secondary"
+                                  , HE.onClick CloseConflictMerge
+                                  ] <> disabledAttr mSess.isSavingMerge
+                                )
+                                [ text (ms msgs.actionCloseHistory) ]
+                            , H.button_
+                                ( [ HP.type_ "button"
+                                  , HP.class_ "tt-btn tt-btn-primary"
+                                  , HE.onClick SaveResolvedMerge
+                                  ] <> disabledAttr (mSess.isSavingMerge || unresolvedCount > 0)
+                                )
+                                [ text (ms saveLabel) ]
+                            ]
+                        ]
+        ]
+  where
+    viewMergeRegion :: MergeSession -> MergeRegion -> View () () ClientState ClientAction
+    viewMergeRegion _ (MergeClean ls) =
+        H.pre_ [ HP.class_ "tt-merge-clean" ] [ text (ms (Txt.concat ls)) ]
+    viewMergeRegion mSess (MergeConflict cb) =
+        let mSelected :: Maybe ConflictChoice
+            mSelected = Map.lookup cb.conflictIndex mSess.choices
+
+            cardClass :: Text
+            cardClass = case mSelected of
+                Just _  -> "tt-merge-conflict-card tt-merge-conflict-card-resolved"
+                Nothing -> "tt-merge-conflict-card"
+
+            renderLines :: [Text] -> Text
+            renderLines ls =
+                let joined :: Text
+                    joined = Txt.concat ls
+                in  if Txt.null joined then msgs.mergeEmptyBlockHint else joined
+
+            choiceBtn :: ConflictChoice -> Text -> View () () ClientState ClientAction
+            choiceBtn choice labelText =
+                let isSelected :: Bool
+                    isSelected = mSelected == Just choice
+
+                    btnClass :: Text
+                    btnClass =
+                        if isSelected
+                            then "tt-btn tt-btn-primary tt-btn-xs"
+                            else "tt-btn tt-btn-secondary tt-btn-xs"
+                in  H.button_
+                        ( [ HP.type_ "button"
+                          , HP.class_ (ms btnClass)
+                          , HE.onClick (SelectMergeChoice cb.conflictIndex choice)
+                          ] <> disabledAttr mSess.isSavingMerge
+                        )
+                        [ text (ms labelText) ]
+        in  H.div_ [ HP.class_ (ms cardClass) ]
+                [ H.div_ [ HP.class_ "tt-merge-sides" ]
+                    [ H.div_ [ HP.class_ "tt-merge-side tt-merge-side-ours" ]
+                        [ H.div_ [ HP.class_ "tt-merge-side-label" ] [ text (ms msgs.mergeLabelOurs) ]
+                        , H.pre_ [ HP.class_ "tt-merge-side-pre" ] [ text (ms (renderLines cb.oursLines)) ]
+                        ]
+                    , H.div_ [ HP.class_ "tt-merge-side tt-merge-side-theirs" ]
+                        [ H.div_ [ HP.class_ "tt-merge-side-label" ] [ text (ms msgs.mergeLabelTheirs) ]
+                        , H.pre_ [ HP.class_ "tt-merge-side-pre" ] [ text (ms (renderLines cb.theirsLines)) ]
+                        ]
+                    ]
+                , H.div_ [ HP.class_ "tt-merge-side" ]
+                    [ H.div_ [ HP.class_ "tt-merge-side-label" ] [ text (ms msgs.mergeLabelBase) ]
+                    , H.pre_ [ HP.class_ "tt-merge-side-pre" ] [ text (ms (renderLines cb.baseLines)) ]
+                    ]
+                , H.div_ [ HP.class_ "tt-merge-choices" ]
+                    [ choiceBtn ChooseOurs            msgs.mergeChoiceOurs
+                    , choiceBtn ChooseTheirs          msgs.mergeChoiceTheirs
+                    , choiceBtn ChooseBothOursFirst   msgs.mergeChoiceBothOursFirst
+                    , choiceBtn ChooseBothTheirsFirst msgs.mergeChoiceBothTheirsFirst
+                    , choiceBtn ChooseBase            msgs.mergeChoiceBase
+                    ]
+                ]
 
 viewConfirmModal ::
        Text

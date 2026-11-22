@@ -133,6 +133,62 @@ data UiMessages = UiMessages
       -- ^ リビジョン詳細の本文タブラベル
     , historyTabDiff             :: !Text
       -- ^ リビジョン詳細の差分タブラベル
+    , historyTabCompare          :: !Text
+      -- ^ 任意 2 リビジョン比較タブラベル
+    , historyCompareFromLabel    :: !Text
+      -- ^ 比較元リビジョン選択ラベル
+    , historyCompareToLabel      :: !Text
+      -- ^ 比較先リビジョン選択ラベル
+    , actionRunCompare           :: !Text
+      -- ^ 比較実行ボタンラベル
+    , historyCompareLoading      :: !Text
+      -- ^ 比較結果読み込み中メッセージ
+    , historyComparePrompt       :: !Text
+      -- ^ 比較未実行時の案内メッセージ
+    , historyCompareTitleChanged :: !Text
+      -- ^ 比較でタイトル変更ありを示すバッジ
+    , historyCompareFmtChanged   :: !Text
+      -- ^ 比較でフォーマット変更ありを示すバッジ
+    , actionOpenConflictMerge    :: !Text
+      -- ^ 競合退避バナーの 3-way マージ解決ボタンラベル
+    , mergeModalTitle            :: !Text
+      -- ^ 3-way マージ解決モーダル見出し
+    , mergeLoadingMessage        :: !Text
+      -- ^ 3-way マージ用の共通祖先・サーバ最新版取得中メッセージ
+    , mergeAutoCleanHint         :: !Text
+      -- ^ 競合ゼロで自動マージ可能な旨の案内
+    , mergeUnresolvedPrefix      :: !Text
+      -- ^ 未解決競合件数表示の接頭辞
+    , mergeActionAllOurs         :: !Text
+      -- ^ 全競合へローカル採用を一括設定するボタンラベル
+    , mergeActionAllTheirs       :: !Text
+      -- ^ 全競合へサーバ採用を一括設定するボタンラベル
+    , mergeChoiceOurs            :: !Text
+      -- ^ 競合ブロックでローカルを採用するボタンラベル
+    , mergeChoiceTheirs          :: !Text
+      -- ^ 競合ブロックでサーバを採用するボタンラベル
+    , mergeChoiceBothOursFirst   :: !Text
+      -- ^ 競合ブロックでローカル→サーバの両方を残すボタンラベル
+    , mergeChoiceBothTheirsFirst :: !Text
+      -- ^ 競合ブロックでサーバ→ローカルの両方を残すボタンラベル
+    , mergeChoiceBase            :: !Text
+      -- ^ 競合ブロックで共通祖先へ戻すボタンラベル
+    , mergeLabelBase             :: !Text
+      -- ^ 競合カード内の共通祖先ラベル
+    , mergeLabelOurs             :: !Text
+      -- ^ 競合カード内のローカル変更ラベル
+    , mergeLabelTheirs           :: !Text
+      -- ^ 競合カード内のサーバ変更ラベル
+    , mergeEmptyBlockHint        :: !Text
+      -- ^ 該当側が空 (削除/追加なし) である旨の表示
+    , actionSaveMerged           :: !Text
+      -- ^ マージ結果をサーバへ保存するボタンラベル
+    , actionSavingMerged         :: !Text
+      -- ^ マージ結果保存中のボタンラベル
+    , noticeMergeSaved           :: !Text
+      -- ^ 3-way マージ保存完了通知
+    , errMergeUnresolved         :: !Text
+      -- ^ 未解決の競合ブロックが残っている場合のエラー文言
     , historyDiffEmpty           :: !Text
       -- ^ 親リビジョンからの本文差分が空のときの案内文言
     , historyTrashedRestoreHint  :: !Text
@@ -534,6 +590,34 @@ jaMessages = UiMessages
     , historySelectPrompt        = "一覧からリビジョンを選ぶと、本文と差分を確認できます。"
     , historyTabBody             = "本文"
     , historyTabDiff             = "差分"
+    , historyTabCompare          = "2版比較"
+    , historyCompareFromLabel    = "比較元"
+    , historyCompareToLabel      = "比較先"
+    , actionRunCompare           = "比較する"
+    , historyCompareLoading      = "リビジョン間の差分を計算しています..."
+    , historyComparePrompt       = "比較元と比較先のリビジョンを選択して「比較する」を押してください。"
+    , historyCompareTitleChanged = "タイトル変更あり"
+    , historyCompareFmtChanged   = "形式変更あり"
+    , actionOpenConflictMerge    = "3-way マージで解決"
+    , mergeModalTitle            = "競合の 3-way マージ解決"
+    , mergeLoadingMessage        = "共通祖先とサーバ最新版を読み込んでいます..."
+    , mergeAutoCleanHint         = "競合箇所はありません。そのまま自動マージして保存できます。"
+    , mergeUnresolvedPrefix      = "未解決の競合: "
+    , mergeActionAllOurs         = "すべてローカルを採用"
+    , mergeActionAllTheirs       = "すべてサーバを採用"
+    , mergeChoiceOurs            = "ローカルを採用"
+    , mergeChoiceTheirs          = "サーバを採用"
+    , mergeChoiceBothOursFirst   = "両方 (ローカル→サーバ)"
+    , mergeChoiceBothTheirsFirst = "両方 (サーバ→ローカル)"
+    , mergeChoiceBase            = "共通祖先へ戻す"
+    , mergeLabelBase             = "共通祖先 (BASE)"
+    , mergeLabelOurs             = "ローカル変更 (LOCAL)"
+    , mergeLabelTheirs           = "サーバ変更 (SERVER)"
+    , mergeEmptyBlockHint        = "(空)"
+    , actionSaveMerged           = "マージ結果を保存"
+    , actionSavingMerged         = "マージ保存中..."
+    , noticeMergeSaved           = "競合を 3-way マージして保存しました。"
+    , errMergeUnresolved         = "未解決の競合箇所が残っています。すべての競合ブロックで採用方針を選択してください。"
     , historyDiffEmpty           = "前の版からの本文差分はありません（タイトル・形式のみの変更、または空本文です）。"
     , historyTrashedRestoreHint  = "ゴミ箱内の文書は過去リビジョンへ復元できません。先に文書を復元してください。"
     , historyCurrentVersionHint  = "現在表示中の最新リビジョンです。"
